@@ -1,8 +1,5 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
-use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
-use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
-use anyhow::{Context, Result, anyhow, bail};
 use crate::franken_sync::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
@@ -13,6 +10,9 @@ use crate::franken_sync::{
     },
     migrate::MigrationRunner,
 };
+use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -216,8 +216,9 @@ impl LazyFrankenDb {
                     match acquire_doctor_mutation_db_open_guard(&path_for_guard, timeout) {
                         Ok(guard) => guard,
                         Err(err) => {
-                            let _ = tx
-                                .send(Err(crate::franken_sync::FrankenError::Internal(err.to_string())));
+                            let _ = tx.send(Err(crate::franken_sync::FrankenError::Internal(
+                                err.to_string(),
+                            )));
                             return;
                         }
                     };
@@ -12264,7 +12265,10 @@ impl FrankenStorage {
                 fparams![db_path, model_id, total_docs],
             );
             if let Err(err) = insert_result {
-                if !matches!(err, crate::franken_sync::FrankenError::UniqueViolation { .. }) {
+                if !matches!(
+                    err,
+                    crate::franken_sync::FrankenError::UniqueViolation { .. }
+                ) {
                     return Err(err.into());
                 }
                 self.conn.execute_compat(
@@ -23139,9 +23143,9 @@ mod tests {
     #[test]
     fn parallel_insert_conversation_tree_keeps_unique_external_ids_distinct() {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use crate::indexer::persist::map_to_internal;
         use crate::model::types::{Agent, AgentKind};
-        use crate::franken_sync::compat::{ConnectionExt, RowExt};
         use rand::RngExt;
         use rayon::prelude::*;
 
@@ -29912,8 +29916,8 @@ mod tests {
 
     #[test]
     fn franken_insert_conversations_batched_populates_analytics_rollups() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use crate::franken_sync::compat::{ConnectionExt, RowExt};
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         let dir = TempDir::new().unwrap();
