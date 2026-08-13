@@ -138,7 +138,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
-| `franken-agent-detection` | `1557300b` |
+| `franken-agent-detection` | `394ba2a22773c1f63f701145383d28867797974e` (`0.1.11-letta.1`, fork `klittle32/franken_agent_detection`; Letta Code connector) |
 | `asupersync` | `=0.3.10` |
 | `frankensearch` | `fbde8022` (accepted post-flip candidate with explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
@@ -378,7 +378,7 @@ rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test --all-fea
 
 | Directory / File | Focus Areas |
 |-----------------|-------------|
-| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe) |
+| `tests/connector_*.rs` | Per-provider session parsing (Claude, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, Pi Agent, Copilot, OpenClaw, ClawdBot, Vibe, Letta Code) |
 | `tests/search_*.rs` | Search pipeline, caching, filters, wildcard fallback |
 | `tests/semantic_integration.rs` | Semantic search, embeddings, two-tier search |
 | `tests/e2e_*.rs` | End-to-end CLI flows, filters, search, sources, TUI, deploy |
@@ -459,6 +459,7 @@ coding_agent_session_search/
 │   │   ├── cursor.rs             # Cursor sessions
 │   │   ├── gemini.rs             # Gemini sessions
 │   │   ├── grok.rs               # Grok Build sessions
+│   │   ├── letta_code.rs         # Letta Code client transcripts (FAD re-export)
 │   │   ├── aider.rs              # Aider sessions
 │   │   ├── amp.rs                # Amp sessions
 │   │   ├── chatgpt.rs            # ChatGPT sessions (encrypted)
@@ -568,6 +569,7 @@ cass robot-docs guide         # LLM-optimized docs
 | OpenHands | `openhands.rs` | JSON event stream |
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
+| Letta Code | `letta_code.rs` | JSONL (`~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`) |
 
 ### HTML Export (Robot Mode)
 

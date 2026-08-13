@@ -3086,6 +3086,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "copilot_cli" => ftui::PackedRgba::rgb(80, 170, 230), // navy
         "crush" => ftui::PackedRgba::rgb(255, 120, 80), // coral
         "goose" => ftui::PackedRgba::rgb(210, 170, 110), // tan/bronze
+        "letta_code" => ftui::PackedRgba::rgb(90, 160, 255), // teal-blue
         "kimi" => ftui::PackedRgba::rgb(190, 220, 80), // yellow-green
         "qwen" => ftui::PackedRgba::rgb(80, 210, 180), // mint
         _ => ftui::PackedRgba::rgb(169, 169, 169),     // gray fallback

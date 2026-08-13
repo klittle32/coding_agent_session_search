@@ -5,7 +5,7 @@ All notable changes to **cass** (coding-agent-session-search) are documented her
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) with links to representative commits.
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
+Repository: <https://github.com/klittle32/coding_agent_session_search>
 
 > **Releases vs. tags**: Published GitHub Releases with downloadable binaries
 > are tracked on the [Releases
@@ -17,7 +17,10 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+
+- **Letta Code client transcripts** via the frozen `klittle32/franken_agent_detection` pin (`0.1.11-letta.1` / `394ba2a2`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
+- Fork identity `0.6.24-letta.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
 
 ## [v0.6.24] -- 2026-08-11
 

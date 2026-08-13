@@ -5,7 +5,7 @@ description: "Coding Agent Session Search - unified CLI/TUI to index and search 
 
 # CASS - Coding Agent Session Search
 
-Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **23 agents**, including Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory (Droid), OpenHands, Antigravity, and Grok Build.
+Unified, high-performance CLI/TUI to index and search your local coding agent history. Aggregates sessions from **25 agents**, including Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, Factory (Droid), OpenHands, Antigravity, Grok Build, and Letta Code.
 
 ## CRITICAL: Robot Mode Required for AI Agents
 
@@ -602,6 +602,7 @@ Final_Score = BM25_Score × Match_Quality + α × Recency_Factor
 | **OpenHands** | `~/.openhands/conversations` | JSON event stream |
 | **Antigravity** | `~/.gemini/antigravity-cli` | JSONL / SQLite |
 | **Grok Build** | `$GROK_HOME/sessions` (default `~/.grok/sessions`) | ACP updates JSONL |
+| **Letta Code** | `$LETTA_TRANSCRIPT_ROOT` (default `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`) | JSONL client transcripts. Not resumable. Custom remote roots may need explicit `sources.toml`. |
 
 **Note:** ChatGPT v2/v3 are AES-256-GCM encrypted (keychain access required). Legacy v1 unencrypted conversations are indexed automatically.
 

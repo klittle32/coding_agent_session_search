@@ -505,6 +505,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "windsurf" => "agent-windsurf",
         "amp" => "agent-amp",
         "grok" => "agent-grok",
+        "letta_code" => "agent-letta",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
         "opencode" | "qwen" => "agent-codex",
         "pi_agent" | "factory" | "droid" => "agent-aider",
@@ -535,6 +536,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "windsurf" => "Windsurf",
         "amp" => "Amp",
         "grok" => "Grok",
+        "letta_code" => "Letta Code",
         "cline" => "Cline",
         "opencode" => "OpenCode",
         "pi_agent" => "Pi Agent",
@@ -1583,6 +1585,7 @@ mod tests {
         assert_eq!(agent_css_class("qwen"), "agent-codex");
         assert_eq!(agent_css_class("hermes"), "agent-hermes");
         assert_eq!(agent_css_class("goose"), "agent-goose");
+        assert_eq!(agent_css_class("letta_code"), "agent-letta");
         assert_eq!(agent_css_class("unknown"), "agent-default");
     }
 
@@ -1601,6 +1604,7 @@ mod tests {
         assert_eq!(agent_display_name("crush"), "Crush");
         assert_eq!(agent_display_name("kimi"), "Kimi");
         assert_eq!(agent_display_name("qwen"), "Qwen");
+        assert_eq!(agent_display_name("letta_code"), "Letta Code");
         assert_eq!(agent_display_name("unknown"), "AI Assistant");
     }
 

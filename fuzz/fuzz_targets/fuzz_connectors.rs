@@ -100,6 +100,12 @@ fn write_connector_layout(root: &Path, slug: &str, payload: &[u8]) {
         "hermes" => {
             write_payload(root.join(".hermes/sessions/fuzz.jsonl"), payload);
         }
+        "letta_code" => {
+            write_payload(
+                root.join(".letta/transcripts/fuzz-agent/fuzz-conv/transcript.jsonl"),
+                payload,
+            );
+        }
         "kimi" => {
             write_payload(
                 root.join(".kimi/sessions/workspace/session/wire.jsonl"),

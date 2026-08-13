@@ -160,6 +160,9 @@ pub mod colors {
     /// Goose - dark umber/bronze tint
     pub const AGENT_GOOSE_BG: Color = Color::rgb(38, 30, 20); // #261e14 - umber
 
+    /// Letta Code - deep teal tint
+    pub const AGENT_LETTA_BG: Color = Color::rgb(16, 28, 48); // #101c30 - teal navy
+
     // ═══════════════════════════════════════════════════════════════════════════
     // ROLE-AWARE BACKGROUND TINTS - Subtle backgrounds per message type
     // ═══════════════════════════════════════════════════════════════════════════
@@ -475,6 +478,7 @@ impl ThemePalette {
             "crush" => (colors::AGENT_CRUSH_BG, PackedRgba::rgb(255, 120, 80)),        // Coral
             "hermes" => (colors::AGENT_HERMES_BG, PackedRgba::rgb(240, 200, 100)),     // Gold
             "goose" => (colors::AGENT_GOOSE_BG, PackedRgba::rgb(210, 170, 110)),       // Tan/bronze
+            "letta_code" => (colors::AGENT_LETTA_BG, PackedRgba::rgb(90, 160, 255)),   // Teal-blue
             "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
             "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
@@ -513,6 +517,7 @@ impl ThemePalette {
             "crush" => "✚",
             "hermes" => "▽",
             "goose" => "◍",
+            "letta_code" => "◉",
             "kimi" => "✧",
             "qwen" => "◒",
             _ => "•",
@@ -1659,6 +1664,7 @@ mod tests {
         "goose",
         "hermes",
         "kimi",
+        "letta_code",
         "qwen",
     ];
 

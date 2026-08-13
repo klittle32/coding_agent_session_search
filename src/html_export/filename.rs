@@ -550,6 +550,7 @@ pub fn agent_slug(agent: &str) -> String {
         "cody" | "sourcegraph" => "cody".to_string(),
         "windsurf" => "windsurf".to_string(),
         "grok" => "grok".to_string(),
+        "lettacode" => "letta_code".to_string(),
         other => {
             // Slugify unknown agents
             let slug = sanitize(other);
