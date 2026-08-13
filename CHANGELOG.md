@@ -21,6 +21,7 @@ Repository: <https://github.com/klittle32/coding_agent_session_search>
 
 - **Letta Code client transcripts** via the frozen `klittle32/franken_agent_detection` pin (`0.1.11-letta.1` / `394ba2a2`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
 - Fork identity `0.6.24-letta.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
+- Sandbox runbook for running `cass-letta` beside Homebrew `cass` without sharing the live data dir ([docs/CASS_LETTA_SANDBOX.md](docs/CASS_LETTA_SANDBOX.md)).
 
 ## [v0.6.24] -- 2026-08-11
 
