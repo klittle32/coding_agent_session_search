@@ -1,12 +1,12 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.24"
+version = "0.6.24-letta.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
 license-file = "LICENSE"
 resolver = "2"
-repository = "https://github.com/Dicklesworthstone/coding_agent_session_search"
+repository = "https://github.com/klittle32/coding_agent_session_search"
 default-run = "cass"
 include = [
     "/Cargo.toml",
@@ -98,7 +98,7 @@ bytemuck = "1.25.0"
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fbde80225914f02389e04af5970647034a8291d7", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
-franken-agent-detection = { version = "0.1.10", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "88fc6783805d80677c4ed18dcc79985fcbb2a694", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+franken-agent-detection = { version = "0.1.11-letta.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "394ba2a22773c1f63f701145383d28867797974e", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -272,7 +272,7 @@ strip = false
 # [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 # fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-# [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
+# [patch."https://github.com/klittle32/franken_agent_detection"]
 # franken-agent-detection = { path = "../franken_agent_detection" }
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:

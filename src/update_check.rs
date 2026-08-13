@@ -20,7 +20,7 @@ const CHECK_INTERVAL_SECS: u64 = 3600;
 const HTTP_TIMEOUT_SECS: u64 = 5;
 
 /// GitHub repo for release checks
-const GITHUB_REPO: &str = "Dicklesworthstone/coding_agent_session_search";
+const GITHUB_REPO: &str = "klittle32/coding_agent_session_search";
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
 const UNIX_INSTALL_ASSET: &str = "install.sh";
 #[cfg(any(test, target_os = "windows"))]
@@ -1145,6 +1145,16 @@ mod tests {
 
         let release = GitHubRelease {
             tag_name: "v9.9.9".to_string(),
+            html_url: "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v9.9.9"
+                .to_string(),
+        };
+        assert!(
+            build_update_info("1.0.0", release, &state).is_none(),
+            "fork builds must not trust upstream Dicklesworthstone release notes URLs"
+        );
+
+        let release = GitHubRelease {
+            tag_name: "v9.9.9".to_string(),
             html_url: format!(
                 "https://github.com/{GITHUB_REPO}/releases/download/v9.9.9/install.sh"
             ),
@@ -1621,7 +1631,7 @@ mod tests {
             latest_version: "0.2.0".into(),
             tag_name: "v0.2.0".into(),
             current_version: "0.1.52".into(),
-            release_url: "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0".into(),
+            release_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.2.0"),
             is_newer: true,
             is_skipped: false,
         };
@@ -1649,7 +1659,7 @@ mod tests {
             latest_version: "0.3.0".into(),
             tag_name: "v0.3.0".into(),
             current_version: "0.1.52".into(),
-            release_url: "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0".into(),
+            release_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.3.0"),
             is_newer: true,
             is_skipped: false,
         };
@@ -1689,8 +1699,12 @@ mod tests {
         assert_eq!(parts.len(), 2, "should be owner/repo format");
         assert!(!parts[0].is_empty(), "owner should not be empty");
         assert!(!parts[1].is_empty(), "repo should not be empty");
-        assert_eq!(parts[0], "Dicklesworthstone");
+        assert_eq!(parts[0], "klittle32");
         assert_eq!(parts[1], "coding_agent_session_search");
+        assert_ne!(
+            parts[0], "Dicklesworthstone",
+            "fork builds must not self-update from the upstream repository"
+        );
     }
 
     // =========================================================================
@@ -1780,7 +1794,7 @@ mod tests {
         // Start local server with valid release JSON
         let release_json = r#"{
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0"
+            "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v0.2.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -1903,7 +1917,7 @@ mod tests {
         // Test the full flow: fetch -> parse -> compare
         let release_json = r#"{
             "tag_name": "v0.3.0",
-            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0"
+            "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v0.3.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -1936,7 +1950,7 @@ mod tests {
         // Test handling of pre-release versions from server
         let release_json = r#"{
             "tag_name": "v0.2.0-beta.1",
-            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0-beta.1"
+            "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v0.2.0-beta.1"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
@@ -2080,7 +2094,7 @@ mod tests {
 
         let release_json = r#"{
             "tag_name": "v9.9.9",
-            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v9.9.9"
+            "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v9.9.9"
         }"#;
         let (addr, handle) = start_test_server(release_json, 200);
 
@@ -2137,7 +2151,7 @@ mod tests {
         // Validates the synchronous wrapper over the native HTTP client.
         let release_json = r#"{
             "tag_name": "v1.0.0",
-            "html_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v1.0.0"
+            "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v1.0.0"
         }"#;
 
         let (addr, handle) = start_test_server(release_json, 200);
