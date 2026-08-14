@@ -163,6 +163,9 @@ pub mod colors {
     /// Letta Code - deep teal tint
     pub const AGENT_LETTA_BG: Color = Color::rgb(16, 28, 48); // #101c30 - teal navy
 
+    /// Prime Agent - deep magenta tint, distinct from Pi Agent
+    pub const AGENT_PRIME_BG: Color = Color::rgb(48, 16, 42); // #30102a - magenta
+
     // ═══════════════════════════════════════════════════════════════════════════
     // ROLE-AWARE BACKGROUND TINTS - Subtle backgrounds per message type
     // ═══════════════════════════════════════════════════════════════════════════
@@ -479,6 +482,7 @@ impl ThemePalette {
             "hermes" => (colors::AGENT_HERMES_BG, PackedRgba::rgb(240, 200, 100)),     // Gold
             "goose" => (colors::AGENT_GOOSE_BG, PackedRgba::rgb(210, 170, 110)),       // Tan/bronze
             "letta_code" => (colors::AGENT_LETTA_BG, PackedRgba::rgb(90, 160, 255)),   // Teal-blue
+            "prime_agent" => (colors::AGENT_PRIME_BG, PackedRgba::rgb(255, 64, 196)), // Hot magenta
             "kimi" => (colors::AGENT_KIMI_BG, PackedRgba::rgb(190, 220, 80)), // Yellow-green
             "qwen" => (colors::AGENT_QWEN_BG, PackedRgba::rgb(80, 210, 180)), // Mint
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
@@ -518,6 +522,7 @@ impl ThemePalette {
             "hermes" => "▽",
             "goose" => "◍",
             "letta_code" => "◉",
+            "prime_agent" => "✶",
             "kimi" => "✧",
             "qwen" => "◒",
             _ => "•",
@@ -1665,6 +1670,7 @@ mod tests {
         "hermes",
         "kimi",
         "letta_code",
+        "prime_agent",
         "qwen",
     ];
 

@@ -246,6 +246,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "opencode",
     "openclaw",
     "pi_agent",
+    "prime_agent",
     "qwen",
     "vibe",
 ];
@@ -3087,6 +3088,7 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "crush" => ftui::PackedRgba::rgb(255, 120, 80), // coral
         "goose" => ftui::PackedRgba::rgb(210, 170, 110), // tan/bronze
         "letta_code" => ftui::PackedRgba::rgb(90, 160, 255), // teal-blue
+        "prime_agent" => ftui::PackedRgba::rgb(255, 64, 196), // hot magenta
         "kimi" => ftui::PackedRgba::rgb(190, 220, 80), // yellow-green
         "qwen" => ftui::PackedRgba::rgb(80, 210, 180), // mint
         _ => ftui::PackedRgba::rgb(169, 169, 169),     // gray fallback

@@ -51,6 +51,7 @@
     "factory",
     "openclaw",
     "antigravity",
+    "prime_agent",
     "kimi",
     "openhands",
     "copilot",
@@ -2161,7 +2162,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Prime Agent, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",

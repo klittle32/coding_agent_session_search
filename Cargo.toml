@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.24-letta.1"
+version = "0.6.25-letta-prime.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -98,7 +98,7 @@ bytemuck = "1.25.0"
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
 frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fbde80225914f02389e04af5970647034a8291d7", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
-franken-agent-detection = { version = "0.1.11-letta.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "394ba2a22773c1f63f701145383d28867797974e", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+franken-agent-detection = { version = "0.1.12-letta-prime.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "34d543ab5417ba04dc657ee08aa82fad8bc2eca4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

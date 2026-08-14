@@ -360,7 +360,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from 24 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
+Ingests history from 26 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model. `cass capabilities --json | jq .connectors` is the canonical machine-readable inventory (kept in lockstep with the runtime registry):
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -388,6 +388,7 @@ Ingests history from 24 local agents, normalizing them into a unified `Conversat
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
 - **Letta Code**: `~/.letta/transcripts/<agentId>/<conversationId>/transcript.jsonl` (override the transcript root with `LETTA_TRANSCRIPT_ROOT`). Identity is `<agentId>/<conversationId>`. Letta Code sessions are **not resumable**. Default remote probe is `~/.letta/transcripts`; a custom remote root may need an explicit `sources.toml` path rather than relying on a remote environment override. To try this fork next to Homebrew `cass` without touching the live archive, see [docs/CASS_LETTA_SANDBOX.md](docs/CASS_LETTA_SANDBOX.md).
+- **Prime Agent**: `~/.prime/agent/sessions/<session-id>.jsonl` (override with `PRIME_AGENT_SESSION_DIR`, legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, or `PRIME_AGENT_CODING_AGENT_DIR` which appends `/sessions`). Canonical slug `prime_agent`, display **Prime Agent**, distinct from `pi_agent`. Projection is the complete append-only history, including abandoned branches. Resume a local session with `prime-agent --resume <absolute local source_path>`. A custom per-run `--session-dir` is not auto-discovered unless you persist the env override or add an explicit CASS source.
 
 Claude Code Desktop sidecars preserve title, workspace, model, and session IDs,
 but not necessarily the full conversation body. If Claude Code has culled an old
@@ -2182,7 +2183,7 @@ classDiagram
 `cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/klittle32/franken_agent_detection) auto-discovers sessions from 25 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build, Letta Code).
+1. **Discovery**: [franken_agent_detection](https://github.com/klittle32/franken_agent_detection) auto-discovers sessions from 26 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Prime Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Hermes, Kimi, Qwen, Factory, OpenHands, Antigravity, Grok Build, Letta Code).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -3039,7 +3040,7 @@ Update check state is stored in the data directory:
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | crates.io `=0.2.1` (first registry release carrying the complete formerly git-pinned line — the existing-only schema-open contract that the old same-version `0.1.19` registry archive lacks [cass#345], deferred-FTS5-validation opens [cass#368], the FTS5 overlong-term skip cap [cass#362], the ns-lifecycle wave, and GH#294 mutation-free default-flags opens. The historical `[patch.crates-io]` git override is retired; `build.rs` instead fails the build if any patch entry targets the fsqlite family or the lockfile resolves any `fsqlite*` crate away from registry `0.2.1`. The 0.2 engine API is async; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge) |
-| `franken-agent-detection` | `394ba2a22773c1f63f701145383d28867797974e` (`0.1.11-letta.1` on `klittle32/franken_agent_detection`; native Letta Code connector plus the prior 0.1.10 connector set) |
+| `franken-agent-detection` | `34d543ab5417ba04dc657ee08aa82fad8bc2eca4` (`0.1.12-letta-prime.1` on `klittle32/franken_agent_detection`; native Letta Code + Prime Agent connectors plus the prior connector set) |
 | `asupersync` | `=0.3.10` |
 | `frankensearch` | `fbde8022` (accepted post-flip candidate; pure-Rust `native`, architecture-safe HNSW with native-only read admission that never rebuilds a rejected selected artifact, explicit `cass-compat` → `lexical-tantivy`, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, generation-pinned Quill hydration, and the restored positionless-term-frequency plumbing; frankentorch remains pinned by git rev inside frankensearch — cass #308, #333, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` | `5f78cfa0` |

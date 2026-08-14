@@ -133,6 +133,7 @@ fn connector_factories_all_instantiate_and_detect() {
         "amp",
         "aider",
         "pi_agent",
+        "prime_agent",
         "factory",
         "openclaw",
         "copilot",
@@ -158,7 +159,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 25, "Expected 25 connector factories");
+    assert_eq!(slugs.len(), 26, "Expected 26 connector factories");
 }
 
 // ---------------------------------------------------------------------------

@@ -579,7 +579,10 @@ fn appending_a_line_reindexes_only_the_expected_conversation() -> TestResult {
     let hits = search_hits(&home, &data_dir, APPEND_SENTINEL)?;
     assert!(!hits.is_empty(), "appended sentinel must be searchable");
     let sibling = search_hits(&home, &data_dir, "unchanged-sibling")?;
-    assert!(!sibling.is_empty(), "untouched sibling must remain searchable");
+    assert!(
+        !sibling.is_empty(),
+        "untouched sibling must remain searchable"
+    );
     Ok(())
 }
 

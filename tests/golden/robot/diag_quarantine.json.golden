@@ -96,6 +96,11 @@
       "found": false
     },
     {
+      "name": "prime_agent",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "kimi",
       "path": "(not detected)",
       "found": false

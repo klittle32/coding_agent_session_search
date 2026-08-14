@@ -645,6 +645,11 @@ fn infer_agent_type(path: &str) -> String {
         "antigravity".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
+    } else if path.contains(".prime/agent")
+        || path.contains("/.prime/")
+        || path.ends_with("/.prime")
+    {
+        "prime_agent".to_string()
     } else if path.contains("/.pi/") || path.ends_with("/.pi") {
         "pi_agent".to_string()
     } else if path.contains(".aider") {
@@ -1418,6 +1423,11 @@ CASS_VERSION=0.4.2
             "amp"
         );
         assert_eq!(infer_agent_type("~/.pi/agent/sessions"), "pi_agent");
+        assert_eq!(infer_agent_type("~/.prime/agent/sessions"), "prime_agent");
+        assert_ne!(
+            infer_agent_type("~/.prime/agent/sessions"),
+            infer_agent_type("~/.pi/agent/sessions")
+        );
     }
 
     // =========================================================================

@@ -108,8 +108,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/klittle32/franken_agent_detection",
-        expected_rev: "394ba2a22773c1f63f701145383d28867797974e",
-        expected_version: "0.1.11-letta.1",
+        expected_rev: "34d543ab5417ba04dc657ee08aa82fad8bc2eca4",
+        expected_version: "0.1.12-letta-prime.1",
         expected_features: &[
             "chatgpt",
             "connectors",

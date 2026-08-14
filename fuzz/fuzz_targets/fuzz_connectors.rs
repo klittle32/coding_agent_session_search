@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use arbitrary::Arbitrary;
-use coding_agent_search::connectors::{get_connector_factories, ScanContext, ScanRoot};
+use coding_agent_search::connectors::{ScanContext, ScanRoot, get_connector_factories};
 use libfuzzer_sys::fuzz_target;
 use tempfile::TempDir;
 
@@ -132,6 +132,12 @@ fn write_connector_layout(root: &Path, slug: &str, payload: &[u8]) {
             );
             write_payload(
                 root.join(".omp/agent/sessions/project/2025-12-01T10-00-00_fuzz.jsonl"),
+                payload,
+            );
+        }
+        "prime_agent" => {
+            write_payload(
+                root.join(".prime/agent/sessions/0198f000-0000-7000-8000-00000000fuzz.jsonl"),
                 payload,
             );
         }

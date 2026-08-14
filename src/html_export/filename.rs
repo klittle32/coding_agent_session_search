@@ -542,6 +542,7 @@ pub fn agent_slug(agent: &str) -> String {
         "codex" | "codexcli" => "codex".to_string(),
         "aider" => "aider".to_string(),
         "piagent" | "pi" => "piagent".to_string(),
+        "primeagent" | "prime" => "prime_agent".to_string(),
         "factory" | "droid" => "factory".to_string(),
         "opencode" => "opencode".to_string(),
         "cline" => "cline".to_string(),
@@ -984,6 +985,11 @@ mod tests {
         assert_eq!(agent_slug("ChatGPT"), "chatgpt");
         assert_eq!(agent_slug("gemini-cli"), "gemini");
         assert_eq!(agent_slug("github_copilot"), "copilot");
+        assert_eq!(agent_slug("prime_agent"), "prime_agent");
+        assert_eq!(agent_slug("prime-agent"), "prime_agent");
+        assert_eq!(agent_slug("prime"), "prime_agent");
+        assert_eq!(agent_slug("pi"), "piagent");
+        assert_ne!(agent_slug("prime"), agent_slug("pi"));
     }
 
     #[test]

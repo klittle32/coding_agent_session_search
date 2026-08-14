@@ -138,7 +138,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
-| `franken-agent-detection` | `394ba2a22773c1f63f701145383d28867797974e` (`0.1.11-letta.1`, fork `klittle32/franken_agent_detection`; Letta Code connector) |
+| `franken-agent-detection` | `34d543ab5417ba04dc657ee08aa82fad8bc2eca4` (`0.1.12-letta-prime.1`, fork `klittle32/franken_agent_detection`; Letta Code + Prime Agent connectors) |
 | `asupersync` | `=0.3.10` |
 | `frankensearch` | `fbde8022` (accepted post-flip candidate with explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
@@ -460,6 +460,7 @@ coding_agent_session_search/
 │   │   ├── gemini.rs             # Gemini sessions
 │   │   ├── grok.rs               # Grok Build sessions
 │   │   ├── letta_code.rs         # Letta Code client transcripts (FAD re-export)
+│   │   ├── prime_agent.rs        # Prime Agent sessions (FAD re-export)
 │   │   ├── aider.rs              # Aider sessions
 │   │   ├── amp.rs                # Amp sessions
 │   │   ├── chatgpt.rs            # ChatGPT sessions (encrypted)
@@ -570,6 +571,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
 | Letta Code | `letta_code.rs` | JSONL (`~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`) |
+| Prime Agent | `prime_agent.rs` | JSONL (`~/.prime/agent/sessions/<session-id>.jsonl`; distinct from `pi_agent`) |
 
 ### HTML Export (Robot Mode)
 

@@ -19,8 +19,9 @@ Repository: <https://github.com/klittle32/coding_agent_session_search>
 
 ### Added
 
-- **Letta Code client transcripts** via the frozen `klittle32/franken_agent_detection` pin (`0.1.11-letta.1` / `394ba2a2`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
-- Fork identity `0.6.24-letta.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
+- **Prime Agent sessions** via the frozen `klittle32/franken_agent_detection` pin (`0.1.12-letta-prime.1` / `34d543ab5417ba04dc657ee08aa82fad8bc2eca4`). Canonical slug `prime_agent`, display **Prime Agent**, default root `~/.prime/agent/sessions/<session-id>.jsonl`. Overrides: `PRIME_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_DIR`. Projection is the complete append-only history, including branches. Local resume: `prime-agent --resume <absolute source_path>`. Distinct from `pi_agent`.
+- Fork identity `0.6.25-letta-prime.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
+- **Letta Code client transcripts** via the same FAD fork (preserved from `0.6.24-letta.1`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
 - Sandbox runbook for running `cass-letta` beside Homebrew `cass` without sharing the live data dir ([docs/CASS_LETTA_SANDBOX.md](docs/CASS_LETTA_SANDBOX.md)).
 
 ## [v0.6.24] -- 2026-08-11
