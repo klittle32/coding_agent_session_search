@@ -72,10 +72,11 @@ remote env override.
 
 ## Side-by-side use with Homebrew cass
 
-The fork binary (`cass-letta`) and Homebrew `cass` share the same default data
-directory. Until you trust the fork, run it only against a throwaway data dir.
-See [CASS_LETTA_SANDBOX.md](CASS_LETTA_SANDBOX.md) for the wrapper, isolation
-rules, and a worked ingest that indexed Letta Code plus existing agents without
+The fork binaries (`cass-letta`, `cass-prime`) and Homebrew `cass` share the
+same default data directory. Until you trust the fork, run it only against a
+throwaway data dir. See [CASS_LETTA_SANDBOX.md](CASS_LETTA_SANDBOX.md) and
+[CASS_PRIME_SANDBOX.md](CASS_PRIME_SANDBOX.md) for the wrappers, isolation
+rules, and worked ingests that index Letta/Prime plus existing agents without
 writing the live archive.
 
 ## Drift alarm
