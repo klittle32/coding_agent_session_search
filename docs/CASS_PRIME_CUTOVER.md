@@ -7,9 +7,9 @@ onto that binary, then removed Homebrew `cass` so it could not be invoked by
 accident.
 
 **After reading this you should be able to** say what `cass` is on this
-machine, how watch/daemon are wired, what the first live index did and did
-not do, and how to roll back or run semantic catch-up without repeating the
-mistakes we avoided.
+machine, how watch/daemon are wired, what the first live lexical index and
+the later MiniLM semantic pass did, and how to roll back without repeating
+the mistakes we avoided.
 
 ## Current state (after cutover)
 
@@ -23,6 +23,7 @@ mistakes we avoided.
 | Live archive | `~/Library/Application Support/com.coding-agent-search.coding-agent-search` | Unchanged location. SQLite is source of truth. |
 | Prime sandbox | `~/.local/share/cass-prime-sandbox` | Left in place; not the daily store |
 | Letta sandbox | `~/.local/share/cass-letta-sandbox` | Left in place; not the daily store |
+| Quality vectors | live `vector_index` / MiniLM-384 | Caught up 2026-08-16 (~1h 36m semantic pass). 4,254 conversations / 411,925 docs. |
 
 `~/.local/bin` is ahead of `/opt/homebrew/bin` on `PATH`. After uninstall,
 `type cass` resolves only to the shim.
@@ -187,19 +188,69 @@ one-shot (`cass index --semantic --json`) or `cass models backfill`.
 Keeps MiniLM warm for hybrid embed/search. Logs:
 `~/Library/Logs/cass/daemon.{out,err}.log`.
 
-## Hybrid / semantic (not part of cutover)
+## Hybrid / semantic pass (same day, after cutover)
 
-Default *search* is already hybrid-preferred and fail-opens to lexical.
-`cass index --json` does not embed. New Prime/Letta rows are searchable
-lexically now. For MiniLM ranking of those new rows, after health/status
-ask for it:
+Default *search* is hybrid-preferred and fail-opens to lexical. The
+incremental `cass index --json` does **not** embed. After cutover, hybrid
+was already working on the **old** corpus (`fully_hybrid_refined`, no
+fallback). The quality MiniLM index was stale relative to the live DB:
 
-```bash
-cass index --semantic --json
-```
+- Built 2026-08-13: 3,810 conversations / 380,402 docs, `minilm-384`
+- `current_db_matches: false` after the Prime/Letta lexical ingest
+- Fast/hash progressive tier absent (`pending_work` stays true for that
+  unused tier). Leave it alone. `hnsw_ready` is false; only needed for
+  `--approximate`.
+- Watch does not embed. `pending.sessions` was 0, so another lexical
+  `cass index --json` was not required. Ignore stale-at-~80s / `--full`
+  nudges while watch is healthy.
 
-No `--full`. No `--watch`. Models are already installed. Do not combine
-`--semantic` with the always-on watch agent.
+MiniLM was already installed and verified
+(`models/all-MiniLM-L6-v2`, revision `c9745ed1…`). No `models install`.
+
+### What we ran (2026-08-16 06:51–08:27 local)
+
+1. **Unload watch only.** It held `index-run.lock` (pid 89765). Daemon
+   stayed up so MiniLM stayed warm:
+
+   ```bash
+   launchctl bootout "gui/$(id -u)/com.kyle.cass.index-watch"
+   ```
+
+   Stale lock from the dead watch pid was left on disk. The semantic job
+   reclaimed it (`job_kind=semantic_rebuild`, pid 8926).
+2. **One-shot semantic backfill** (no `--full`, no `--watch`, no
+   `--build-hnsw`):
+
+   ```bash
+   cass --color=never index --semantic --json
+   ```
+
+   Exit 0 in 5,787,389 ms (~1h 36m). Entrypoint `kind=semantic_backfill`.
+   Live `data_dir` / `db_path`. `quarantined_conversations=0`. Phases
+   included `semantic_initialize`, `semantic_replay`,
+   `semantic_embedding` (411,930 docs), `semantic_finalize`. Peak embed
+   rate ~90–140 docs/s, later ~30 docs/s. Along the way it also indexed 2
+   Cursor sessions that were lock-busy during the morning lexical pass.
+3. **Reload watch:**
+
+   ```bash
+   launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.kyle.cass.index-watch.plist
+   ```
+
+   Health may say `rebuilding` for a short window (`watch_startup`). That
+   is watch, not a failed semantic job.
+
+### Result
+
+| | Before pass | After pass |
+|---|---|---|
+| Quality conversations | 3,810 (2026-08-13) | 4,254 |
+| Quality docs | 380,402 | 411,925 |
+| `quality_tier_remaining` | 0 (but DB fingerprint stale) | 0 |
+| Hybrid probe | `fully_hybrid_refined` on old corpus | `fully_hybrid_refined`, no fallback |
+
+Do **not** add `--semantic` to the watch LaunchAgent. Future catch-up is
+the same one-shot if health/status show `current_db_matches: false` again.
 
 ## Rollback
 

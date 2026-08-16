@@ -24,7 +24,7 @@ Repository: <https://github.com/klittle32/coding_agent_session_search>
 - **Letta Code client transcripts** via the same FAD fork (preserved from `0.6.24-letta.1`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
 - Sandbox runbook for running `cass-letta` beside Homebrew `cass` without sharing the live data dir ([docs/CASS_LETTA_SANDBOX.md](docs/CASS_LETTA_SANDBOX.md)).
 - Sandbox runbook for running `cass-prime` beside Homebrew `cass` and `cass-letta` without sharing either existing data dir ([docs/CASS_PRIME_SANDBOX.md](docs/CASS_PRIME_SANDBOX.md)).
-- Live cutover record: `cass-prime` became the daily driver, LaunchAgents were retargeted, Homebrew `cass` was uninstalled ([docs/CASS_PRIME_CUTOVER.md](docs/CASS_PRIME_CUTOVER.md)).
+- Live cutover record: `cass-prime` became the daily driver, LaunchAgents were retargeted, Homebrew `cass` was uninstalled, then a MiniLM semantic backfill caught the live quality index up to 4,254 conversations ([docs/CASS_PRIME_CUTOVER.md](docs/CASS_PRIME_CUTOVER.md)).
 
 ## [v0.6.24] -- 2026-08-11
 
