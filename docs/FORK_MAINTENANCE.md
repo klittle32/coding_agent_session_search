@@ -70,14 +70,18 @@ Default remote roots are required. A custom remote root may need explicit
 `sources.toml` configuration; do not broaden the probe API just to chase a
 remote env override.
 
-## Side-by-side use with Homebrew cass
+## Daily driver vs sandboxes
 
-The fork binaries (`cass-letta`, `cass-prime`) and Homebrew `cass` share the
-same default data directory. Until you trust the fork, run it only against a
-throwaway data dir. See [CASS_LETTA_SANDBOX.md](CASS_LETTA_SANDBOX.md) and
-[CASS_PRIME_SANDBOX.md](CASS_PRIME_SANDBOX.md) for the wrappers, isolation
-rules, and worked ingests that index Letta/Prime plus existing agents without
-writing the live archive.
+On the cutover machine (2026-08-16), daily `cass` is a shim to `cass-prime`
+and Homebrew `cass` is uninstalled. See
+[CASS_PRIME_CUTOVER.md](CASS_PRIME_CUTOVER.md).
+
+`cass-prime` / `cass-letta` still share the **same default data directory**
+as a stock cass install. A new fork build should be proven against a
+throwaway data dir first. See [CASS_LETTA_SANDBOX.md](CASS_LETTA_SANDBOX.md)
+and [CASS_PRIME_SANDBOX.md](CASS_PRIME_SANDBOX.md). Do not `brew install
+cass` to “get a backup binary” — that bottle is upstream and has neither
+Prime nor Letta.
 
 ## Drift alarm
 

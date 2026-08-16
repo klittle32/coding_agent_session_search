@@ -2,8 +2,13 @@
 
 This fork ships a separate binary (`cass-prime`) that can index Prime Agent
 sessions **and** Letta Code transcripts, in addition to the agents upstream
-cass already supports. Homebrew `cass` remains the daily driver until you
-deliberately point the fork at the live archive.
+cass already supports.
+
+**2026-08-16:** the live daily driver on this machine is now `cass-prime`
+(via `~/.local/bin/cass`). Homebrew `cass` was uninstalled after that
+cutover. See [CASS_PRIME_CUTOVER.md](CASS_PRIME_CUTOVER.md). This sandbox
+runbook is still the way to test a new fork build without writing the live
+archive.
 
 **After reading this you should be able to** install `cass-prime` next to
 Homebrew `cass` and `cass-letta`, index your real local sessions (including
@@ -16,9 +21,14 @@ untouched.
 The three binaries are different files. They still share the **same default
 data directory** unless you override it.
 
-| | Daily driver | Letta sandbox (existing) | Prime sandbox (this check) |
+Pre-cutover layout (this is still the right isolation map for a *new*
+fork build). After 2026-08-16 the live column is served by `cass-prime`
+via the `~/.local/bin/cass` shim; Homebrew `cass` is gone.
+
+| | Live archive | Letta sandbox (existing) | Prime sandbox (this check) |
 |---|---|---|---|
-| Binary | Homebrew `cass` (`0.6.24`) | `~/.local/bin/cass-letta` (`0.6.24-letta.1`) | `~/.local/bin/cass-prime` (`0.6.25-letta-prime.1`) |
+| Binary (pre-cutover) | Homebrew `cass` (`0.6.24`) | `~/.local/bin/cass-letta` (`0.6.24-letta.1`) | `~/.local/bin/cass-prime` (`0.6.25-letta-prime.1`) |
+| Binary (after cutover) | `~/.local/bin/cass` → `cass-prime` | unchanged | unchanged |
 | Data dir | `~/Library/Application Support/com.coding-agent-search.coding-agent-search` | `~/.local/share/cass-letta-sandbox` | `~/.local/share/cass-prime-sandbox` |
 | SQLite | `<live>/agent_search.db` | `<letta-sandbox>/agent_search.db` | `<prime-sandbox>/agent_search.db` |
 
@@ -201,12 +211,16 @@ copy. Do not delete:
 - `~/.local/share/cass-letta-sandbox`
 - `~/.prime/agent/sessions` (those are the real Prime logs)
 
-Removing `~/.local/bin/cass-prime` removes only the extra binary. Homebrew
-`cass` and `cass-letta` stay.
+Removing `~/.local/bin/cass-prime` removes the extra binary (and, after
+cutover, breaks daily `cass` and the LaunchAgents). Do not do that on the
+cutover machine. `cass-letta` and the two sandbox data dirs stay.
 
 ## When you are ready to stop sandboxing
 
-Pointing `cass-prime` at the live data dir is a deliberate switch, not the
-default. Do that only after you are comfortable with the fork. Until then,
-Homebrew `cass` stays the daily driver and every Prime-fork command goes
-through `cass_prime_safe`.
+That switch already happened on this machine (2026-08-16). The ordered
+steps, LaunchAgent edits, incremental live index, Homebrew uninstall, and
+rollback notes are in [CASS_PRIME_CUTOVER.md](CASS_PRIME_CUTOVER.md).
+
+If you are on a *different* machine that still uses Homebrew `cass` as the
+daily driver, do not point `cass-prime` at that live data dir until you
+mean to. Until then, every Prime-fork command goes through `cass_prime_safe`.
