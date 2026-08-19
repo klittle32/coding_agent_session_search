@@ -8,22 +8,24 @@ accident.
 
 **After reading this you should be able to** say what `cass` is on this
 machine, how watch/daemon are wired, what the first live lexical index and
-the later MiniLM semantic pass did, and how to roll back without repeating
-the mistakes we avoided.
+the later MiniLM semantic pass did, how to unstick a 160/512 MiB lexical
+deadlock without `--full` or `--semantic`, how to verify hybrid MiniLM is
+actually working (search probe beats `status`), and how to roll back
+without repeating the mistakes we avoided.
 
 ## Current state (after cutover)
 
 | Role | Path | Version / notes |
 |---|---|---|
 | Daily `cass` | `~/.local/bin/cass` | 193-byte shim; `exec`s `cass-prime` |
-| Real binary | `~/.local/bin/cass-prime` | `0.6.25-letta-prime.1` |
+| Real binary | `~/.local/bin/cass-prime` | `0.6.26-letta-prime.1` (`7e18f544`). Previous kept as `cass-prime.0.6.25-letta-prime.1` |
 | Sandbox wrapper | `~/.local/bin/cass-prime-safe` | Forces `CASS_DATA_DIR=~/.local/share/cass-prime-sandbox`, unsets `CASS_DAEMON_SOCKET` |
 | Older Letta fork | `~/.local/bin/cass-letta` | `0.6.24-letta.1`; still sandbox-only |
 | Homebrew `cass` | *(removed)* | Was Cellar `0.6.24`; `brew uninstall --formula cass` on 2026-08-16. Not `--zap`. |
 | Live archive | `~/Library/Application Support/com.coding-agent-search.coding-agent-search` | Unchanged location. SQLite is source of truth. |
 | Prime sandbox | `~/.local/share/cass-prime-sandbox` | Left in place; not the daily store |
 | Letta sandbox | `~/.local/share/cass-letta-sandbox` | Left in place; not the daily store |
-| Quality vectors | live `vector_index` / MiniLM-384 | Caught up 2026-08-16 (~1h 36m semantic pass). 4,254 conversations / 411,925 docs. |
+| Quality vectors | live `vector_index` / MiniLM-384 | Caught up 2026-08-19 via `models backfill --tier quality`. 4,321 conversations / 37,970 docs. `current_db_matches=true`. |
 
 `~/.local/bin` is ahead of `/opt/homebrew/bin` on `PATH`. After uninstall,
 `type cass` resolves only to the shim.
@@ -177,7 +179,8 @@ Lexical + file watch only. Extra env:
 `~/Library/Logs/cass/index-watch.{out,err}.log`.
 
 Do **not** add `--semantic` to this agent. Semantic/hybrid vectors are a
-one-shot (`cass index --semantic --json`) or `cass models backfill`.
+one-shot `cass models backfill --tier quality --embedder fastembed`.
+Do **not** use `cass index --semantic` on this archive (see 2026-08-19).
 
 ### `com.kyle.cass.daemon`
 
@@ -249,8 +252,145 @@ MiniLM was already installed and verified
 | `quality_tier_remaining` | 0 (but DB fingerprint stale) | 0 |
 | Hybrid probe | `fully_hybrid_refined` on old corpus | `fully_hybrid_refined`, no fallback |
 
-Do **not** add `--semantic` to the watch LaunchAgent. Future catch-up is
-the same one-shot if health/status show `current_db_matches: false` again.
+Do **not** add `--semantic` to the watch LaunchAgent. Future quality
+catch-up is `cass models backfill --tier quality --embedder fastembed`
+(loop until `published=true`), **not** `cass index --semantic`.
+
+## 2026-08-19: lexical deadlock and quality MiniLM republish
+
+After merging upstream `v0.6.25` onto the fork and installing
+`0.6.26-letta-prime.1`, lexical + MiniLM needed a refresh. The 2026-08-16
+recipe (`cass index --semantic`) is **wrong on this archive now**.
+
+### What went wrong
+
+`cass index --semantic` always does a **lexical rebuild first**, then embeds.
+On this machine that chose a 4,321-conversation rebuild and froze at
+**160/4321** with `inflight_message_bytes=536870912` (the 512 MiB
+responsiveness cap). CPU idle, `persist_in_progress=false`, then exit 70
+(stall abort). Closest upstream issues: #382, #400. The #290 8 MiB
+transcript cap already fired and did not unstick it.
+
+Raising `CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES` to 2 GiB **without**
+disabling the governor only showed `near_limit=640MB` and froze again at 256.
+`CASS_INDEX_STALL_ABORT_SECS=0` alone kept the heartbeat alive for hours with
+no progress. Incremental `cass index --json` (no `--semantic`) also picked
+the same 4,321 full rebuild and died at 160.
+
+Watch holding `index-run.lock` caused the first attempts to exit 7. Boot it
+out before any manual index. `pgrep` for `cass-prime index` can miss
+`cass-prime --color=never index --json` — kill by the actual leftover pid.
+
+### What unstuck lexical
+
+```bash
+launchctl bootout "gui/$(id -u)/com.kyle.cass.index-watch"
+CASS_INDEX_STALL_ABORT_SECS=0 \
+CASS_RESPONSIVENESS_DISABLE=1 \
+CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES=8589934592 \
+CASS_RESPONSIVENESS_MAX_WORKERS=1 \
+cass --color=never index --json
+```
+
+Completed exit 0 in ~64s: 4,321 conversations, 427,877 messages, 0
+quarantined. Strategy: `deferred_authoritative_db_rebuild` / resume
+incomplete checkpoint. Do **not** use `--full`.
+
+### Quality semantic (best results)
+
+`--tier quality` **is** the top cass tier (`minilm` / `fastembed`, 384-d).
+`--tier fast` is the cheap hash index. There is no better embedder in this
+binary. HNSW is lookup speed only. Reranker is query-time and this install
+is missing `tokenizer.json`.
+
+```bash
+launchctl bootout "gui/$(id -u)/com.kyle.cass.index-watch"
+CASS_INDEX_STALL_ABORT_SECS=0 cass --color=never models backfill \
+  --tier quality --embedder fastembed --batch-conversations 8192 --json
+```
+
+Rerun until `published=true`. 2026-08-19: six batches, then publish —
+4,321 conversations / 37,970 docs, `embedder_id=minilm-384`,
+`quality_tier.current_db_matches=true`. Then:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.kyle.cass.index-watch.plist
+```
+
+Watch must come back as `incremental_inline`, not another 4,321 rebuild.
+Health may say `rebuilding` / `watch_startup` for a short window. Daemon
+stays up the whole time.
+
+### Post-refresh verification (what “good to go” actually means)
+
+Do **not** trust `cass status --json` alone. After watch reloads it often
+looks unhealthy even when hybrid MiniLM search is working. Run this
+sequence; the search probe is the truth surface.
+
+```bash
+cass --version
+# expect: 0.6.26-letta-prime.1 (or newer cass-prime), via ~/.local/bin/cass
+
+cass health --json
+# go: healthy=true, recommended_action=null
+# wait: status=rebuilding, rebuild_progress.phase starts with watch_startup,
+#       stalled=false. Poll; do not start a second writer.
+
+uid=$(id -u)
+launchctl print "gui/${uid}/com.kyle.cass.index-watch" | awk '/pid =|state =/'
+launchctl print "gui/${uid}/com.kyle.cass.daemon" | awk '/pid =|state =/'
+# go: both running. Watch command must be
+#   cass-prime index --watch --watch-interval 30
+# Daemon stays up the whole time.
+
+# Watch must have chosen incremental, not another 4321 full rebuild:
+#   selected_lexical_population_strategy strategy="incremental_inline"
+grep -E 'selected_lexical_population_strategy|streaming_indexing_complete|watch mode:' \
+  ~/Library/Logs/cass/index-watch.err.log | tail -n 20
+
+cass status --json
+# Read these fields, not the top-level status string:
+#   pending.sessions == 0, pending.watch_active == true
+#   rebuild.phase == "watch", rebuild.stalled == false
+#   ingest_quarantine.quarantined_conversations == 0
+#   semantic.quality_tier.ready == true
+#   semantic.quality_tier.embedder_id == "minilm-384"
+#   semantic.quality_tier.conversation_count matches the live archive
+#
+# Often false right after watch ingests a couple of new sessions:
+#   index.fingerprint.matches_current_db_fingerprint
+#   semantic.quality_tier.current_db_matches
+#   semantic.can_search / quality_tier_published
+# That is a 2-session (or similar) fingerprint lag, not a deadlock.
+# Ignore recommended_action "cass index --full" and
+# semantic.hint "cass index --semantic".
+
+cass search "authentication error" --robot --limit 3 --fields summary --robot-meta --color=never
+# go: _meta.search_mode == "hybrid"
+#     _meta.semantic_refinement == true
+#     _meta.refinement_level == "fully_hybrid_refined"
+#     _meta.fallback_tier == null
+#     query_plan.phases lexical + semantic both realized=true
+# The _warning about stale index / --full is the usual ~80s nudge.
+# Ignore it while watch is in phase=watch and health is healthy.
+```
+
+2026-08-19 observed after the quality publish + watch reload:
+
+| Check | Result |
+|---|---|
+| Binary | `cass 0.6.26-letta-prime.1 (7e18f5443ce6 2026-08-18)` at `~/.local/bin/cass` → `cass-prime` |
+| Health | `healthy=true` once watch left `watch_startup` |
+| Watch | pid 23310, `incremental_inline`, then `phase=watch`; ingested 2 Cursor sessions / 319 messages |
+| Daemon | pid 20835, MiniLM warm |
+| Search probe | hybrid MiniLM, `fully_hybrid_refined`, 3 hits, no fallback |
+| Quality tier | present, ready, `minilm-384`, 4,321 convos / 37,970 docs |
+| Fingerprint lag | checkpoint `content-v1:4321:4489:602446` vs live `…:602596` after those 2 Cursor sessions. Status said unhealthy / `current_db_matches=false`. Search still refined. |
+| Fast/hash tier | unused. Leave it. |
+| Quarantine | 0 |
+
+A later `models backfill --tier quality` closes the 2-session MiniLM gap if
+you want a perfect fingerprint. It is not required for daily hybrid search.
 
 ## Rollback
 
