@@ -57,16 +57,48 @@ where
                 .build()
                 .expect("failed to build Quill sync-bridge runtime")
         });
-    let output = runtime.block_on(async {
-        let cx = Cx::for_request();
-        call(cx).await
-    });
-    DRIVER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(runtime);
+    // Restore the runtime on the way out even if the driven future panics.
+    //
+    // The slot is TAKEN for the duration of the call so a reentrant bridge call
+    // finds it empty and builds its own runtime instead of re-entering
+    // `block_on` on this one. That take must be paired with a put-back on every
+    // exit path: with a plain sequential restore, a panic escaping `block_on`
+    // would unwind past it and leave the slot permanently empty, so every later
+    // call on this thread would build a fresh runtime. Not a correctness bug —
+    // a fresh runtime is always valid — but it silently converts a cached
+    // runtime into a per-call allocation for the rest of the thread's life.
+    struct RestoreOnDrop(Option<Runtime>);
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                DRIVER.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    // Only reclaim the slot if it is still empty: a reentrant
+                    // call may have built and parked its own runtime while this
+                    // one was driving, and clobbering it would drop a live
+                    // runtime that an outer frame is still using.
+                    if slot.is_none() {
+                        *slot = Some(runtime);
+                    }
+                });
+            }
         }
-    });
+    }
+
+    // The guard OWNS the runtime across the call, so an unwind runs its Drop
+    // with the runtime still in hand. Setting the guard after `block_on`
+    // returns would be pointless: a panic unwinds before that assignment and
+    // drops the runtime instead of parking it.
+    let guard = RestoreOnDrop(Some(runtime));
+    let output = guard
+        .0
+        .as_ref()
+        .expect("sync-bridge runtime is present for the duration of the call")
+        .block_on(async {
+            let cx = Cx::for_request();
+            call(cx).await
+        });
+    drop(guard);
     output
 }
 
@@ -99,7 +131,15 @@ pub struct QuillLexicalDocHit {
     pub rank: usize,
     /// Snapshot-global document id, used to read stored columns back.
     pub global_docid: u32,
-    /// External document identity, `"{source_id}#{msg_idx}"`.
+    /// External document identity, as minted by
+    /// [`frankensearch::quill::cass::cass_document_identity`].
+    ///
+    /// Deliberately NOT documented as a literal format string: the shape is the
+    /// engine's to define and it has already changed once (it was
+    /// `"{source_id}#{msg_idx}"` until that proved non-unique — one `source_id`
+    /// covers every locally discovered conversation, so message 0 of each
+    /// collided). Treat it as an opaque identity; if you need the parts, read
+    /// the stored columns rather than parsing this.
     pub document_id: String,
 }
 
@@ -358,33 +398,49 @@ impl QuillCassIndex {
     pub fn open_or_create(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let directory = path.to_path_buf();
-        // `open_with_schema` refuses a directory that holds no published
-        // manifest, so an absent index is created rather than reported.
+        // Create ONLY when the directory holds no published manifest.
+        //
+        // The obvious spelling — try `open_with_schema`, fall back to
+        // `create_with_schema` on any error — is wrong: it converts every open
+        // failure into "make a new index", so a corrupt manifest, a permission
+        // error, or a schema mismatch would all silently produce an empty index
+        // in place of the real one. Deciding on the marker's presence keeps
+        // "absent" separate from "broken", and lets a genuine open failure
+        // propagate.
+        //
+        // `create_with_schema` is create-or-open-compatible, so two processes
+        // racing on a fresh directory both end up with the same index rather
+        // than one failing.
+        let index_exists = path.join(QUILL_INDEX_MARKER).exists();
         let index = drive(|cx| {
             let directory = directory.clone();
             async move {
-                match QuillIndex::open_with_schema(
-                    &cx,
-                    directory.clone(),
-                    CASS_SEMANTIC_SCHEMA,
-                    QuillConfig::default(),
-                )
-                .await
-                {
-                    Ok(index) => Ok(index),
-                    Err(_) => {
-                        QuillIndex::create_with_schema(
-                            &cx,
-                            directory,
-                            CASS_SEMANTIC_SCHEMA,
-                            QuillConfig::default(),
-                        )
-                        .await
-                    }
+                if index_exists {
+                    QuillIndex::open_with_schema(
+                        &cx,
+                        directory,
+                        CASS_SEMANTIC_SCHEMA,
+                        QuillConfig::default(),
+                    )
+                    .await
+                } else {
+                    QuillIndex::create_with_schema(
+                        &cx,
+                        directory,
+                        CASS_SEMANTIC_SCHEMA,
+                        QuillConfig::default(),
+                    )
+                    .await
                 }
             }
         })
-        .map_err(|error| anyhow!("opening Quill CASS index: {error}"))?;
+        .map_err(|error| {
+            anyhow!(
+                "{} Quill CASS index at {}: {error}",
+                if index_exists { "opening" } else { "creating" },
+                path.display()
+            )
+        })?;
         let mut index = Self {
             index,
             directory: path.to_path_buf(),
@@ -396,7 +452,7 @@ impl QuillCassIndex {
         // zero documents (an empty corpus, or a rebuild that finds nothing)
         // must still leave behind a readable, contract-valid index rather than
         // a directory that later reads as "no index here".
-        if !path.join(QUILL_INDEX_MARKER).exists() {
+        if !index_exists {
             index.commit()?;
         }
         Ok(index)

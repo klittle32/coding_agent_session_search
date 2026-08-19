@@ -488,6 +488,16 @@ fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
     index_path.join(FEDERATED_SEARCH_MANIFEST_FILE)
 }
 
+/// Write the schema-generation sentinel.
+///
+/// Deliberately a plain `fs::write` rather than a temp-file-plus-rename. A crash
+/// mid-write leaves a truncated file, which `current_schema_hash_file_matches`
+/// fails to parse and `wipe_index_dir_on_schema_hash_mismatch` therefore treats
+/// as a mismatch — the index is discarded and rebuilt. That is the FAIL-SAFE
+/// direction: the cost of a torn sentinel is a rebuild, never a stale-schema
+/// index read as current. Making it atomic would only save an unnecessary
+/// rebuild in a rare crash window, and the atomic helpers in this tree are
+/// private to other modules.
 fn write_root_schema_hash_file(index_path: &Path) -> Result<()> {
     fs::write(
         index_path.join("schema_hash.json"),
@@ -929,6 +939,14 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // No `meta.json` fallback here, unlike `searchable_index_exists` — the
+    // asymmetry is deliberate. `exists` answers "is there an index generation
+    // here?", so a pre-migration Tantivy directory counts (it is an index, and
+    // recognizing it is what makes the flip REBUILD rather than mistake the
+    // directory for empty). This function answers "is the index usable by the
+    // current engine?", and a Tantivy `meta.json` is not: Quill cannot read
+    // those segments. Accepting it here would report a contract-valid index
+    // that no reader can open.
     if !index_path
         .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
         .exists()
@@ -1359,6 +1377,27 @@ pub fn publish_federated_searchable_index_directories_with_summaries(
 /// A missing hash file is NOT a mismatch: a directory with no recorded hash is
 /// either brand new or pre-dates the sentinel, and both cases are handled by
 /// writing the current hash after creation.
+///
+/// # This deletes the sidecars too, deliberately
+///
+/// The generation directory holds more than segments: `.lexical-rebuild-state.json`,
+/// `.lexical-rebuild-equivalence.json`, `.lexical-refresh-ledger.json`,
+/// `.lexical-refresh-evidence.json`, and `lexical-generation-manifest.json` all
+/// live here. Every one of them describes THIS generation's index, so once the
+/// index is discarded for a schema mismatch they describe something that no
+/// longer exists — a checkpoint whose committed offsets index documents in a
+/// different field layout is worse than no checkpoint, because resuming from it
+/// would append current-schema documents onto a stale-schema index.
+///
+/// `load_lexical_rebuild_state` maps a missing state file to `Ok(None)`, which
+/// the caller reads as restart-from-zero. That is exactly right here: a schema
+/// mismatch means the whole generation is rebuilt regardless.
+///
+/// This matches the Tantivy backend's behavior, which called
+/// `remove_dir_all(path)` on the same condition (`cass_compat.rs`), so the flip
+/// preserves it rather than introducing it. Anything that must OUTLIVE a
+/// generation belongs in the index ROOT (e.g. `.lexical-publish-backups/`),
+/// not inside the generation directory.
 fn wipe_index_dir_on_schema_hash_mismatch(index_path: &Path) -> Result<()> {
     let schema_hash_path = index_path.join("schema_hash.json");
     if !schema_hash_path.exists() {
@@ -1423,6 +1462,11 @@ impl TantivyIndex {
         writer_parallelism: usize,
     ) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
+        // Same mismatch guard as `open_or_create`. Without it this constructor
+        // would open a stale-schema index and then `write_root_schema_hash_file`
+        // would STAMP it as current — turning a detectable mismatch into a
+        // silent one, which is strictly worse than not checking at all.
+        wipe_index_dir_on_schema_hash_mismatch(path)?;
         // Quill does not take a per-index writer-thread count: the CASS schema
         // is wider than the shipping five-field shape, so its ingest takes the
         // scalar route by construction and there are no writer threads to
