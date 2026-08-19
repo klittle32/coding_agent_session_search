@@ -33,8 +33,20 @@ beads.right.meta.json
 !metadata.json
 !config.json
 
+# Timestamped issues.jsonl copies from filter/import salvage
+issues.jsonl.pre-*
+
+# br fsqlite WAL-cert sidecars — per-machine runtime, like -wal/-shm
+*.db-wal-cert*
+
 # Local history backups
 .br_history/
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm.
+# Covers beads.db-fsqlite-ns-{gate,use} and vacuum copies named
+# .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
+*-fsqlite-ns-gate
+*-fsqlite-ns-use

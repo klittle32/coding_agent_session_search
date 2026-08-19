@@ -19,12 +19,103 @@ Repository: <https://github.com/klittle32/coding_agent_session_search>
 
 ### Added
 
-- **Prime Agent sessions** via the frozen `klittle32/franken_agent_detection` pin (`0.1.12-letta-prime.1` / `34d543ab5417ba04dc657ee08aa82fad8bc2eca4`). Canonical slug `prime_agent`, display **Prime Agent**, default root `~/.prime/agent/sessions/<session-id>.jsonl`. Overrides: `PRIME_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_DIR`. Projection is the complete append-only history, including branches. Local resume: `prime-agent --resume <absolute source_path>`. Distinct from `pi_agent`.
-- Fork identity `0.6.25-letta-prime.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
+- **Prime Agent sessions** via the frozen `klittle32/franken_agent_detection` pin (`0.1.12-letta-prime.1` / `0b04f8a2251ec775ecc23578793172976de15516`). Canonical slug `prime_agent`, display **Prime Agent**, default root `~/.prime/agent/sessions/<session-id>.jsonl`. Overrides: `PRIME_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_DIR`. Projection is the complete append-only history, including branches. Local resume: `prime-agent --resume <absolute source_path>`. Distinct from `pi_agent`.
+- Fork identity `0.6.26-letta-prime.1` with self-update targeting `klittle32/coding_agent_session_search` so this binary cannot install Dicklesworthstone releases.
 - **Letta Code client transcripts** via the same FAD fork (preserved from `0.6.24-letta.1`). Default root `~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`; local override `LETTA_TRANSCRIPT_ROOT`. Letta Code is non-resumable.
+- FAD pin advanced to `0b04f8a2` (Muse, Copilot VS Code JSON/JSONL store, fsqlite 0.3) while keeping Letta Code and Prime Agent.
 - Sandbox runbook for running `cass-letta` beside Homebrew `cass` without sharing the live data dir ([docs/CASS_LETTA_SANDBOX.md](docs/CASS_LETTA_SANDBOX.md)).
 - Sandbox runbook for running `cass-prime` beside Homebrew `cass` and `cass-letta` without sharing either existing data dir ([docs/CASS_PRIME_SANDBOX.md](docs/CASS_PRIME_SANDBOX.md)).
 - Live cutover record: `cass-prime` became the daily driver, LaunchAgents were retargeted, Homebrew `cass` was uninstalled, then a MiniLM semantic backfill caught the live quality index up to 4,254 conversations ([docs/CASS_PRIME_CUTOVER.md](docs/CASS_PRIME_CUTOVER.md)).
+- **Build commit embedded in the binary** ([#399](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/399)).
+  `cass --version` now prints `cass <semver> (<short-sha> <commit-date>)` for
+  builds made from a git checkout (with a `-dirty` suffix for uncommitted
+  worktrees), so a `main` build and the nearest tagged release are no longer
+  indistinguishable at runtime. `capabilities --json` and `api-version --json`
+  gain machine-readable `build_commit` / `build_commit_date` fields
+  (`"unknown"` for builds without git metadata, e.g. crates.io). The commit is
+  resolved at
+  compile time against the crate's own checkout — never at runtime against the
+  process CWD.
+- **`cass health --binary-only`** ([#398](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/398)).
+  Same readiness report, but the exit code reflects only whether the
+  executable itself works — archive conditions (stale index, active rebuild,
+  uninitialized or degraded archive) are still fully reported yet never fail
+  the exit code. Built for binary promotion gates and packaging smoke tests
+  that must validate a candidate binary on a host whose archive happens to be
+  stale. The JSON payload carries the active `exit_policy`
+  (`"archive"`/`"binary-only"`).
+
+### Fixed
+
+- **`--db` now isolates the whole sandbox, not just the SQLite file**
+  ([#403](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/403)).
+  When `--db` points outside the default data dir, derived assets — lexical
+  index, raw-mirror, checkpoints, `index-run.lock` — resolve to the db file's
+  parent directory instead of silently reading and writing the LIVE install's
+  data dir (which previously let a throwaway `--db` rebuild overwrite the live
+  lexical checkpoint fingerprint and contend for live locks). An explicit
+  `--data-dir` still wins; `--db` inside the default data dir keeps today's
+  behavior.
+- **`cass health` no longer reports `db=available` / "Search usable now: yes"
+  on an unopenable archive** ([#396](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/396)).
+  The health fast surface still elides busy/lock-class open failures (a
+  concurrent writer is not a degraded-state signal), but hard failures —
+  CANTOPEN, corrupt header, permissions — now surface as an open error, flip
+  the readiness class to `db=open-failed`, and exit unhealthy, matching what
+  `cass search` actually experiences.
+
+## [v0.6.25] -- 2026-08-14
+
+**The FrankenSQLite 0.3.1 engine wave plus the post-v0.6.24 GitHub-issue
+triage fixes. The whole franken dependency family moves in lockstep: fsqlite
+`=0.3.1` (crates.io), asupersync `=0.4.4`, frankensearch remote head
+`14d1480a` (tantivy 0.27), and franken-agent-detection `57d2789e`.**
+
+### Changed
+
+- **FrankenSQLite `=0.2.1` → `=0.3.1`.** Carries the asupersync-0.4.3 runtime
+  migration, the 0.3.0 fix wave (GH#333 concurrent-open BusyRecovery retries;
+  GH#334 `FileIdentity` re-derivation after file replacement — including the
+  cass#393 macOS post-reboot `st_dev` namespace-sidecar repair; the 8-writer
+  rollback cascade; cross-connection visibility), and the 0.3.1 correctness
+  wave (allocator post-savepoint page-aliasing quarantine, committed-freelist
+  resurrection refusal, shared concurrent-writer EOF high-water, sidecar-less
+  read-only first-contact opens [fsqlite GH#140], Darwin OFD locking).
+- **asupersync `=0.3.10` → `=0.4.4`** (fsqlite 0.3.x requires the 0.4.x line;
+  the 0.3.x and 0.4.x asupersync type universes are non-interchangeable.
+  0.4.4 preserves a spawned task's typed result across cancellation
+  acknowledgement instead of letting a concurrent abort erase it).
+- **frankensearch pinned to remote head `14d1480a`** (491 commits past the
+  previous `fbde8022` pin; brings tantivy 0.27). cass's segment-assembly path
+  was ported off the removed `SegmentMeta::list_files()` API and the
+  progressive-lexical adapter's `doc_count` now returns `Result`.
+- **franken-agent-detection `88fc6783` → `57d2789e`** (fsqlite 0.3.x +
+  asupersync 0.4.3 lockstep bump; 1004 tests green on the new stack).
+
+### Fixed
+
+- **#394**: one-shot `cass index --semantic` no longer re-embeds the entire
+  corpus when the embedding watermark already covers the newest message and a
+  vector index exists (the skip was previously gated on watch mode only).
+- **#392**: `cass sources sync` now tells the truth when transfers fail:
+  top-level `status` is `complete`/`partial`/`failed` (with
+  `sources_attempted`/`sources_with_failures`/`sources_fully_failed` counts),
+  exit 12 when every attempted source failed all paths, exit 8 on partial
+  failure.
+- **#377**: watch-once paths are absolutized and symlink-resolved at resolve
+  time, so relative or symlinked inputs match connector scan roots instead of
+  silently producing a skipped run; uncanonicalizable paths warn loudly.
+- **#383** (partial): the semantic-resume "has message after cursor" probe now
+  answers from `conversation_tail_state` plus one exact `(conversation_id,
+  idx)` point lookup instead of walking conversation histories, with fallback
+  to the exhaustive probe when tail state is absent.
+- **#397**: the TUI no longer triggers a full analytics auto-rebuild on every
+  launch for corpora with no API token metadata — an empty `token_usage`
+  ledger with an empty `token_daily_stats` rollup is now a terminal fresh
+  state for Track B. And `cass analytics rebuild --track a|b|all` now exists,
+  so the `--track all` action that `analytics validate` has been recommending
+  is finally runnable (Track B rebuilds route through
+  `rebuild_token_daily_stats`).
 
 ## [v0.6.24] -- 2026-08-11
 

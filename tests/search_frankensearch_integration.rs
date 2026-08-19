@@ -149,9 +149,32 @@ fn cass_selects_only_the_explicit_tantivy_compatibility_surface() {
         lockfile.contains("name = \"frankensearch-lexical\""),
         "the CASS compatibility graph must contain the Tantivy-backed lexical crate"
     );
+    // INVERTED BY THE CASS->QUILL FLIP, intent preserved.
+    //
+    // Before the flip Quill was not a cass dependency, so its ABSENCE proved
+    // that `cass-compat` was not implicitly dragging it in. Quill is now the
+    // lexical backend, so absence would mean the backend is missing entirely.
+    //
+    // The property worth guarding is unchanged — Quill must be acquired
+    // EXPLICITLY, never as a silent transitive effect of another feature — so
+    // the check is now: the crate is present AND the manifest names the `quill`
+    // feature itself. Deleting the assertion would have dropped the
+    // explicitness guarantee along with the stale expectation.
     assert!(
-        !lockfile.contains("name = \"frankensearch-quill\""),
-        "CASS must not acquire Quill merely by selecting cass-compat"
+        lockfile.contains("name = \"frankensearch-quill\""),
+        "the lexical backend crate must be in the graph after the CASS->Quill flip"
+    );
+    let manifest_text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .expect("read Cargo.toml");
+    let frankensearch_dep_line = manifest_text
+        .lines()
+        .find(|line| line.starts_with("frankensearch = "))
+        .expect("frankensearch dependency line");
+    assert!(
+        frankensearch_dep_line.contains("\"quill\""),
+        "Quill must be selected explicitly in the frankensearch feature list, not acquired transitively"
     );
 
     let mut generic_imports = Vec::new();
@@ -457,6 +480,11 @@ fn lexical_search_through_frankensearch_pipeline() {
 /// to survive the facade flip: create, ingest, commit, reopen, merge, query,
 /// drop, and fresh reopen.
 #[test]
+// Merges two independently-built shard directories, which is the Tantivy-only
+// N-directory merge. Quill's concat_merge joins segments within ONE manifest,
+// so the staged-shard strategy that needed this is disabled for the Quill
+// backend. Ignored rather than weakened; see the `staged_shard_plan` binding.
+#[ignore = "Tantivy-only shard merge; unreachable on the Quill backend"]
 fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
     assert_eq!(
         frankensearch::lexical_tantivy::CASS_SCHEMA_VERSION,
@@ -510,9 +538,19 @@ fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
         || {
             let left = TantivyIndex::open_or_create(&left_path).expect("reopen left shard");
             let right = TantivyIndex::open_or_create(&right_path).expect("reopen right shard");
-            assert_eq!(left.reader().expect("left reader").searcher().num_docs(), 1);
             assert_eq!(
-                right.reader().expect("right reader").searcher().num_docs(),
+                left.reader()
+                    .expect("left reader")
+                    .doc_count()
+                    .expect("doc count"),
+                1
+            );
+            assert_eq!(
+                right
+                    .reader()
+                    .expect("right reader")
+                    .doc_count()
+                    .expect("doc count"),
                 1
             );
             drop((left, right));
@@ -526,8 +564,8 @@ fn cass_schema_v8_survives_create_merge_query_and_fresh_reopen() {
                 merged
                     .reader()
                     .expect("merged reader")
-                    .searcher()
-                    .num_docs(),
+                    .doc_count()
+                    .expect("doc count"),
                 2
             );
         },

@@ -47,16 +47,17 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin since the fsqlite 0.2.1 migration (bead
-        // bo000): the published 0.2.1 archive contains the complete formerly
-        // git-pinned line (existing-only schema opens, deferred-FTS5
-        // validation, ns-lifecycle wave) plus GH#294 mutation-free opens.
+        // crates.io-only exact pin (established with the fsqlite 0.2.1
+        // migration, bead bo000; now at 0.3.1, which carries the asupersync
+        // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
+        // cass#393 namespace-sidecar st_dev repair, and the 0.3.1
+        // allocator/freelist/concurrent-writer correctness wave).
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to require a bare `=0.2.1` registry pin. Whole-family registry
+        // to require a bare `=0.3.1` registry pin. Whole-family registry
         // convergence is enforced by `validate_fsqlite_registry_pin`.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.4",
         expected_features: &["fts5"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -74,7 +75,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -92,7 +93,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -108,7 +109,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/klittle32/franken_agent_detection",
-        expected_rev: "34d543ab5417ba04dc657ee08aa82fad8bc2eca4",
+        expected_rev: "0b04f8a2251ec775ecc23578793172976de15516",
         expected_version: "0.1.12-letta-prime.1",
         expected_features: &[
             "chatgpt",
@@ -132,13 +133,16 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "asupersync",
         crate_package_name: "asupersync",
         manifest_package_field: None,
-        // crates.io-only exact pin after the 0.3.x migration unified every source
-        // (direct dep, frankensqlite transitive, frankensearch transitive)
-        // onto a single published release. Empty `expected_git` signals
-        // `validate_manifest_dependency_spec` to skip git/rev checks.
+        // crates.io-only exact pin: every source (direct dep, frankensqlite
+        // transitive, frankensearch transitive) resolves to a single published
+        // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
+        // whose public API names asupersync 0.4.x types; 0.4.4 additionally
+        // preserves typed task results across cancellation acknowledgement.
+        // Empty `expected_git` signals `validate_manifest_dependency_spec`
+        // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.10",
+        expected_version: "0.4.5",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -159,7 +163,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // surface. The latter keeps CASS schema-v8 access independent from
         // FrankenSearch's swappable generic lexical backend (cass #308,
         // bd-8nqz.5).
-        expected_rev: "fbde80225914f02389e04af5970647034a8291d7",
+        expected_rev: "46a3aefce1aa658fa98f27f0b3676f073160e15c",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
@@ -167,7 +171,11 @@ const CONTRACTS: &[DependencyContract] = &[
         // separate `-baseline` build is needed). Bead tg5o9 retired the vacuous
         // cass `semantic` feature; semantic readiness is now determined solely
         // by runtime model/vector assets.
-        expected_features: &["ann", "cass-compat", "hash", "native"],
+        // `quill` added for the CASS->Quill lexical flip: it links the native
+        // Quill engine alongside the Tantivy incumbent so the two can be
+        // compared before Tantivy is dropped. `cass-compat` leaves with
+        // Tantivy once the flip completes.
+        expected_features: &["ann", "cass-compat", "hash", "native", "quill"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",
         manifest_rel: "frankensearch/Cargo.toml",
@@ -183,7 +191,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -200,7 +208,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &["crossterm-compat", "native-backend"],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -217,7 +225,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -234,7 +242,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
         expected_rev: "5f78cfa0",
-        expected_version: "0.3.1",
+        expected_version: "0.3.4",
         expected_features: &[
             "canvas",
             "charts",
@@ -302,6 +310,73 @@ fn main() {
     let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
+    emit_build_commit_metadata(&manifest_dir);
+}
+
+/// Embed the build commit at compile time (GH #399).
+///
+/// A binary built from `main` and the binary from the nearest tag are
+/// otherwise indistinguishable at runtime: bare `version` in clap prints only
+/// `CARGO_PKG_VERSION`. Resolve the commit HERE, against the crate's own
+/// checkout (`CARGO_MANIFEST_DIR`), never at runtime against the process CWD
+/// (ubs#79 is the failure mode to avoid: a runtime `git rev-parse` reports
+/// the *scanned* repository's commit as the build SHA).
+///
+/// Emits:
+/// - `VERGEN_GIT_SHA` — full commit hash (name kept because doctor run
+///   journaling already reads `option_env!("VERGEN_GIT_SHA")`); only when
+///   resolvable.
+/// - `CASS_BUILD_COMMIT` — short (12-char) hash with a `-dirty` suffix when
+///   the worktree has uncommitted tracked changes; only when resolvable.
+/// - `CASS_BUILD_COMMIT_DATE` — commit date (`YYYY-MM-DD`); only when
+///   resolvable.
+/// - `CASS_VERSION_FULL` — ALWAYS emitted: `<semver> (<short-sha> <date>)`
+///   when git metadata is available, plain `<semver>` otherwise (crates.io /
+///   tarball builds have no `.git`).
+fn emit_build_commit_metadata(manifest_dir: &Path) {
+    let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+
+    // Rebuild when HEAD moves or the checked-out branch's ref advances, so a
+    // cached build script cannot pin a stale SHA into a fresh binary.
+    let git_dir = manifest_dir.join(".git");
+    if git_dir.exists() {
+        let head = git_dir.join("HEAD");
+        if head.exists() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+        if let Ok(head_contents) = fs::read_to_string(&head)
+            && let Some(reference) = head_contents.trim().strip_prefix("ref: ")
+        {
+            let ref_path = git_dir.join(reference);
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
+    }
+
+    let state = git_state(manifest_dir).ok();
+    let commit_date = git_output(manifest_dir, &["show", "-s", "--format=%cs", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .ok();
+
+    let full_version = match &state {
+        Some(state) if state.head.len() >= 12 => {
+            let mut short = state.head[..12].to_string();
+            if state.dirty {
+                short.push_str("-dirty");
+            }
+            println!("cargo:rustc-env=VERGEN_GIT_SHA={}", state.head);
+            println!("cargo:rustc-env=CASS_BUILD_COMMIT={short}");
+            if let Some(date) = &commit_date {
+                println!("cargo:rustc-env=CASS_BUILD_COMMIT_DATE={date}");
+                format!("{crate_version} ({short} {date})")
+            } else {
+                format!("{crate_version} ({short})")
+            }
+        }
+        _ => crate_version.clone(),
+    };
+    println!("cargo:rustc-env=CASS_VERSION_FULL={full_version}");
 }
 
 fn validate_path_dependency_contracts(
@@ -329,7 +404,7 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
     // The fsqlite engine family must resolve exclusively from crates.io at the
     // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
     // override contract while keeping its purpose: no silent engine drift.
-    const EXPECTED_VERSION: &str = "0.2.1";
+    const EXPECTED_VERSION: &str = "0.3.4";
     const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. The former git source override must not quietly come back: no

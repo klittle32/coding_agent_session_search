@@ -6,14 +6,15 @@ This branch is a private fork of CASS. Do **not** open a pull request against
 Current fork identity:
 
 - CASS origin: `klittle32/coding_agent_session_search`
-- CASS version: `0.6.25-letta-prime.1` (prerelease derived from upstream `0.6.24`)
+- CASS version: `0.6.26-letta-prime.1` (prerelease derived from upstream `0.6.25`)
 - FAD origin: `klittle32/franken_agent_detection`
-- FAD pin: `34d543ab5417ba04dc657ee08aa82fad8bc2eca4` (`0.1.12-letta-prime.1`, tag `v0.1.12-letta-prime.1`)
+- FAD pin: `0b04f8a2251ec775ecc23578793172976de15516` (`0.1.12-letta-prime.1`; Muse + Copilot JSON/JSONL store + fsqlite 0.3, keeping Letta Code and Prime Agent)
 - Sibling checkout expected at `../franken_agent_detection` on that same SHA
 - Self-update target: `klittle32/coding_agent_session_search` (`src/update_check.rs`)
 
 Letta Code and Prime Agent parsing live only in FAD. CASS exposes re-export
-stubs (`src/connectors/letta_code.rs`, `src/connectors/prime_agent.rs`) and
+stubs (`src/connectors/letta_code.rs`, `src/connectors/prime_agent.rs`,
+`src/connectors/muse.rs`) and
 must not grow a second parser.
 
 Prime Agent identity:

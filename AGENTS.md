@@ -137,10 +137,10 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | `62a58ee3` (git branch `fts5-overlong-hotfix-cass362`; `f9cc3294` family + FTS5 overlong-term skip cap [cass#362]) |
-| `franken-agent-detection` | `34d543ab5417ba04dc657ee08aa82fad8bc2eca4` (`0.1.12-letta-prime.1`, fork `klittle32/franken_agent_detection`; Letta Code + Prime Agent connectors) |
-| `asupersync` | `=0.3.10` |
-| `frankensearch` | `fbde8022` (accepted post-flip candidate with explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
+| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.4` (0.3.x asupersync-0.4 line + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, 0.3.1 allocator/freelist/concurrent-writer correctness wave, and the later 0.3.4 lockstep; carries the FTS5 overlong-term skip cap [cass#362]) |
+| `franken-agent-detection` | `0b04f8a2251ec775ecc23578793172976de15516` (`0.1.12-letta-prime.1`, fork `klittle32/franken_agent_detection`; Letta Code + Prime Agent + Muse + Copilot JSON/JSONL store, fsqlite 0.3 lockstep) |
+| `asupersync` | `=0.4.5` (fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable) |
+| `frankensearch` | `46a3aefc` (CASS→Quill lexical flip; `cass-compat` → `lexical-tantivy` retained for the differential oracle; aligned with fsqlite 0.3.4 + asupersync 0.4.5; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |
 
@@ -360,9 +360,14 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ### Unit Tests
 
+> **Stack floor:** always run tests with `RUST_MIN_STACK=16777216`. fsqlite
+> 0.3.x's async engine builds deep debug-mode futures and the default 2 MiB
+> test-thread stack overflows in storage-touching unit tests (SIGABRT with
+> "has overflowed its stack"). CI sets this workflow-wide.
+
 ```bash
 # Run all tests
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target RUST_MIN_STACK=16777216 cargo test
 
 # Run with output
 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test -- --nocapture
@@ -460,6 +465,7 @@ coding_agent_session_search/
 │   │   ├── gemini.rs             # Gemini sessions
 │   │   ├── grok.rs               # Grok Build sessions
 │   │   ├── letta_code.rs         # Letta Code client transcripts (FAD re-export)
+│   │   ├── muse.rs               # Muse Code sessions (FAD re-export)
 │   │   ├── prime_agent.rs        # Prime Agent sessions (FAD re-export)
 │   │   ├── aider.rs              # Aider sessions
 │   │   ├── amp.rs                # Amp sessions
@@ -571,6 +577,7 @@ cass robot-docs guide         # LLM-optimized docs
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
 | Letta Code | `letta_code.rs` | JSONL (`~/.letta/transcripts/<agent>/<conversation>/transcript.jsonl`) |
+| Muse | `muse.rs` | JSONL (`~/.local/share/muse/sessions/<YYYY>/<MM>/<DD>/<session-uuid>/session.jsonl`) |
 | Prime Agent | `prime_agent.rs` | JSONL (`~/.prime/agent/sessions/<session-id>.jsonl`; distinct from `pi_agent`) |
 
 ### HTML Export (Robot Mode)

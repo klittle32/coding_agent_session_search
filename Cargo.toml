@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.25-letta-prime.1"
+version = "0.6.26-letta-prime.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -23,7 +23,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.3.10", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.4.5", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -43,15 +43,21 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.2.1 (crates.io): the complete pinned 0.1.19-git line (ns-lifecycle
-# wave, deferred-FTS5-validation open, multileaf) plus GH#294 mutation-free
-# default-flags opens. The 0.2 engine API is async (!Send futures); CASS's
-# synchronous call shape is preserved by src/franken_sync.rs, which drives
-# every engine future on a private current-thread asupersync runtime.
-frankensqlite = { version = "=0.2.1", package = "fsqlite", features = ["fts5"] }
+# fsqlite 0.3.1 (crates.io): the 0.3.0 asupersync-0.4.3 runtime migration and
+# bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
+# FileIdentity re-derivation after file replacement — the cass#393
+# st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
+# cross-connection visibility) plus the 0.3.1 correctness wave: allocator
+# post-savepoint page-aliasing quarantine, committed-freelist resurrection
+# refusal, shared concurrent-writer EOF high-water, sidecar-less read-only
+# first-contact opens (GH#140), Darwin OFD locking. The engine API is async
+# (!Send futures); CASS's synchronous call shape is preserved by
+# src/franken_sync.rs, which drives every engine future on a private
+# current-thread asupersync runtime.
+frankensqlite = { version = "=0.3.4", package = "fsqlite", features = ["fts5"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.2.1", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -97,8 +103,8 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fbde80225914f02389e04af5970647034a8291d7", default-features = false, features = ["hash", "cass-compat", "ann", "native"] }
-franken-agent-detection = { version = "0.1.12-letta-prime.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "34d543ab5417ba04dc657ee08aa82fad8bc2eca4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "46a3aefce1aa658fa98f27f0b3676f073160e15c", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+franken-agent-detection = { version = "0.1.12-letta-prime.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "0b04f8a2251ec775ecc23578793172976de15516", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -196,11 +202,11 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.2.1", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
 
-# The fsqlite family now resolves from crates.io (0.2.1) for every direct and
+# The fsqlite family now resolves from crates.io (0.3.1) for every direct and
 # transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.2.1 fsqlite family in the
+# build.rs enforces the registry identity (single 0.3.1 fsqlite family in the
 # lockfile, no patch reintroduction) as the dependency source contract.
 
 [[bin]]
@@ -217,6 +223,24 @@ test = false
 name = "e2e-run-bundle"
 path = "src/bin/e2e-run-bundle.rs"
 test = false
+
+# fsqlite 0.3.x's async engine builds enormous debug-mode futures; at
+# opt-level 0 a single statement poll can overflow even a 16 MiB test-thread
+# stack (analytics::query storage tests SIGABRT'd during the 0.3.1 gate).
+# Upstream frankensqlite develops at `[profile.dev] opt-level = 1` and
+# franken_agent_detection uses this exact dependencies-only form for the same
+# reason. Applies to dependencies only, never this crate's own code/tests.
+#
+# The fsqlite 0.3.4 uptake pushed these futures past what opt-level 1 covers:
+# `cli_read_db_tests::state_meta_json_reports_active_data_dir_lock_without_db_path_metadata`
+# SIGABRT'd on a stack overflow. Verified as a size problem, not a logic
+# regression — the same test passes unchanged under a larger thread stack — so
+# the fix is `RUST_MIN_STACK` in `.cargo/config.toml` rather than opt-level 2
+# here. opt-level 2 also works but forces a full rebuild of every dependency
+# at roughly double the artifact size, which is not worth it for a test-thread
+# stack bound.
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 lto = true
@@ -242,9 +266,9 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.3.x line. Keep
+# The dependency graph is pinned to the asupersync 0.4.x line (0.4.5). Keep
 # frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.2.x stack.
+# Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -277,6 +301,8 @@ strip = false
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
+# LOCAL DEV ONLY (CASS->Quill flip). Must be re-commented before commit: a path
+# patch on a shared branch breaks every other checkout.
 # [patch."https://github.com/Dicklesworthstone/frankensearch"]
 # frankensearch = { path = "../frankensearch/frankensearch" }
 # frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
@@ -284,6 +310,7 @@ strip = false
 # frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
 # frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
 # frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
+# frankensearch-quill = { path = "../frankensearch/crates/frankensearch-quill" }
 # frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
 
 [workspace.metadata.dist]
@@ -321,10 +348,6 @@ harness = false
 
 [[bench]]
 name = "cache_micro"
-harness = false
-
-[[bench]]
-name = "regex_cache"
 harness = false
 
 [[bench]]

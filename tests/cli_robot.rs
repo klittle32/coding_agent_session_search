@@ -2327,7 +2327,8 @@ fn capabilities_matches_golden_contract() {
         output.stderr.is_empty(),
         "capabilities should not log to stderr"
     );
-    let actual: Value = serde_json::from_slice(&output.stdout).expect("valid capabilities json");
+    let mut actual: Value =
+        serde_json::from_slice(&output.stdout).expect("valid capabilities json");
     let expected = read_robot_json_golden("capabilities.json.golden");
 
     // Verify crate_version matches Cargo.toml (dynamic, not from fixture)
@@ -2337,6 +2338,24 @@ fn capabilities_matches_golden_contract() {
         cargo_version,
         "crate_version should match Cargo.toml version"
     );
+
+    // GH #399: build identity varies per build/checkout. Validate its shape,
+    // then normalize to the golden placeholders before the exact compare.
+    let commit = actual["build_commit"]
+        .as_str()
+        .expect("build_commit should be a string");
+    let commit_core = commit.strip_suffix("-dirty").unwrap_or(commit);
+    assert!(
+        commit_core == "unknown"
+            || (commit_core.len() == 12 && commit_core.chars().all(|c| c.is_ascii_hexdigit())),
+        "build_commit should be a 12-hex short sha (optionally -dirty) or 'unknown', got: {commit}"
+    );
+    assert!(
+        actual["build_commit_date"].is_string(),
+        "build_commit_date should be a string"
+    );
+    actual["build_commit"] = Value::String("[BUILD_COMMIT]".to_string());
+    actual["build_commit_date"] = Value::String("[BUILD_COMMIT_DATE]".to_string());
 
     assert_eq!(actual, expected, "capabilities contract drifted");
 }
@@ -5692,9 +5711,24 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 #[test]
 fn timed_out_robot_pack_preserves_evidence_and_names_shed_work() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    // The scenario needs BOTH margins to hold, or the assertions below cannot
+    // mean what they say:
+    //   budget > cold pre-search + search   -> search completes, so evidence EXISTS
+    //   delay  > budget                     -> the budget trips AFTER evidence exists
+    //
+    // The original 250ms/350ms pair satisfied neither once cold-start pre-search
+    // work (refresh + self-heal on a freshly copied fixture) grew past 250ms:
+    // `search` was shed BEFORE it ran, so the payload had no evidence to preserve
+    // and this test failed while never once exercising the contract it names.
+    // Measured on a cold fixture, the injected delay was irrelevant — 250ms with
+    // NO delay fails identically.
+    //
+    // 3000/6000 clears both margins with room and was verified reachable on three
+    // consecutive cold runs (timed_out=true AND evidence=1). The assertions are
+    // unchanged; only the timing parameters moved.
     let output = base_cmd()
-        .env("CASS_PACK_BUDGET_MS", "250")
-        .env("CASS_TEST_PACK_SLOW_MS", "350")
+        .env("CASS_PACK_BUDGET_MS", "3000")
+        .env("CASS_TEST_PACK_SLOW_MS", "6000")
         .args([
             "pack",
             "hello",
@@ -6605,10 +6639,12 @@ fn introspect_health_stale_threshold_default() {
         stale["value_type"], "integer",
         "stale-threshold should be integer type"
     );
-    // Health uses a shorter default (5 minutes) for quick checks
+    // Health now matches `cass status` / DEFAULT_STALE_THRESHOLD_SECS so a
+    // bare `cass health` does not flip unhealthy five minutes after a rebuild
+    // on large archives outside continuous watch mode.
     assert_eq!(
-        stale["default"], "300",
-        "health --stale-threshold should default to 300 (5 minutes)"
+        stale["default"], "1800",
+        "health --stale-threshold should default to 1800 (30 minutes), matching status"
     );
 }
 

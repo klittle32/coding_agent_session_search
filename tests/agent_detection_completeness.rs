@@ -139,6 +139,7 @@ fn connector_factories_all_instantiate_and_detect() {
         "copilot",
         "grok",
         "letta_code",
+        "muse",
     ] {
         assert!(
             unique.contains(required),
@@ -159,7 +160,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 26, "Expected 26 connector factories");
+    assert_eq!(slugs.len(), 27, "Expected 27 connector factories");
 }
 
 // ---------------------------------------------------------------------------

@@ -636,7 +636,7 @@
         },
         {
           "name": "force-rebuild",
-          "description": "Force Tantivy index rebuild even if schema matches",
+          "description": "Force lexical index rebuild even if schema matches",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -2091,6 +2091,17 @@
           "value_type": "integer",
           "required": false,
           "default": "1800"
+        },
+        {
+          "name": "binary-only",
+          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. For binary promotion gates and packaging smoke tests that must validate a candidate binary on a host whose archive happens to be stale (#398)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",

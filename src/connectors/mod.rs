@@ -217,6 +217,7 @@ pub mod grok;
 pub mod hermes;
 pub mod kimi;
 pub mod letta_code;
+pub mod muse;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;

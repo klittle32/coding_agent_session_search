@@ -507,6 +507,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "grok" => "agent-grok",
         "letta_code" => "agent-letta",
         "prime_agent" => "agent-prime",
+        "muse" => "agent-muse",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
         "opencode" | "qwen" => "agent-codex",
         "pi_agent" | "factory" | "droid" => "agent-aider",
@@ -539,6 +540,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "grok" => "Grok",
         "letta_code" => "Letta Code",
         "prime_agent" => "Prime Agent",
+        "muse" => "Muse",
         "cline" => "Cline",
         "opencode" => "OpenCode",
         "pi_agent" => "Pi Agent",
@@ -1589,6 +1591,7 @@ mod tests {
         assert_eq!(agent_css_class("goose"), "agent-goose");
         assert_eq!(agent_css_class("letta_code"), "agent-letta");
         assert_eq!(agent_css_class("prime_agent"), "agent-prime");
+        assert_eq!(agent_css_class("muse"), "agent-muse");
         assert_eq!(agent_css_class("unknown"), "agent-default");
     }
 
@@ -1609,6 +1612,7 @@ mod tests {
         assert_eq!(agent_display_name("qwen"), "Qwen");
         assert_eq!(agent_display_name("letta_code"), "Letta Code");
         assert_eq!(agent_display_name("prime_agent"), "Prime Agent");
+        assert_eq!(agent_display_name("muse"), "Muse");
         assert_ne!(
             agent_display_name("prime_agent"),
             agent_display_name("pi_agent")
