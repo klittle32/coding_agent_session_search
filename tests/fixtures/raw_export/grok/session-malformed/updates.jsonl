@@ -1,0 +1,2 @@
+{"timestamp":1784389100,"method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-0000000000cc","update":{"sessionUpdate":"hook_execution","hook":"status","output":"no dialogue"}}}
+{"timestamp":1784389101,"method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-0000000000cc","update":{"sessionUpdate":"available_commands_update","commands":[]}}}

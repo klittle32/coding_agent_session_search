@@ -1,0 +1,2 @@
+{"type":"response_item","payload":{"role":"user","content":"CODEX_NESTED_USER"}}
+{"type":"response_item","payload":{"role":"assistant","content":"CODEX_NESTED_ASSISTANT"}}

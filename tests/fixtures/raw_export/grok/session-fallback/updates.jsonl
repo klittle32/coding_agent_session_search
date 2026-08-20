@@ -1,0 +1,2 @@
+{"timestamp":1784389000,"method":"session/update","params":{"sessionId":"00000000-0000-4000-8000-0000000000bb","update":{"sessionUpdate":"hook_execution","hook":"retry","output":"model call failed"}}}
+{"timestamp":1784389001,"method":"_x.ai/session/update","params":{"sessionId":"00000000-0000-4000-8000-0000000000bb","update":{"sessionUpdate":"available_commands_update","commands":[]}}}

@@ -1,0 +1,3 @@
+{"type":"user","synthetic_reason":"environment","content":[{"type":"text","text":"GROK_SYNTHETIC_SKIP"}]}
+{"type":"user","prompt_index":0,"content":[{"type":"text","text":"<user_query>GROK_FALLBACK_USER</user_query>"}]}
+{"type":"assistant","content":[{"type":"text","text":"GROK_FALLBACK_ASSISTANT"}]}

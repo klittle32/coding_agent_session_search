@@ -1,0 +1,2 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"sibling-b","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"GROK_SIBLING_B_USER"}}}}
+{"timestamp":2,"method":"_x.ai/session/update","params":{"sessionId":"sibling-b","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"GROK_SIBLING_B_ASSISTANT"}}}}

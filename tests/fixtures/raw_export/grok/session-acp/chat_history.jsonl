@@ -1,0 +1,2 @@
+{"type":"user","prompt_index":0,"content":[{"type":"text","text":"<user_query>GROK_DUPLICATE_FALLBACK_MUST_NOT_APPEAR</user_query>"}]}
+{"type":"assistant","content":[{"type":"text","text":"GROK_DUPLICATE_FALLBACK_ASSISTANT_MUST_NOT_APPEAR"}]}
