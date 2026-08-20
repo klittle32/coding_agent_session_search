@@ -1,0 +1,6 @@
+{"kind":"user","text":"LETTA_USER_SENTINEL_cobalt","captured_at":"2026-07-01T12:00:00Z","source_message_id":"msg-shared-orbit"}
+{"kind":"reasoning","text":"LETTA_REASONING_SENTINEL_amber","captured_at":"2026-07-01T12:00:01Z","source_message_id":"msg-shared-orbit"}
+{"kind":"assistant","text":"LETTA_ASSISTANT_SENTINEL_silver","captured_at":"2026-07-01T12:00:02Z","source_message_id":"msg-shared-orbit"}
+{"kind":"tool_call","name":"Read","argsText":"{\"file_path\":\"src/lib.rs\",\"needle\":\"LETTA_TOOL_ARG_SENTINEL\"}","resultText":"LETTA_TOOL_RESULT_SENTINEL","resultOk":true,"captured_at":"2026-07-01T12:00:03Z","source_line_id":"line-read-1","source_message_id":"msg-read-1"}
+{"kind":"meta","note":"recognized internal bookkeeping"}
+{"kind":"internal","blob":"LETTA_BLOB_SENTINEL_base64_QVlBQUFBQUE="}

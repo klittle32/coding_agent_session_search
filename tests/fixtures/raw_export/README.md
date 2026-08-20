@@ -11,3 +11,6 @@ Do not copy real transcripts, local paths, IDs, or secrets here.
 | `grok/sibling-a/` + `sibling-b/` | Exact-path scoping |
 | `generic/session.jsonl` | Legacy `{role,content}` JSONL |
 | `codex_nested/session.jsonl` | Historical Codex `payload.role` shape (upstream #20) |
+| `letta/agent-export-fixture/conv-export-alpha/` | Letta user/reasoning/assistant/tool plus omitted internal records |
+| `letta/agent-export-fixture/conv-export-beta/` | Sibling transcript for exact-path scoping |
+| `letta/agent-export-fixture/conv-export-malformed/` | Recognized Letta transcript with zero recoverable turns |

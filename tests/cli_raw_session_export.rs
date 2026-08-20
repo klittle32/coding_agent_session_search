@@ -10,6 +10,7 @@ use std::process::Output;
 
 use assert_cmd::Command;
 use coding_agent_search::connectors::grok::GrokConnector;
+use coding_agent_search::connectors::letta_code::LettaCodeConnector;
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use tempfile::TempDir;
 
@@ -26,6 +27,11 @@ const GENERIC_USER: &str = "GENERIC_USER_SENTINEL";
 const GENERIC_ASSISTANT: &str = "GENERIC_ASSISTANT_SENTINEL";
 const CODEX_USER: &str = "CODEX_NESTED_USER";
 const CODEX_ASSISTANT: &str = "CODEX_NESTED_ASSISTANT";
+const LETTA_USER: &str = "LETTA_USER_SENTINEL_cobalt";
+const LETTA_ASSISTANT: &str = "LETTA_ASSISTANT_SENTINEL_silver";
+const LETTA_REASONING: &str = "LETTA_REASONING_SENTINEL_amber";
+const LETTA_TOOL_RESULT: &str = "LETTA_TOOL_RESULT_SENTINEL";
+const LETTA_BLOB: &str = "LETTA_BLOB_SENTINEL_base64_QVlBQUFBQUE=";
 
 fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -151,8 +157,8 @@ fn ordered_user_assistant(markdown: &str) -> Vec<(String, String)> {
     out
 }
 
-fn connector_user_assistant(path: &Path) -> Vec<(String, String)> {
-    let scan_root = if path.is_dir() {
+fn connector_user_assistant(path: &Path, connector: &dyn Connector) -> Vec<(String, String)> {
+    let scan_root = if file_name_is(path, "transcript.jsonl") || path.is_dir() {
         path.to_path_buf()
     } else {
         path.parent().expect("parent").to_path_buf()
@@ -163,8 +169,8 @@ fn connector_user_assistant(path: &Path) -> Vec<(String, String)> {
         vec![ScanRoot::local(scan_root)],
         None,
     );
-    let conversations = GrokConnector::new().scan(&ctx).expect("scan grok fixture");
-    assert_eq!(conversations.len(), 1, "expected one grok conversation");
+    let conversations = connector.scan(&ctx).expect("scan fixture");
+    assert_eq!(conversations.len(), 1, "expected one conversation");
     conversations[0]
         .messages
         .iter()
@@ -172,6 +178,10 @@ fn connector_user_assistant(path: &Path) -> Vec<(String, String)> {
         .filter(|message| !message.content.trim().is_empty())
         .map(|message| (message.role.clone(), message.content.clone()))
         .collect()
+}
+
+fn file_name_is(path: &Path, expected: &str) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(expected)
 }
 
 fn assert_cm_contract(markdown: &str, user: &str, assistant: &str) {
@@ -251,7 +261,7 @@ fn grok_export_matches_direct_connector_normalization() {
     let output = export_markdown(&path);
     assert_success(&output, "grok parity export");
     let exported = ordered_user_assistant(&stdout(&output));
-    let scanned = connector_user_assistant(&path);
+    let scanned = connector_user_assistant(&path, &GrokConnector::new());
     let exported_norm: Vec<(String, String)> = exported
         .into_iter()
         .map(|(role, text)| (role, text.split_whitespace().collect::<Vec<_>>().join(" ")))
@@ -300,6 +310,105 @@ fn grok_malformed_recognized_source_fails_actionably() -> TestResult {
         "must not emit a successful all-unknown transcript"
     );
     Ok(())
+}
+
+#[test]
+fn letta_export_recovers_user_and_assistant_without_unknown() {
+    let path = fixture("letta/agent-export-fixture/conv-export-alpha/transcript.jsonl");
+    let output = export_markdown(&path);
+    assert_success(&output, "letta export");
+    let markdown = stdout(&output);
+    assert_cm_contract(&markdown, LETTA_USER, LETTA_ASSISTANT);
+    assert!(
+        markdown.contains(LETTA_REASONING) || !markdown.contains("## unknown"),
+        "reasoning may render as assistant or be omitted, but must not be unknown:\n{markdown}"
+    );
+    assert!(
+        markdown.contains(LETTA_TOOL_RESULT) || markdown.contains("## tool"),
+        "bounded tool context should follow connector policy:\n{markdown}"
+    );
+    assert!(
+        !markdown.contains(LETTA_BLOB),
+        "internal/meta blob must not leak:\n{markdown}"
+    );
+    assert!(!markdown.contains("LETTA_SIBLING_BETA_USER"));
+}
+
+#[test]
+fn letta_export_matches_direct_connector_normalization() {
+    let path = fixture("letta/agent-export-fixture/conv-export-alpha/transcript.jsonl");
+    let output = export_markdown(&path);
+    assert_success(&output, "letta parity export");
+    let exported = ordered_user_assistant(&stdout(&output));
+    let scanned = connector_user_assistant(&path, &LettaCodeConnector::new());
+    let exported_norm: Vec<(String, String)> = exported
+        .into_iter()
+        .map(|(role, text)| (role, text.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    let scanned_norm: Vec<(String, String)> = scanned
+        .into_iter()
+        .map(|(role, text)| (role, text.split_whitespace().collect::<Vec<_>>().join(" ")))
+        .collect();
+    assert_eq!(
+        exported_norm, scanned_norm,
+        "CLI export user/assistant sequence must match LettaCodeConnector::scan"
+    );
+}
+
+#[test]
+fn letta_exact_path_scoping_excludes_sibling_transcript() {
+    let path = fixture("letta/agent-export-fixture/conv-export-alpha/transcript.jsonl");
+    let output = export_markdown(&path);
+    assert_success(&output, "letta sibling export");
+    let markdown = stdout(&output);
+    assert!(markdown.contains(LETTA_USER));
+    assert!(!markdown.contains("LETTA_SIBLING_BETA_USER"));
+    assert!(!markdown.contains("LETTA_SIBLING_BETA_ASSISTANT"));
+}
+
+#[test]
+fn letta_malformed_recognized_source_fails_actionably() {
+    let path = fixture("letta/agent-export-fixture/conv-export-malformed/transcript.jsonl");
+    let output = export_markdown(&path);
+    assert!(
+        !output.status.success(),
+        "recognized malformed letta source must not succeed"
+    );
+    let combined = format!("{}\n{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("letta_code") || combined.contains("letta"),
+        "diagnostic must name the connector:\n{combined}"
+    );
+    assert!(
+        combined.contains("session-parse") || combined.contains("could not export"),
+        "diagnostic must be actionable:\n{combined}"
+    );
+}
+
+#[test]
+fn downstream_cm_contract_smoke_for_grok_and_letta() {
+    for rel in [
+        "grok/session-acp/updates.jsonl",
+        "letta/agent-export-fixture/conv-export-alpha/transcript.jsonl",
+    ] {
+        let output = export_markdown(&fixture(rel));
+        assert_success(&output, rel);
+        let markdown = stdout(&output);
+        assert!(has_user_heading(&markdown), "{rel} missing user heading");
+        assert!(
+            has_assistant_heading(&markdown),
+            "{rel} missing assistant heading"
+        );
+        assert_eq!(
+            heading_unknown_count(&markdown),
+            0,
+            "{rel} must not be 100% unknown:\n{markdown}"
+        );
+        assert!(
+            !markdown.contains("GROK_BLOB_SENTINEL") && !markdown.contains("LETTA_BLOB_SENTINEL"),
+            "{rel} leaked a blob sentinel:\n{markdown}"
+        );
+    }
 }
 
 #[test]

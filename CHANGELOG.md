@@ -17,6 +17,10 @@ Repository: <https://github.com/klittle32/coding_agent_session_search>
 
 ## [Unreleased]
 
+### Fixed
+
+- **Raw `cass export` for Grok Build and Letta Code.** Recognized `updates.jsonl` / `chat_history.jsonl` and `transcript.jsonl` session files are normalized through their existing connectors before Markdown rendering, so `cm reflect` receives recoverable `user`/`assistant` turns instead of one `## unknown` heading per bookkeeping event. Generic JSONL and nested Codex payloads still use the legacy parser. Recognized but empty/ambiguous sources fail with a `session-parse` diagnostic instead of a successful all-unknown export.
+
 ### Added
 
 - **Prime Agent sessions** via the frozen `klittle32/franken_agent_detection` pin (`0.1.12-letta-prime.1` / `0b04f8a2251ec775ecc23578793172976de15516`). Canonical slug `prime_agent`, display **Prime Agent**, default root `~/.prime/agent/sessions/<session-id>.jsonl`. Overrides: `PRIME_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, `PRIME_AGENT_CODING_AGENT_DIR`. Projection is the complete append-only history, including branches. Local resume: `prime-agent --resume <absolute source_path>`. Distinct from `pi_agent`.

@@ -16,17 +16,21 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::connectors::grok::GrokConnector;
+use crate::connectors::letta_code::LettaCodeConnector;
 use crate::connectors::{Connector, NormalizedConversation, ScanContext, ScanRoot};
 use crate::{CliError, CliErrorKind};
 
 const GROK_UPDATE_METHODS: &[&str] = &["session/update", "_x.ai/session/update"];
 const GROK_SESSION_FILES: &[&str] = &["updates.jsonl", "chat_history.jsonl", "summary.json"];
+const LETTA_TRANSCRIPT_FILE: &str = "transcript.jsonl";
+const LETTA_KINDS: &[&str] = &["user", "assistant", "reasoning", "tool_call", "error"];
 const PEEK_LINE_LIMIT: usize = 32;
 
 /// Adapter claimed by conservative path + content detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawExportAdapter {
     Grok,
+    LettaCode,
 }
 
 /// Normalized conversation already converted into the raw exporter's turn JSON.
@@ -53,6 +57,8 @@ pub(crate) fn try_connector_backed_export(
 pub(crate) fn detect_adapter(path: &Path) -> Option<RawExportAdapter> {
     if looks_like_grok(path) {
         Some(RawExportAdapter::Grok)
+    } else if looks_like_letta(path) {
+        Some(RawExportAdapter::LettaCode)
     } else {
         None
     }
@@ -62,9 +68,7 @@ fn normalize_with_adapter(
     adapter: RawExportAdapter,
     requested_path: &Path,
 ) -> Result<NormalizedConversation, CliError> {
-    match adapter {
-        RawExportAdapter::Grok => scan_and_select(RawExportAdapter::Grok, requested_path),
-    }
+    scan_and_select(adapter, requested_path)
 }
 
 fn scan_and_select(
@@ -92,6 +96,7 @@ impl RawExportAdapter {
     fn slug(self) -> &'static str {
         match self {
             Self::Grok => "grok",
+            Self::LettaCode => "letta_code",
         }
     }
 
@@ -107,12 +112,14 @@ impl RawExportAdapter {
                         .unwrap_or_else(|| requested_path.to_path_buf())
                 }
             }
+            Self::LettaCode => requested_path.to_path_buf(),
         }
     }
 
     fn connector(self) -> Box<dyn Connector> {
         match self {
             Self::Grok => Box::new(GrokConnector::new()),
+            Self::LettaCode => Box::new(LettaCodeConnector::new()),
         }
     }
 }
@@ -229,6 +236,36 @@ fn recognized_format_error(
         )),
         retryable: false,
     }
+}
+
+fn looks_like_letta(path: &Path) -> bool {
+    if path.is_dir() {
+        let transcript = path.join(LETTA_TRANSCRIPT_FILE);
+        return transcript.is_file() && file_has_letta_signature(&transcript);
+    }
+    file_name_str(path) == LETTA_TRANSCRIPT_FILE && file_has_letta_signature(path)
+}
+
+fn file_has_letta_signature(path: &Path) -> bool {
+    peek_jsonl_values(path)
+        .into_iter()
+        .any(|value| json_looks_like_letta_record(&value))
+}
+
+fn json_looks_like_letta_record(value: &Value) -> bool {
+    if value
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| LETTA_KINDS.contains(&kind))
+    {
+        return true;
+    }
+    value
+        .get("message_type")
+        .and_then(Value::as_str)
+        .is_some_and(|message_type| {
+            LETTA_KINDS.contains(&message_type) || matches!(message_type, "user" | "assistant")
+        })
 }
 
 fn looks_like_grok(path: &Path) -> bool {
@@ -441,6 +478,34 @@ mod tests {
             try_connector_backed_export(&path)
                 .expect("generic")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn detect_adapter_requires_letta_signature_not_just_basename() {
+        let tmp = TempDir::new().expect("tempdir");
+        let generic = tmp.path().join("transcript.jsonl");
+        write(
+            &generic,
+            r#"{"role":"user","content":"not a letta transcript"}
+"#,
+        );
+        assert_eq!(detect_adapter(&generic), None);
+
+        let letta = tmp
+            .path()
+            .join("agent-a")
+            .join("conv-a")
+            .join("transcript.jsonl");
+        write(
+            &letta,
+            r#"{"kind":"user","text":"hi","captured_at":"2026-07-01T12:00:00Z"}
+"#,
+        );
+        assert_eq!(detect_adapter(&letta), Some(RawExportAdapter::LettaCode));
+        assert_eq!(
+            detect_adapter(letta.parent().expect("conversation dir")),
+            Some(RawExportAdapter::LettaCode)
         );
     }
 }
