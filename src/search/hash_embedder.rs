@@ -34,12 +34,17 @@
 //! assert_eq!(embedding.len(), 384);
 //! ```
 
+use std::sync::OnceLock;
+
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
+use frankensearch::core::EmbeddingIdentityBundleV1;
+
+mod identity;
 use frankensearch::{
     HashAlgorithm as FsHashAlgorithm, HashEmbedder as FsHashEmbedder, ModelCategory, ModelTier,
 };
 
-/// Default embedding dimension (matches MiniLM for compatibility).
+/// Default control dimension. Equal MiniLM width does not imply a shared space.
 pub const DEFAULT_DIMENSION: usize = 384;
 
 /// Minimum token length to include in embedding.
@@ -55,6 +60,7 @@ pub struct HashEmbedder {
     dimension: usize,
     id: String,
     delegate: FsHashEmbedder,
+    identity: OnceLock<EmbeddingIdentityBundleV1>,
 }
 
 impl HashEmbedder {
@@ -74,6 +80,7 @@ impl HashEmbedder {
             dimension,
             id: format!("fnv1a-{dimension}"),
             delegate: FsHashEmbedder::new(dimension, FsHashAlgorithm::FnvModular),
+            identity: OnceLock::new(),
         }
     }
 
@@ -123,7 +130,7 @@ impl Embedder for HashEmbedder {
 
         let tokens = Self::tokenize(text);
 
-        // Preserve cass legacy behavior for low-signal inputs.
+        // Preserve cass legacy behavior for tokenless low-signal inputs.
         if tokens.is_empty() {
             return Ok(self.uniform_fallback());
         }
@@ -142,11 +149,21 @@ impl Embedder for HashEmbedder {
                 ))),
             });
         }
+        // Feature hashing can exactly cancel nonempty token contributions.
+        // Preserve the same deterministic, nonzero fallback used for tokenless
+        // input so downstream search never receives a zero-norm vector.
+        if embedding.iter().all(|value| *value == 0.0) {
+            return Ok(self.uniform_fallback());
+        }
         Ok(embedding)
     }
 
     fn embed_batch_sync(&self, texts: &[&str]) -> EmbedderResult<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed_sync(t)).collect()
+    }
+
+    fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
+        self.bound_identity()
     }
 
     fn dimension(&self) -> usize {
@@ -252,6 +269,30 @@ mod tests {
             (norm - 1.0).abs() < 1e-5,
             "L2 norm should be ~1.0, got {norm}"
         );
+    }
+
+    #[test]
+    fn test_hash_embedder_cancellation_uses_finite_unit_fallback() {
+        let embedder = HashEmbedder::new(1);
+        let cancellation_input = "token0 token100";
+        let raw = embedder.delegate.embed_sync(cancellation_input);
+        assert_eq!(
+            raw,
+            vec![0.0],
+            "fixture must exactly cancel two nonempty hash features"
+        );
+
+        let embedding = embedder.embed_sync(cancellation_input).unwrap();
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+
+        assert!(embedding.iter().all(|value| value.is_finite()));
+        assert!(embedding.iter().any(|value| *value != 0.0));
+        assert!((norm - 1.0).abs() < 1e-6, "fallback norm={norm}");
+        assert_eq!(embedding, embedder.uniform_fallback());
     }
 
     #[test]

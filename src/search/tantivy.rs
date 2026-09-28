@@ -107,20 +107,10 @@ fn positive_usize_env(name: &str) -> Option<usize> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_available_memory_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
 fn host_memory_bytes_for_tantivy_default() -> Option<u64> {
-    linux_available_memory_bytes()
+    // GH #496: MemAvailable clamped to this process's cgroup headroom, so a
+    // memory-capped unit does not size its writer heap from the whole host.
+    crate::indexer::responsiveness::available_memory_bytes()
 }
 
 #[cfg(target_os = "macos")]
@@ -484,7 +474,7 @@ struct FederatedSearchShardManifest {
     meta_fingerprint: String,
 }
 
-fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
+pub(crate) fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
     index_path.join(FEDERATED_SEARCH_MANIFEST_FILE)
 }
 
@@ -913,7 +903,7 @@ fn load_federated_search_manifest_internal(
 }
 
 pub fn searchable_index_exists(index_path: &Path) -> bool {
-    // A Quill index announces itself with its CURRENT pointer; `meta.json` is
+    // A Quill index announces itself with its MANIFEST; `meta.json` is
     // the Tantivy-era marker and is still accepted so a not-yet-migrated
     // directory is recognized as an index (and therefore rebuilt) rather than
     // being mistaken for an empty one.
@@ -924,19 +914,39 @@ pub fn searchable_index_exists(index_path: &Path) -> bool {
         || federated_search_manifest_path(index_path).exists()
 }
 
+/// Readers and their source path travel together from admission into search.
+/// Retaining these owners avoids reopening (and revalidating) every segment
+/// after the strict read-only contract check has already succeeded.
+pub(crate) struct OpenedLexicalIndex {
+    pub(crate) path: PathBuf,
+    pub(crate) reader: Option<(frankensearch::quill::QuillSearchIndex, Fields)>,
+    pub(crate) federated_readers: Option<Vec<(frankensearch::quill::QuillSearchIndex, Fields)>>,
+}
+
+impl std::fmt::Debug for OpenedLexicalIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedLexicalIndex")
+            .field("path", &self.path)
+            .field("standard_reader", &self.reader.is_some())
+            .field(
+                "federated_readers",
+                &self.federated_readers.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
+}
+
 pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
-    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
-        validate_federated_search_manifest(index_path, &manifest, true)?;
-        for shard in manifest.shards {
-            let shard_path = index_path.join(&shard.relative_path);
-            crate::search::quill_bridge::open_cass_reader(&shard_path).with_context(|| {
-                format!(
-                    "opening federated lexical shard reader {}",
-                    shard_path.display()
-                )
-            })?;
-        }
-        return Ok(());
+    open_validated_lexical_index(index_path).map(|_| ())
+}
+
+pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
+    if let Some(readers) = open_federated_search_readers(index_path)? {
+        return Ok(OpenedLexicalIndex {
+            path: index_path.to_path_buf(),
+            reader: None,
+            federated_readers: Some(readers),
+        });
     }
 
     // No `meta.json` fallback here, unlike `searchable_index_exists` — the
@@ -957,16 +967,27 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         ));
     }
     current_schema_hash_file_matches(index_path)?;
-    crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
+    let reader = crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
         format!(
             "opening standard lexical index reader {}",
             index_path.display()
         )
     })?;
-    Ok(())
+    Ok(OpenedLexicalIndex {
+        path: index_path.to_path_buf(),
+        reader: Some((reader, cass_field_handles())),
+        federated_readers: None,
+    })
 }
 
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
+    // Prefer the active engine's publication authority. The remaining paths
+    // support legacy Tantivy generations and federated lexical bundles.
+    let quill_manifest = index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER);
+    if quill_manifest.exists() {
+        return fs::metadata(quill_manifest).and_then(|m| m.modified()).ok();
+    }
+
     let meta_path = index_path.join("meta.json");
     if meta_path.exists() {
         return fs::metadata(meta_path).and_then(|m| m.modified()).ok();
@@ -1063,6 +1084,27 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
             .sum(),
         segments: segment_metas.len(),
     }))
+}
+
+/// Live-document count of a searchable lexical generation from manifest
+/// metadata alone (GH #457): the Quill MANIFEST of a single generation, or
+/// the sum over every shard of a federated bundle. Never opens a segment.
+///
+/// `None` for a Tantivy-era directory (no live count without an engine open)
+/// and when no manifest decodes.
+#[must_use]
+pub fn searchable_index_live_doc_count(index_path: &Path) -> Option<u64> {
+    if let Ok(Some(manifest)) = load_federated_search_manifest_internal(index_path) {
+        let mut total = 0_u64;
+        for shard in &manifest.shards {
+            let shard_live = crate::search::quill_bridge::manifest_live_doc_count(
+                &index_path.join(&shard.relative_path),
+            )?;
+            total = total.saturating_add(shard_live.live_docs);
+        }
+        return Some(total);
+    }
+    crate::search::quill_bridge::manifest_live_doc_count(index_path).map(|live| live.live_docs)
 }
 
 fn searchable_index_summary_from_tantivy_meta(
@@ -1439,9 +1481,18 @@ pub struct TantivyIndex {
     /// [`crate::search::quill_bridge`].
     inner: crate::search::quill_bridge::QuillCassIndex,
     pub fields: Fields,
+    /// #440: documents still owed to the identity-idempotent (upsert) path
+    /// because a resumed rebuild found the published authority ahead of its
+    /// durable cursor. `add_prebuilt_document_refs_slice` routes this many
+    /// leading documents through upsert, then reverts to plain adds.
+    resume_reconcile_docs_remaining: usize,
 }
 
 impl TantivyIndex {
+    pub(crate) fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
     pub fn open_or_create(path: &Path) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
         wipe_index_dir_on_schema_hash_mismatch(path)?;
@@ -1454,7 +1505,11 @@ impl TantivyIndex {
         // The compiled CASS schema is fixed, so field handles no longer come
         // from a runtime schema read; they are the pinned ordinals.
         let fields = cass_field_handles();
-        Ok(Self { inner, fields })
+        Ok(Self {
+            inner,
+            fields,
+            resume_reconcile_docs_remaining: 0,
+        })
     }
 
     pub fn open_or_create_with_writer_parallelism(
@@ -1475,7 +1530,11 @@ impl TantivyIndex {
         let inner = crate::search::quill_bridge::QuillCassIndex::open_or_create(path)?;
         write_root_schema_hash_file(path)?;
         let fields = cass_field_handles();
-        Ok(Self { inner, fields })
+        Ok(Self {
+            inner,
+            fields,
+            resume_reconcile_docs_remaining: 0,
+        })
     }
 
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
@@ -1511,6 +1570,16 @@ impl TantivyIndex {
         self.inner.commit()
     }
 
+    /// GH #446: route the stall watchdog's liveness signal into the Quill
+    /// sink so accumulate / commit / merge work ticks `activity` — see
+    /// `quill_bridge::EngineLivenessProbe`.
+    pub fn set_heartbeat(
+        &mut self,
+        heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
+    ) {
+        self.inner.set_heartbeat(heartbeat);
+    }
+
     pub fn configure_bulk_load_merge_policy(&mut self) {
         self.inner.configure_bulk_load_merge_policy();
     }
@@ -1532,6 +1601,12 @@ impl TantivyIndex {
     /// Returns Ok(true) if merge was triggered, Ok(false) if skipped.
     pub fn optimize_if_idle(&mut self) -> Result<bool> {
         self.inner.optimize_if_idle(now_unix_millis())
+    }
+
+    /// At most one bounded segment merge; see
+    /// [`QuillCassIndex::fold_largest_small_run`].
+    pub fn fold_largest_small_run(&mut self) -> Result<bool> {
+        self.inner.fold_largest_small_run(now_unix_millis())
     }
 
     /// Force immediate segment merge and wait for completion.
@@ -1649,19 +1724,14 @@ impl TantivyIndex {
                             "attempted to assemble Tantivy index directories with different index settings"
                         ));
                     }
-                    if metas.persisted_custom_extensions
-                        != combined_meta.persisted_custom_extensions
-                    {
-                        return Err(anyhow::anyhow!(
-                            "attempted to assemble Tantivy index directories with different \
-                             persisted custom plugin extensions"
-                        ));
-                    }
+                    // tantivy 0.26.1 (the registry pin frankensearch 0.4.2
+                    // re-exports) has no persisted custom plugin extensions on
+                    // `IndexMeta`; the 0.27-only extension-mismatch guard
+                    // returns with the 0.27 upgrade.
                 }
                 None => {
                     combined_index_meta = Some(tantivy_crate::IndexMeta {
                         index_settings: metas.index_settings.clone(),
-                        persisted_custom_extensions: metas.persisted_custom_extensions.clone(),
                         segments: Vec::new(),
                         schema: metas.schema.clone(),
                         opstamp: 0,
@@ -1877,6 +1947,178 @@ impl TantivyIndex {
         }
     }
 
+    /// Reconcile selected canonical messages under their stable identities.
+    /// A replacement filtered as noise removes its old live document. Each
+    /// bounded engine batch publishes independently; errors propagate and a
+    /// retry converges without promising whole-conversation atomicity.
+    pub fn reconcile_messages_from_packet(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+    ) -> Result<()> {
+        self.reconcile_packet_messages_with_limits(
+            packet,
+            message_indices,
+            conversation_id_override,
+            tantivy_add_batch_max_messages(),
+            tantivy_add_batch_max_chars(),
+        )
+    }
+
+    fn reconcile_packet_messages_with_limits(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+        max_messages: usize,
+        max_chars: usize,
+    ) -> Result<()> {
+        let messages = &packet.payload.messages;
+        // Reject invalid selectors before publishing even the first batch.
+        if let Some(index) = message_indices
+            .iter()
+            .find(|&&index| index >= messages.len())
+        {
+            anyhow::bail!(
+                "packet message index {} out of range for packet with {} messages",
+                index,
+                messages.len()
+            );
+        }
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        let mut docs = Vec::new();
+        let mut removals = Vec::new();
+        let mut pending_indices = BTreeSet::new();
+        let mut pending_bytes = 0usize;
+        for &index in message_indices {
+            let message = messages
+                .get(index)
+                .context("validated packet index disappeared")?;
+            let msg_idx = message.idx.max(0) as u64;
+            // Repeated selectors are valid replay, but one engine batch may
+            // not contain a duplicate live identity.
+            if pending_indices.contains(&msg_idx) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+            pending_indices.insert(msg_idx);
+            if let Some(doc) = cass_document_for_packet_message(&context, message) {
+                pending_bytes = pending_bytes.saturating_add(doc.content.len());
+                docs.push(doc);
+            } else {
+                let identity = frankensearch::quill::cass::cass_document_identity(
+                    &context.source_id,
+                    frankensearch::quill::cass::CassConversationKey {
+                        source_path: &context.source_path,
+                        id: context.conversation_id,
+                    },
+                    msg_idx,
+                );
+                pending_bytes = pending_bytes.saturating_add(identity.len());
+                removals.push(identity);
+            }
+            if pending_indices.len() >= max_messages.max(1) || pending_bytes >= max_chars.max(1) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+        }
+        self.flush_packet_revisions(&mut docs, &mut removals)
+    }
+
+    fn flush_packet_revisions(
+        &mut self,
+        docs: &mut Vec<FsCassDocument>,
+        removals: &mut Vec<String>,
+    ) -> Result<()> {
+        self.inner.upsert_cass_documents(docs)?;
+        self.inner.delete_cass_document_ids(removals)?;
+        docs.clear();
+        removals.clear();
+        Ok(())
+    }
+
+    /// Total live documents in the published snapshot.
+    pub fn doc_count(&self) -> Result<u64> {
+        self.inner.doc_count()
+    }
+
+    /// Build every lexical document for one packet without writing anything.
+    ///
+    /// The projection and noise filter are identical to
+    /// [`Self::add_messages_from_packet`]; callers that need identity-stable
+    /// writes (qhiv2 targeted reconcile) feed the result to
+    /// [`Self::upsert_prebuilt_documents_slice`].
+    #[must_use]
+    pub fn build_packet_documents(
+        packet: &ConversationPacket,
+        conversation_id_override: Option<i64>,
+    ) -> Vec<FsCassDocument> {
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        packet
+            .payload
+            .messages
+            .iter()
+            .filter_map(|msg| cass_document_for_packet_message(&context, msg))
+            .collect()
+    }
+
+    /// Upsert prebuilt documents in bounded batches under their stable
+    /// identities (see `QuillCassIndex::upsert_cass_documents`); a retry of
+    /// the same set converges to exactly one live document per identity
+    /// instead of appending duplicates.
+    pub fn upsert_prebuilt_documents_slice(
+        &mut self,
+        documents: &[FsCassDocument],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut upserted_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                upserted_docs = upserted_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy upsert document batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.upsert_cass_documents(batch)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            upserted_docs = upserted_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy upsert document tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.upsert_cass_documents(batch)?;
+        }
+        Ok(upserted_docs)
+    }
+
     pub fn add_prebuilt_documents_slice(&mut self, documents: &[FsCassDocument]) -> Result<usize> {
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
@@ -1919,10 +2161,85 @@ impl TantivyIndex {
         Ok(indexed_docs)
     }
 
+    /// #440: arm the identity-idempotent resume path. The next `docs`
+    /// documents handed to [`Self::add_prebuilt_document_refs_slice`] are
+    /// upserted instead of added, so a resumed rebuild whose published
+    /// authority already holds them converges to exactly one live document
+    /// per identity instead of being refused as a duplicate.
+    pub fn arm_resume_reconcile(&mut self, docs: usize) {
+        self.resume_reconcile_docs_remaining = docs;
+    }
+
+    /// Documents still owed to the upsert path by [`Self::arm_resume_reconcile`].
+    #[must_use]
+    pub fn resume_reconcile_docs_remaining(&self) -> usize {
+        self.resume_reconcile_docs_remaining
+    }
+
+    /// Upsert prebuilt borrowed documents in bounded batches under their
+    /// stable identities (see [`Self::upsert_prebuilt_documents_slice`]).
+    pub fn upsert_prebuilt_document_refs_slice<'a>(
+        &mut self,
+        documents: &[FsCassDocumentRef<'a>],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut upserted_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                upserted_docs = upserted_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy upsert document ref batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.upsert_cass_document_refs(batch)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            upserted_docs = upserted_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy upsert document ref tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.upsert_cass_document_refs(batch)?;
+        }
+        Ok(upserted_docs)
+    }
+
     pub fn add_prebuilt_document_refs_slice<'a>(
         &mut self,
         documents: &[FsCassDocumentRef<'a>],
     ) -> Result<usize> {
+        // #440: a resumed rebuild owes its leading documents to the upsert
+        // path (see `arm_resume_reconcile`). Split the slice at the owed
+        // boundary so the reconcile window is exact rather than "this whole
+        // batch", then fall through to the ordinary add for the remainder.
+        if self.resume_reconcile_docs_remaining > 0 {
+            let owed = self.resume_reconcile_docs_remaining.min(documents.len());
+            let (reconcile, rest) = documents.split_at(owed);
+            let upserted = self.upsert_prebuilt_document_refs_slice(reconcile)?;
+            self.resume_reconcile_docs_remaining -= owed;
+            if rest.is_empty() {
+                return Ok(upserted);
+            }
+            return Ok(upserted.saturating_add(self.add_prebuilt_document_refs_slice(rest)?));
+        }
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
         let mut indexed_docs = 0usize;
@@ -2330,6 +2647,290 @@ mod tests {
         assert!(status.should_merge());
     }
 
+    fn gh423_lexical_packet(count: usize) -> ConversationPacket {
+        let conv = NormalizedConversation {
+            agent_slug: "codebuff".into(),
+            external_id: Some("shared-lineage-chat".into()),
+            title: Some("Shared lineage".into()),
+            workspace: Some(PathBuf::from("/work/project")),
+            source_path: PathBuf::from("/shared/manicode/chat-messages.json"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000),
+            metadata: serde_json::json!({"cass":{"origin":{"source_id":"remote-source","kind":"ssh","host":"remote-host"}}}),
+            messages: (0..count)
+                .map(|position| NormalizedMessage {
+                    idx: i64::try_from(position).unwrap() * 3 + 5,
+                    role: "assistant".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: format!("oldrevision marker{position}"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect(),
+        };
+        ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        )
+    }
+
+    fn gh423_lexical_hits(index: &TantivyIndex, term: &str) -> BTreeSet<String> {
+        let reader = index.reader().unwrap();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .unwrap();
+        let query = parser.parse(
+            term,
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page =
+            crate::search::quill_bridge::search_paginated(&reader, &query.query, 128, 0, true)
+                .unwrap();
+        let hits: BTreeSet<_> = page
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            page.hits.len(),
+            "each stable identity is live exactly once"
+        );
+        assert_eq!(page.total_count, Some(hits.len()));
+        hits
+    }
+
+    fn gh423_lexical_identity(
+        packet: &ConversationPacket,
+        position: usize,
+        conversation_id: i64,
+    ) -> String {
+        let context = cass_doc_context_from_packet(packet);
+        frankensearch::quill::cass::cass_document_identity(
+            &context.source_id,
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &context.source_path,
+                id: Some(conversation_id),
+            },
+            packet.payload.messages[position].idx.max(0) as u64,
+        )
+    }
+
+    #[test]
+    fn gh423_lexical_revisions_replace_all_32_and_preserve_untouched_across_batches() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(33);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        let indices: Vec<usize> = (0..32).collect();
+        let expected: BTreeSet<String> = indices
+            .iter()
+            .map(|&idx| gh423_lexical_identity(&packet, idx, 77))
+            .collect();
+        let untouched = gh423_lexical_identity(&packet, 32, 77);
+        for &position in &indices {
+            packet.payload.messages[position].content =
+                format!("newrevision completed response marker{position}");
+        }
+        // Run the production batching body with small limits to cross both
+        // document and content thresholds without a giant fixture or env race.
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched.clone()])
+        );
+        let mut repeated_selectors = indices.clone();
+        repeated_selectors.push(0);
+        index
+            .reconcile_messages_from_packet(&packet, &repeated_selectors, Some(77))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        for &position in &indices {
+            packet.payload.messages[position].content.clear();
+        }
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched])
+        );
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &indices, Some(77))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            1,
+            "repeated removals are idempotent"
+        );
+    }
+
+    #[test]
+    fn gh423_lexical_noise_removal_commits_pending_work_and_preserves_sibling_identity() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            heartbeat.fetch_add(1, Ordering::Relaxed);
+        })));
+        let mut packet = gh423_lexical_packet(3);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index
+            .add_messages_from_packet(&packet, None, Some(88), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let mut pending = gh423_lexical_packet(1);
+        pending.payload.identity.source_path = "/pending/chat-messages.json".into();
+        pending.payload.messages[0].content = "pendingneedle survives removal".into();
+        index
+            .add_messages_from_packet(&pending, None, Some(99), |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            6,
+            "plain addition is still pending"
+        );
+        let before_ticks = ticks.load(Ordering::Relaxed);
+        packet.payload.messages[0].content = "   \n\t".into();
+        packet.payload.messages[1].content = "OK".into();
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert!(
+            ticks.load(Ordering::Relaxed) >= before_ticks + 2,
+            "commit and removal both tick liveness"
+        );
+        assert_eq!(index.doc_count().unwrap(), 5);
+        let mut survivors: BTreeSet<String> = (0..3)
+            .map(|position| gh423_lexical_identity(&packet, position, 88))
+            .collect();
+        survivors.insert(gh423_lexical_identity(&packet, 2, 77));
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), survivors);
+        assert_eq!(
+            gh423_lexical_hits(&index, "pendingneedle"),
+            BTreeSet::from([gh423_lexical_identity(&pending, 0, 99)])
+        );
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 5);
+        index.set_heartbeat(None);
+    }
+
+    #[test]
+    fn gh423_lexical_out_of_range_selector_refuses_before_any_publication() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(2);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let before = gh423_lexical_hits(&index, "oldrevision");
+        packet.payload.messages[0].content = "newrevision must not publish".into();
+        let error = index
+            .reconcile_messages_from_packet(&packet, &[0, 2], Some(77))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of range"));
+        assert_eq!(index.doc_count().unwrap(), 2);
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), before);
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &[], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 2);
+    }
+
+    /// #440: an armed resume reconcile routes exactly the owed leading
+    /// documents through the upsert path and plain-adds the rest, so a replay
+    /// over a published prefix converges without a duplicate-identity refusal
+    /// and without paying identity probes for the whole remainder.
+    #[test]
+    fn armed_resume_reconcile_upserts_only_the_owed_prefix() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut index = TantivyIndex::open_or_create(dir.path()).expect("open");
+        let doc = |msg_idx: u64, content: &str| FsCassDocument {
+            agent: "claude".to_owned(),
+            workspace: Some("cass".to_owned()),
+            workspace_original: Some("cass".to_owned()),
+            source_path: "/transcripts/resume.jsonl".to_owned(),
+            msg_idx,
+            created_at: Some(1_700_000_000),
+            title: Some("resume".to_owned()),
+            content: content.to_owned(),
+            source_id: "local".to_owned(),
+            origin_kind: "local".to_owned(),
+            origin_host: None,
+            conversation_id: Some(7),
+        };
+        // The "published before the interruption" prefix.
+        let published = [doc(0, "alpha published"), doc(1, "beta published")];
+        let refs: Vec<FsCassDocumentRef<'_>> =
+            published.iter().map(FsCassDocument::as_ref).collect();
+        index
+            .add_prebuilt_document_refs_slice(&refs)
+            .expect("publish prefix");
+        index.commit().expect("commit prefix");
+        assert_eq!(index.doc_count().expect("doc count"), 2);
+
+        // The replay from the stale cursor re-sends the prefix plus new docs.
+        let replay = [
+            doc(0, "alpha published"),
+            doc(1, "beta published"),
+            doc(2, "gamma new"),
+            doc(3, "delta new"),
+        ];
+        let refs: Vec<FsCassDocumentRef<'_>> = replay.iter().map(FsCassDocument::as_ref).collect();
+        index.arm_resume_reconcile(2);
+        assert_eq!(index.resume_reconcile_docs_remaining(), 2);
+        let written = index
+            .add_prebuilt_document_refs_slice(&refs)
+            .expect("replay converges through the reconcile window");
+        assert_eq!(written, 4);
+        assert_eq!(
+            index.resume_reconcile_docs_remaining(),
+            0,
+            "the owed prefix is consumed exactly once"
+        );
+        index.commit().expect("commit replay");
+        assert_eq!(index.doc_count().expect("doc count"), 4);
+
+        // With the window consumed, a further duplicate is refused again —
+        // the reconcile is a bounded window, not a permanent mode switch.
+        let dup = [doc(2, "gamma new")];
+        let refs: Vec<FsCassDocumentRef<'_>> = dup.iter().map(FsCassDocument::as_ref).collect();
+        let refused = index.add_prebuilt_document_refs_slice(&refs);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("duplicate live document id")),
+            "expected the duplicate refusal after the window closed: {refused:?}"
+        );
+    }
+
     /// A published Quill index must produce a fingerprint the daemon can parse.
     ///
     /// Regression: the fingerprint reader only knew Tantivy's `meta.json`, so a
@@ -2356,6 +2957,27 @@ mod tests {
         assert!(
             u64::from_str_radix(&fingerprint[..16], 16).is_ok(),
             "daemon parses the first 16 chars as hex; got {fingerprint:?}"
+        );
+    }
+
+    /// Status falls back to the lexical publication timestamp when the
+    /// canonical DB has no recorded indexing time. After the Quill flip, a
+    /// standard published index has `MANIFEST` rather than Tantivy's
+    /// `meta.json`; overlooking that marker made the fallback falsely return
+    /// `None` for the current engine.
+    #[test]
+    fn searchable_index_modified_time_recognizes_a_published_quill_index() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut index = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        index.commit().expect("commit");
+
+        assert!(
+            !dir.path().join("meta.json").exists(),
+            "the regression requires a Quill-only publication"
+        );
+        assert!(
+            searchable_index_modified_time(dir.path()).is_some(),
+            "a published Quill MANIFEST must provide the status fallback timestamp"
         );
     }
 
@@ -3522,6 +4144,90 @@ mod tests {
             reader.doc_count().expect("doc count"),
             4,
             "two conversations × two messages each ⇒ four lexical docs"
+        );
+    }
+
+    /// GH #499 (2l1b0.49): a date-filtered search over a sealed segment that
+    /// holds a tombstone. Under frankensearch-quill 0.3.1 the numeric window
+    /// was scored on the segment's at-seal rows while the term leaf used its
+    /// live rows, and cass reported "posting cursor invariant failed: Boolean
+    /// children belong to different segment domains" (exit 9) for every
+    /// `--days`/`--since` search on a long-lived index. Quill 0.3.2 carries
+    /// the fix. The window deliberately excludes one row: a window over every
+    /// row lowers to a whole-segment match and would pass on the old engine.
+    #[test]
+    fn gh499_date_window_over_a_tombstoned_sealed_segment() {
+        let message = |idx: i64, created_at: i64, content: &str| NormalizedMessage {
+            idx,
+            role: "user".to_string(),
+            author: None,
+            created_at: Some(created_at),
+            content: content.to_string(),
+            extra: Value::Null,
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        };
+        let dir = TempDir::new().expect("temp dir");
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("gh499".to_string()),
+            title: Some("window".to_string()),
+            workspace: None,
+            source_path: dir.path().join("gh499.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: Value::Null,
+            messages: vec![
+                message(0, 100, "window early"),
+                message(1, 500, "window middle"),
+                message(2, 900, "window late"),
+            ],
+        };
+        let index_dir = dir.path().join("index");
+        let mut idx = TantivyIndex::open_or_create(&index_dir).expect("idx");
+        idx.add_conversation(&conversation).expect("seed");
+        idx.commit().expect("seal the first segment");
+
+        // Re-ingesting a message under its stable identity tombstones the
+        // sealed row, as an incremental index run does.
+        let edited = message(1, 500, "window middle, edited");
+        let replacement =
+            cass_document_for_message(&cass_doc_context(&conversation, None), &edited)
+                .expect("replacement document");
+        idx.upsert_prebuilt_documents_slice(&[replacement])
+            .expect("upsert");
+        idx.commit().expect("publish the replacement");
+
+        let live = crate::search::quill_bridge::manifest_live_doc_count(&index_dir)
+            .expect("published manifest");
+        assert!(
+            live.tombstones > 0 && live.segments >= 2,
+            "the fixture needs a tombstone in a sealed segment: {live:?}"
+        );
+
+        let client = crate::search::query::SearchClient::open(&index_dir, None)
+            .expect("open search client")
+            .expect("index present");
+        let filters = crate::search::query::SearchFilters {
+            created_from: Some(400),
+            created_to: Some(1_000),
+            ..Default::default()
+        };
+        let hits = client
+            .search(
+                "window",
+                filters,
+                10,
+                0,
+                crate::search::query::FieldMask::FULL,
+            )
+            .expect("a date-filtered search over a tombstoned segment must succeed");
+        let mut stamps: Vec<i64> = hits.iter().filter_map(|hit| hit.created_at).collect();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![500, 900], "{hits:?}");
+        assert!(
+            hits.iter().any(|hit| hit.content.contains("edited")),
+            "the live replacement is served, not the tombstoned row: {hits:?}"
         );
     }
 }

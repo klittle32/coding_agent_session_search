@@ -27,7 +27,7 @@ const CHILD_CORPUS_ENV: &str = "CASS_TEST_SEMANTIC_CORPUS_SHA256";
 const CHILD_MARKER: &str = "semantic_generation_fresh_process_verified";
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn corpus_identity() -> SemanticCorpusSnapshotIdentity {
@@ -65,7 +65,8 @@ fn artifact(corpus: &SemanticCorpusSnapshotIdentity, bytes: &[u8]) -> SemanticGe
         content_sha256: corpus.content_sha256.clone(),
     };
     SemanticGenerationArtifact {
-        role: SemanticArtifactRole::FastVector,
+        shard: None,
+            role: SemanticArtifactRole::FastVector,
         relative_path: "fast/primary.fsvi".to_owned(),
         artifact_sha256,
         size_bytes,
@@ -302,7 +303,7 @@ const CHILD_STREAM_CAP: usize = CHILD_OUTPUT_CAP / 2;
 const CHILD_LINE_CAP: usize = 10_000;
 
 fn accepted_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn accepted_corpus_identity() -> SemanticCorpusSnapshotIdentity {
@@ -446,6 +447,7 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         covered_content_sha256: corpus.content_sha256.clone(),
     };
     let artifact = SemanticGenerationArtifact {
+        shard: None,
         role: SemanticArtifactRole::FastVector,
         relative_path: relative_path.to_owned(),
         artifact_sha256,

@@ -20,6 +20,7 @@ use coding_agent_search::pages::errors::{
 };
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -33,6 +34,21 @@ const TEST_RECOVERY_SECRET: &[u8] = b"test-recovery-secret-32-bytes!!";
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+fn run_node_module_assertions(script: &str) -> std::io::Result<Output> {
+    // `--experimental-detect-module` loads the ES-module assets as modules on
+    // Node 20.10+ and is a no-op where detection is the default (22.7+).
+    // Node 24 removed `--experimental-default-type` and rejects it.
+    Command::new("node")
+        .args([
+            "--experimental-detect-module",
+            "--input-type=module",
+            "--eval",
+            script,
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+}
 
 /// Create a test archive with password encryption.
 fn create_test_archive(temp_dir: &Path, password: &str) -> std::path::PathBuf {
@@ -188,7 +204,7 @@ fn test_wrong_recovery_key_error() {
         create_test_archive_with_recovery(temp_dir.path(), TEST_PASSWORD, TEST_RECOVERY_SECRET);
 
     let config = load_config(&archive_dir).expect("Should load config");
-    let result = DecryptionEngine::unlock_with_recovery(config, b"wrong-recovery-key");
+    let result = DecryptionEngine::unlock_with_recovery(config, &[0xEE; 32]);
 
     assert!(result.is_err(), "Should fail with wrong recovery key");
 }
@@ -814,6 +830,1069 @@ fn test_graceful_degradation_corrupted_archive() {
     assert!(
         msg.contains("unknown field") && msg.contains("garbage_field"),
         "Should surface the offending unexpected field cleanly: {msg}"
+    );
+}
+
+#[test]
+fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
+    let auth_js = include_str!("../src/pages_assets/auth.js");
+    let terminate_body = auth_js
+        .split_once("function terminateCryptoWorker()")
+        .expect("auth.js should define the crypto-worker termination boundary")
+        .1
+        .split_once("function resetCryptoWorker()")
+        .expect("worker termination should remain a bounded helper")
+        .0;
+    assert!(
+        terminate_body.contains("previousWorker.terminate();"),
+        "worker termination must cancel in-flight cryptographic work"
+    );
+
+    let reset_body = auth_js
+        .split_once("function resetCryptoWorker()")
+        .expect("auth.js should define the crypto-worker reset boundary")
+        .1
+        .split_once("function beginAppInitAttempt()")
+        .expect("worker reset should remain a bounded helper")
+        .0;
+    let terminate_offset = reset_body
+        .find("terminateCryptoWorker();")
+        .expect("worker reset must use the hard termination boundary");
+    let reinitialize_offset = reset_body
+        .find("initializeCryptoWorker();")
+        .expect("worker reset must create a clean replacement");
+    assert!(
+        terminate_offset < reinitialize_offset,
+        "the old worker must be terminated before its replacement is started"
+    );
+
+    let lock_body = auth_js
+        .split_once("async function lockArchive(options = {})")
+        .expect("auth.js should define lockArchive")
+        .1
+        .split_once("async function loadQrScannerLibrary()")
+        .expect("lockArchive should remain a bounded helper")
+        .0;
+    let reset_offset = lock_body
+        .find("const workerReady = resetCryptoWorker();")
+        .expect("locking must reset the crypto worker");
+    let clear_session_offset = lock_body
+        .find("window.cassSession = null;")
+        .expect("locking must clear the in-memory session key");
+    let first_await_offset = lock_body
+        .find("await closeQrScanner();")
+        .expect("locking should still close the QR scanner");
+    assert!(
+        reset_offset < first_await_offset,
+        "worker termination must happen synchronously before lockArchive yields"
+    );
+    assert!(
+        clear_session_offset < first_await_offset,
+        "the in-memory session key must be cleared before lockArchive yields"
+    );
+    assert!(
+        !auth_js.contains("postMessage({ type: 'CLEAR_KEYS' })"),
+        "a queued CLEAR_KEYS message is not a cancellation boundary"
+    );
+
+    let unlock_success_body = auth_js
+        .split_once("function handleUnlockSuccess(data)")
+        .expect("auth.js should define the successful-unlock transition")
+        .1
+        .split_once("function handleUnlockFailed(data)")
+        .expect("successful unlock should remain a bounded helper")
+        .0;
+    let clear_password_offset = unlock_success_body
+        .find("elements.passwordInput.value = \"\";")
+        .expect("a successful unlock must erase the password input");
+    let persist_session_offset = unlock_success_body
+        .find("persistSession(data.dek);")
+        .expect("successful unlock should still establish the configured session");
+    assert!(
+        clear_password_offset < persist_session_offset,
+        "the plaintext password must not remain in the DOM for the unlocked session"
+    );
+}
+
+#[test]
+fn browser_storage_clear_reports_partial_failures_and_continues_cleanup() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedKeys = new Set();
+                this.removeAttempts = [];
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.removeAttempts.push(key);
+                if (this.failedKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+        Object.defineProperty(globalThis, 'navigator', {
+            value: { storage: {} },
+            configurable: true,
+            writable: true,
+        });
+
+        try {
+            const { clearAllStorage, getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const failedSessionKey = `cass_session_dek_${scopeId}`;
+            const laterSessionKey = `cass_session_expiry_${scopeId}`;
+            const currentLocalKey = `cass-archive-${scopeId}-pref-storage-mode`;
+            const otherSessionKey = `cass_session_dek_${otherScopeId}`;
+            const otherLocalKey = `cass-archive-${otherScopeId}-pref-storage-mode`;
+
+            sessionStorage.setItem(failedSessionKey, 'secret');
+            sessionStorage.setItem(laterSessionKey, 'expiry');
+            sessionStorage.setItem(otherSessionKey, 'other');
+            localStorage.setItem(currentLocalKey, 'local');
+            localStorage.setItem(otherLocalKey, 'other');
+            sessionStorage.failedKeys.add(failedSessionKey);
+
+            const partialResult = await clearAllStorage();
+            if (partialResult !== false) {
+                throw new Error('clearAllStorage must report a failed browser-storage deletion');
+            }
+            if (sessionStorage.getItem(failedSessionKey) !== 'secret') {
+                throw new Error('the injected failed key should demonstrate that data can remain');
+            }
+            if (sessionStorage.getItem(laterSessionKey) !== null) {
+                throw new Error('cleanup must continue to later sessionStorage keys after one failure');
+            }
+            if (localStorage.getItem(currentLocalKey) !== null) {
+                throw new Error('cleanup must still attempt localStorage after a sessionStorage failure');
+            }
+            if (
+                sessionStorage.getItem(otherSessionKey) !== 'other'
+                || localStorage.getItem(otherLocalKey) !== 'other'
+            ) {
+                throw new Error('archive-scoped cleanup must preserve other archives');
+            }
+
+            sessionStorage.failedKeys.clear();
+            const retryResult = await clearAllStorage();
+            if (retryResult !== true || sessionStorage.getItem(failedSessionKey) !== null) {
+                throw new Error('a successful retry must remove the previously retained key');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output =
+        run_node_module_assertions(script).expect("run browser storage clear assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser storage clear assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_storage_fallback_and_migration_preserve_logical_write_order() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedSetKeys = new Set();
+                this.failedRemoveKeys = new Set();
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                if (this.failedSetKeys.has(key)) {
+                    throw new Error(`injected set failure for ${key}`);
+                }
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                if (this.failedRemoveKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+        Object.defineProperty(globalThis, 'navigator', {
+            value: { storage: {} },
+            configurable: true,
+            writable: true,
+        });
+
+        try {
+            const {
+                StorageMode,
+                getArchiveScopeId,
+                getItem,
+                getStorageMode,
+                removeItem,
+                setItem,
+                setStorageMode,
+            } = await import('./src/pages_assets/storage.js');
+            const prefix = `cass-archive-${getArchiveScopeId()}-data-`;
+
+            for (const [mode, backend] of [
+                [StorageMode.SESSION, sessionStorage],
+                [StorageMode.LOCAL, localStorage],
+            ]) {
+                await setStorageMode(mode);
+                const key = `coherent-${mode}`;
+                const fullKey = `${prefix}${key}`;
+                backend.setItem(fullKey, JSON.stringify('old-persistent'));
+                backend.failedSetKeys.add(fullKey);
+
+                if (await setItem(key, 'new-fallback') !== false) {
+                    throw new Error(`${mode} failed overwrite must report fallback-only durability`);
+                }
+                if (await getItem(key) !== 'new-fallback') {
+                    throw new Error(`${mode} reads must prefer the newest failed-write fallback`);
+                }
+                if (backend.getItem(fullKey) !== JSON.stringify('old-persistent')) {
+                    throw new Error('the test must retain stale persistent bytes after the injected failure');
+                }
+
+                backend.failedSetKeys.delete(fullKey);
+                if (await setItem(key, 'persisted') !== true) {
+                    throw new Error(`${mode} retry must report persistent success`);
+                }
+                backend.setItem(fullKey, JSON.stringify('backend-after-success'));
+                if (await getItem(key) !== 'backend-after-success') {
+                    throw new Error(`${mode} successful writes must retire the memory fallback`);
+                }
+
+                backend.failedRemoveKeys.add(fullKey);
+                if (await removeItem(key) !== false) {
+                    throw new Error(`${mode} failed deletion must be reported to the caller`);
+                }
+                if (await getItem(key, 'missing') !== 'missing') {
+                    throw new Error(`${mode} failed deletion must hide stale physical bytes logically`);
+                }
+
+                backend.failedRemoveKeys.delete(fullKey);
+                if (await setItem(key, 'revived') !== true || await getItem(key) !== 'revived') {
+                    throw new Error(`${mode} successful write must retire a deletion tombstone`);
+                }
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const overlayKey = 'migration-overlay';
+            const overlayFullKey = `${prefix}${overlayKey}`;
+            const staleTargetKey = `${prefix}stale-target-only`;
+            sessionStorage.setItem(overlayFullKey, JSON.stringify('stale-source'));
+            localStorage.setItem(overlayFullKey, JSON.stringify('stale-target'));
+            localStorage.setItem(staleTargetKey, JSON.stringify('must-disappear'));
+            sessionStorage.failedSetKeys.add(overlayFullKey);
+            if (await setItem(overlayKey, 'newest-logical') !== false) {
+                throw new Error('the migration fixture must create a memory fallback overlay');
+            }
+            sessionStorage.failedSetKeys.delete(overlayFullKey);
+
+            await setStorageMode(StorageMode.LOCAL, true);
+            if (
+                getStorageMode() !== StorageMode.LOCAL
+                || await getItem(overlayKey) !== 'newest-logical'
+                || localStorage.getItem(overlayFullKey) !== JSON.stringify('newest-logical')
+            ) {
+                throw new Error('migration must commit the newest logical overlay, not stale source bytes');
+            }
+            if (localStorage.getItem(staleTargetKey) !== null) {
+                throw new Error('migration must not expose destination-only stale data');
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const deletedKey = 'migration-tombstone';
+            const deletedFullKey = `${prefix}${deletedKey}`;
+            sessionStorage.setItem(deletedFullKey, JSON.stringify('source-secret'));
+            localStorage.setItem(deletedFullKey, JSON.stringify('target-secret'));
+            sessionStorage.failedRemoveKeys.add(deletedFullKey);
+            if (await removeItem(deletedKey) !== false) {
+                throw new Error('the migration fixture must create a deletion tombstone');
+            }
+            sessionStorage.failedRemoveKeys.delete(deletedFullKey);
+            await setStorageMode(StorageMode.LOCAL, true);
+            if (localStorage.getItem(deletedFullKey) !== null || await getItem(deletedKey) !== null) {
+                throw new Error('migration must preserve a newer logical deletion');
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const rejectedKey = 'migration-rejected';
+            const rejectedFullKey = `${prefix}${rejectedKey}`;
+            sessionStorage.setItem(rejectedFullKey, JSON.stringify('source-remains-authoritative'));
+            localStorage.removeItem(rejectedFullKey);
+            localStorage.failedSetKeys.add(rejectedFullKey);
+            let migrationRejected = false;
+            try {
+                await setStorageMode(StorageMode.LOCAL, true);
+            } catch {
+                migrationRejected = true;
+            }
+            if (!migrationRejected || getStorageMode() !== StorageMode.SESSION) {
+                throw new Error('an unverifiable destination write must not commit the new storage mode');
+            }
+            if (await getItem(rejectedKey) !== 'source-remains-authoritative') {
+                throw new Error('a rejected migration must leave the source logical state readable');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = run_node_module_assertions(script)
+        .expect("run browser storage fallback and migration assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser storage fallback and migration assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.data.delete(key);
+            }
+        }
+
+        class OpfsRootMock {
+            constructor(entries) {
+                this.entries = new Set(entries);
+                this.failedEntries = new Set();
+                this.removeAttempts = [];
+            }
+
+            async *keys() {
+                for (const entry of [...this.entries]) {
+                    yield entry;
+                }
+            }
+
+            async removeEntry(entry) {
+                this.removeAttempts.push(entry);
+                if (this.failedEntries.has(entry)) {
+                    throw new Error(`injected OPFS remove failure for ${entry}`);
+                }
+                this.entries.delete(entry);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+
+        try {
+            const { clearOPFS, getArchiveScopeId, getStorageStats } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const currentDb = `cass-archive-${scopeId}.sqlite3`;
+            const currentData = `cass-archive-${scopeId}-data-state`;
+            const otherDb = `cass-archive-${otherScopeId}.sqlite3`;
+            const otherData = `cass-archive-${otherScopeId}-data-state`;
+            const legacyDb = 'cass-archive.sqlite3';
+            const unrelated = 'unrelated-app.db';
+            const root = new OpfsRootMock([
+                currentDb,
+                currentData,
+                otherDb,
+                otherData,
+                legacyDb,
+                unrelated,
+            ]);
+            Object.defineProperty(globalThis, 'navigator', {
+                value: { storage: { getDirectory: async () => root } },
+                configurable: true,
+                writable: true,
+            });
+
+            const currentPreference = `cass-archive-${scopeId}-pref-opfs-enabled`;
+            const otherPreference = `cass-archive-${otherScopeId}-pref-opfs-enabled`;
+            localStorage.setItem(currentPreference, 'true');
+            localStorage.setItem(otherPreference, 'true');
+            localStorage.setItem('cass-archive-opfs-enabled', 'true');
+            root.failedEntries.add(currentDb);
+
+            const partialResult = await clearOPFS();
+            if (partialResult !== false || !root.entries.has(currentDb)) {
+                throw new Error('scoped OPFS cleanup must report the injected deletion failure');
+            }
+            if (root.entries.has(currentData) || root.entries.has(legacyDb)) {
+                throw new Error('OPFS cleanup must continue after one entry deletion fails');
+            }
+            if (!root.entries.has(otherDb) || !root.entries.has(otherData) || !root.entries.has(unrelated)) {
+                throw new Error('scoped OPFS cleanup must preserve other archives and unrelated data');
+            }
+            if (localStorage.getItem(currentPreference) !== null || localStorage.getItem('cass-archive-opfs-enabled') !== null) {
+                throw new Error('scoped OPFS cleanup must retire current and legacy opt-in preferences');
+            }
+            if (localStorage.getItem(otherPreference) !== 'true') {
+                throw new Error('scoped OPFS cleanup must preserve another archive preference');
+            }
+            const partialStats = await getStorageStats();
+            if (!partialStats.opfs.dbFiles.includes(currentDb)) {
+                throw new Error('OPFS stats must report detected residue even when file metadata is inaccessible');
+            }
+
+            root.failedEntries.clear();
+            if (!await clearOPFS() || root.entries.has(currentDb)) {
+                throw new Error('a successful retry must remove the retained current-archive file');
+            }
+
+            if (!await clearOPFS({ allArchives: true })) {
+                throw new Error('all-archive OPFS cleanup should succeed after failures are removed');
+            }
+            if (root.entries.has(otherDb) || root.entries.has(otherData)) {
+                throw new Error('all-archive OPFS cleanup must remove other cass archive data');
+            }
+            if (!root.entries.has(unrelated) || localStorage.getItem(otherPreference) !== null) {
+                throw new Error('all-archive cleanup must remove cass state without touching unrelated OPFS data');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output =
+        run_node_module_assertions(script).expect("run scoped OPFS cleanup assertions with node");
+
+    assert!(
+        output.status.success(),
+        "scoped OPFS cleanup assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_cache_and_registration_cleanup_are_scope_bound() {
+    let script = r#"
+        const originalWindow = globalThis.window;
+        const originalCaches = globalThis.caches;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        try {
+            const cacheNames = new Set();
+            const failedCacheNames = new Set();
+            const cacheApi = {
+                async keys() {
+                    return [...cacheNames];
+                },
+                async delete(name) {
+                    if (failedCacheNames.has(name)) {
+                        throw new Error(`injected cache delete failure for ${name}`);
+                    }
+                    return cacheNames.delete(name);
+                },
+            };
+            globalThis.window = {
+                location: { href: 'https://example.com/archive/index.html#/' },
+                caches: cacheApi,
+            };
+            globalThis.caches = cacheApi;
+
+            const registrations = [];
+            Object.defineProperty(globalThis, 'navigator', {
+                value: {
+                    serviceWorker: {
+                        async getRegistrations() {
+                            return [...registrations];
+                        },
+                    },
+                },
+                configurable: true,
+                writable: true,
+            });
+
+            const {
+                clearServiceWorkerCache,
+                getArchiveScopeId,
+                getArchiveScopeUrl,
+                unregisterServiceWorker,
+            } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const currentCacheV1 = `cass-archive-${scopeId}-v1`;
+            const currentCacheV2 = `cass-archive-${scopeId}-v2`;
+            const otherCache = `cass-archive-${otherScopeId}-v1`;
+            const unrelatedCache = 'unrelated-app-cache';
+            cacheNames.add(currentCacheV1);
+            cacheNames.add(currentCacheV2);
+            cacheNames.add(otherCache);
+            cacheNames.add(unrelatedCache);
+            failedCacheNames.add(currentCacheV1);
+
+            if (await clearServiceWorkerCache() !== false) {
+                throw new Error('cache cleanup must report a retained current-archive cache');
+            }
+            if (!cacheNames.has(currentCacheV1) || cacheNames.has(currentCacheV2)) {
+                throw new Error('cache cleanup must continue after one deletion rejects');
+            }
+            if (!cacheNames.has(otherCache) || !cacheNames.has(unrelatedCache)) {
+                throw new Error('scoped cache cleanup must preserve other archive and unrelated caches');
+            }
+
+            failedCacheNames.clear();
+            if (!await clearServiceWorkerCache() || cacheNames.has(currentCacheV1)) {
+                throw new Error('cache cleanup retry must remove the retained current cache');
+            }
+            if (!await clearServiceWorkerCache({ allArchives: true })) {
+                throw new Error('all-archive cache cleanup should remove remaining cass caches');
+            }
+            if (cacheNames.has(otherCache) || !cacheNames.has(unrelatedCache)) {
+                throw new Error('all-archive cache cleanup must preserve unrelated cache namespaces');
+            }
+
+            const currentScope = getArchiveScopeUrl();
+            let failCurrentUnregister = true;
+            let currentUnregisterAttempts = 0;
+            let unrelatedUnregisterAttempts = 0;
+            const currentRegistration = {
+                scope: currentScope,
+                async unregister() {
+                    currentUnregisterAttempts++;
+                    if (failCurrentUnregister) {
+                        throw new Error('injected unregister failure');
+                    }
+                    registrations.splice(registrations.indexOf(currentRegistration), 1);
+                    return true;
+                },
+            };
+            const unrelatedRegistration = {
+                scope: 'https://example.com/unrelated/',
+                async unregister() {
+                    unrelatedUnregisterAttempts++;
+                    registrations.splice(registrations.indexOf(unrelatedRegistration), 1);
+                    return true;
+                },
+            };
+            registrations.push(currentRegistration, unrelatedRegistration);
+
+            if (await unregisterServiceWorker() !== false || currentUnregisterAttempts !== 1) {
+                throw new Error('unregister must report an exact-scope registration that remains');
+            }
+            if (unrelatedUnregisterAttempts !== 0 || !registrations.includes(unrelatedRegistration)) {
+                throw new Error('unregister must never target an unrelated same-origin scope');
+            }
+
+            failCurrentUnregister = false;
+            if (!await unregisterServiceWorker() || registrations.includes(currentRegistration)) {
+                throw new Error('unregister retry must remove the exact archive registration');
+            }
+            if (unrelatedUnregisterAttempts !== 0 || !registrations.includes(unrelatedRegistration)) {
+                throw new Error('successful exact-scope unregister must preserve unrelated registrations');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.caches = originalCaches;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = run_node_module_assertions(script)
+        .expect("run scoped browser cache cleanup assertions with node");
+
+    assert!(
+        output.status.success(),
+        "scoped browser cache cleanup assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_session_teardown_survives_partial_storage_failures() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedKeys = new Set();
+                this.failedSetKeys = new Set();
+                this.removeAttempts = [];
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                if (this.failedSetKeys.has(key)) {
+                    throw new Error(`injected set failure for ${key}`);
+                }
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.removeAttempts.push(key);
+                if (this.failedKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalDocument = globalThis.document;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const removedListeners = [];
+
+        globalThis.window = {
+            location: { href: 'https://example.com/archive/index.html#/' },
+            addEventListener() {},
+            removeEventListener(type) { removedListeners.push(`window:${type}`); },
+        };
+        globalThis.document = {
+            addEventListener() {},
+            removeEventListener(type) { removedListeners.push(`document:${type}`); },
+        };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+
+        try {
+            const { SessionManager, SESSION_CONFIG } = await import('./src/pages_assets/session.js');
+            const { getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const tokenKey = `${SESSION_CONFIG.KEY_SESSION_TOKEN}_${scopeId}`;
+            const expiryKey = `${SESSION_CONFIG.KEY_EXPIRY}_${scopeId}`;
+
+            sessionStorage.setItem(tokenKey, 'session-secret');
+            sessionStorage.setItem(expiryKey, '123');
+            localStorage.setItem(tokenKey, 'local-secret');
+            localStorage.setItem(expiryKey, '456');
+            localStorage.setItem(SESSION_CONFIG.KEY_SESSION_TOKEN, 'legacy-secret');
+            sessionStorage.failedKeys.add(tokenKey);
+
+            const manager = new SessionManager();
+            const dek = new Uint8Array([1, 2, 3, 4]);
+            manager.dek = dek;
+            manager.expiryTs = Date.now() + 60_000;
+            manager.persistent = true;
+            manager.setupCleanupHandlers();
+
+            const partialResult = manager.endSession();
+            if (partialResult !== false) {
+                throw new Error('endSession must report a persisted-key deletion failure');
+            }
+            if (manager.dek !== null || dek.some((byte) => byte !== 0)) {
+                throw new Error('endSession must zeroize and release the in-memory DEK');
+            }
+            if (manager.expiryTs !== 0 || manager.persistent || manager.cleanupHandlersInstalled) {
+                throw new Error('endSession must finish in-memory state and listener teardown');
+            }
+            if (
+                !removedListeners.includes('document:visibilitychange')
+                || !removedListeners.includes('window:beforeunload')
+            ) {
+                throw new Error('endSession must remove both cleanup listeners');
+            }
+            if (sessionStorage.getItem(tokenKey) !== 'session-secret') {
+                throw new Error('the injected failure must demonstrate that a secret can remain');
+            }
+            if (
+                sessionStorage.getItem(expiryKey) !== null
+                || localStorage.getItem(tokenKey) !== null
+                || localStorage.getItem(expiryKey) !== null
+                || localStorage.getItem(SESSION_CONFIG.KEY_SESSION_TOKEN) !== null
+            ) {
+                throw new Error('cleanup must continue across later keys and storage backends');
+            }
+
+            sessionStorage.failedKeys.clear();
+            if (!manager.clearStorage() || sessionStorage.getItem(tokenKey) !== null) {
+                throw new Error('a successful retry must remove the retained session secret');
+            }
+
+            const failedStartManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+            });
+            sessionStorage.failedSetKeys.add(expiryKey);
+            let startRejected = false;
+            try {
+                await failedStartManager.startSession(new Uint8Array(32).fill(9), true);
+            } catch {
+                startRejected = true;
+            }
+            if (!startRejected || failedStartManager.isActive()) {
+                throw new Error('a partial persistent write must not publish an active session');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('a failed session start must roll back partially persisted keys');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.document = originalDocument;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+        }
+    "#;
+
+    let output = run_node_module_assertions(script)
+        .expect("run browser session teardown assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser session teardown assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_session_rejects_invalid_or_uncommitted_state() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.ignoredSetKeys = new Set();
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                if (!this.ignoredSetKeys.has(key)) {
+                    this.data.set(key, String(value));
+                }
+            }
+
+            removeItem(key) {
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalDocument = globalThis.document;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+
+        globalThis.window = {
+            location: { href: 'https://example.com/archive/index.html#/' },
+            addEventListener() {},
+            removeEventListener() {},
+        };
+        globalThis.document = {
+            hidden: false,
+            addEventListener() {},
+            removeEventListener() {},
+        };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+
+        const bytes = (value) => new Uint8Array(32).fill(value);
+        const encode = (value) => btoa(String.fromCharCode(...value));
+        const expectConstructorFailure = (options, label, SessionManager) => {
+            let rejected = false;
+            try {
+                new SessionManager(options);
+            } catch {
+                rejected = true;
+            }
+            if (!rejected) {
+                throw new Error(`${label} must be rejected by the constructor`);
+            }
+        };
+
+        try {
+            const { SessionManager, SESSION_CONFIG, createSessionManager } =
+                await import('./src/pages_assets/session.js');
+            const { getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const tokenKey = `${SESSION_CONFIG.KEY_SESSION_TOKEN}_${scopeId}`;
+            const expiryKey = `${SESSION_CONFIG.KEY_EXPIRY}_${scopeId}`;
+
+            for (const duration of [0, -1, NaN, Infinity, 2_147_483_648]) {
+                expectConstructorFailure({ duration }, `duration ${duration}`, SessionManager);
+            }
+            for (const storage of ['', 'unknown', 'persistent']) {
+                expectConstructorFailure({ storage }, `storage ${storage}`, SessionManager);
+            }
+            let factoryRejected = false;
+            try {
+                createSessionManager({ duration: 0 });
+            } catch {
+                factoryRejected = true;
+            }
+            if (!factoryRejected) {
+                throw new Error('the session factory must not replace an explicit invalid duration');
+            }
+
+            const invalidDekManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            let invalidDekRejected = false;
+            try {
+                await invalidDekManager.startSession(new Uint8Array(31));
+            } catch {
+                invalidDekRejected = true;
+            }
+            if (!invalidDekRejected || invalidDekManager.isActive()) {
+                throw new Error('startSession must reject every non-32-byte DEK');
+            }
+
+            const replacementManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            const originalDek = bytes(3);
+            await replacementManager.startSession(originalDek);
+            const priorManagedDek = replacementManager.getDek();
+            await replacementManager.startSession(priorManagedDek);
+            if (priorManagedDek.some((byte) => byte !== 0)) {
+                throw new Error('restarting with the active DEK object must zeroize the prior key');
+            }
+            if (
+                replacementManager.getDek() === priorManagedDek
+                || replacementManager.getDek().some((byte) => byte !== 3)
+            ) {
+                throw new Error('same-object restart must publish a preserved copy, not the zeroized old key');
+            }
+            replacementManager.endSession();
+
+            const unverifiedStartManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            sessionStorage.ignoredSetKeys.add(expiryKey);
+            let unverifiedStartRejected = false;
+            try {
+                await unverifiedStartManager.startSession(bytes(4), true);
+            } catch {
+                unverifiedStartRejected = true;
+            }
+            sessionStorage.ignoredSetKeys.delete(expiryKey);
+            if (!unverifiedStartRejected || unverifiedStartManager.isActive()) {
+                throw new Error('a no-op persistent write must not publish a session');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('an unverified session start must remove partial durable state');
+            }
+
+            const restoreManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            const validToken = encode(bytes(5));
+            const invalidExpiries = [
+                'NaN',
+                '0',
+                '-1',
+                '1.5',
+                String(Date.now() - 1),
+                String(Date.now() + 2_147_483_647 + 10_000),
+                String(Number.MAX_SAFE_INTEGER + 1),
+            ];
+            for (const invalidExpiry of invalidExpiries) {
+                sessionStorage.setItem(tokenKey, validToken);
+                sessionStorage.setItem(expiryKey, invalidExpiry);
+                if (await restoreManager.restoreSession() !== null || restoreManager.isActive()) {
+                    throw new Error(`restoreSession must reject invalid expiry ${invalidExpiry}`);
+                }
+                if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                    throw new Error('rejected restore state must be cleared');
+                }
+            }
+
+            for (const length of [0, 31, 33]) {
+                sessionStorage.setItem(tokenKey, encode(new Uint8Array(length)));
+                sessionStorage.setItem(expiryKey, String(Date.now() + 60_000));
+                if (await restoreManager.restoreSession() !== null || restoreManager.isActive()) {
+                    throw new Error(`restoreSession must reject a ${length}-byte DEK`);
+                }
+            }
+
+            const restoreReplacementManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await restoreReplacementManager.startSession(bytes(6), false);
+            const replacedDek = restoreReplacementManager.getDek();
+            sessionStorage.setItem(tokenKey, encode(bytes(7)));
+            sessionStorage.setItem(expiryKey, String(Date.now() + 60_000));
+            const restoredDek = await restoreReplacementManager.restoreSession();
+            if (replacedDek.some((byte) => byte !== 0)) {
+                throw new Error('restoreSession must zeroize the previous active DEK');
+            }
+            if (!restoredDek || restoredDek.length !== 32 || restoredDek.some((byte) => byte !== 7)) {
+                throw new Error('restoreSession must publish only the validated replacement DEK');
+            }
+            restoreReplacementManager.endSession();
+
+            const extensionManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_MEMORY,
+                duration: 60_000,
+            });
+            await extensionManager.startSession(bytes(8));
+            const originalExpiry = extensionManager.expiryTs;
+            for (const extension of [0, -1, NaN, Infinity, 2_147_483_648, 2_147_483_647]) {
+                if (extensionManager.extendSession(extension) !== false) {
+                    throw new Error(`invalid or overflowing extension ${extension} must be rejected`);
+                }
+                if (!extensionManager.isActive() || extensionManager.expiryTs !== originalExpiry) {
+                    throw new Error('a rejected extension must preserve the previously committed session');
+                }
+            }
+            extensionManager.endSession();
+
+            const failedExtensionManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await failedExtensionManager.startSession(bytes(9), true);
+            const failedExtensionDek = failedExtensionManager.getDek();
+            sessionStorage.ignoredSetKeys.add(expiryKey);
+            if (failedExtensionManager.extendSession(1_000) !== false) {
+                throw new Error('an unverified persistent expiry extension must fail');
+            }
+            sessionStorage.ignoredSetKeys.delete(expiryKey);
+            if (failedExtensionManager.isActive() || failedExtensionDek.some((byte) => byte !== 0)) {
+                throw new Error('ambiguous persistent extension failure must fail closed and zeroize');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('ambiguous persistent extension state must be removed');
+            }
+
+            const unloadMemoryManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await unloadMemoryManager.startSession(bytes(10), false);
+            const unloadMemoryDek = unloadMemoryManager.getDek();
+            unloadMemoryManager.handleBeforeUnload();
+            if (unloadMemoryManager.isActive() || unloadMemoryDek.some((byte) => byte !== 0)) {
+                throw new Error('unload must wipe an actually non-persistent session');
+            }
+
+            const unloadPersistentManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+                duration: 60_000,
+            });
+            await unloadPersistentManager.startSession(bytes(11), true);
+            const unloadPersistentDek = unloadPersistentManager.getDek();
+            unloadPersistentManager.handleBeforeUnload();
+            if (!unloadPersistentManager.isActive() || unloadPersistentDek.some((byte) => byte !== 11)) {
+                throw new Error('unload must preserve a session that was actually persisted');
+            }
+            unloadPersistentManager.endSession();
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.document = originalDocument;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+        }
+    "#;
+
+    let output = run_node_module_assertions(script)
+        .expect("run invalid browser session assertions with node");
+
+    assert!(
+        output.status.success(),
+        "invalid browser session assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

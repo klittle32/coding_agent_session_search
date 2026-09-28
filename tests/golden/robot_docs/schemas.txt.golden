@@ -36,10 +36,13 @@ schemas: (auto-generated from contract)
       - total_sessions: integer
   api-version:
     - api_version: integer
+    - build_commit: string
     - contract_version: string
     - crate_version: string
   capabilities:
     - api_version: integer
+    - build_commit: string
+    - build_commit_date: string
     - commands: array
     - connectors: array
     - contract_version: string
@@ -335,6 +338,18 @@ schemas: (auto-generated from contract)
         - safe_to_rebuild: boolean
         - safety_classification: string
         - status: string
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - doctor_command: object
     - doctor_contract_version: integer
     - doctor_v2_contract: object
@@ -377,18 +392,22 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -428,6 +447,7 @@ schemas: (auto-generated from contract)
     - primary_incident_id: ?
     - quarantine: object
     - raw_mirror: object
+      - amplified_sources: array
       - exists: boolean
       - layout: object
         - blob_path_template: string
@@ -474,14 +494,23 @@ schemas: (auto-generated from contract)
       - sensitive_paths_included: boolean
       - status: string
       - summary: object
+        - amplified_source_count: integer
+        - amplified_source_excess_bytes: integer
+        - amplified_source_referenced_bytes: integer
         - checksum_mismatch_count: integer
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
         - invalid_manifest_count: integer
+        - listed_manifest_count: integer
+        - listing_mode: string
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
+        - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
+        - omitted_healthy_manifest_count: integer
+        - orphan_blob_bytes: integer
+        - orphan_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -669,7 +698,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -779,6 +810,18 @@ schemas: (auto-generated from contract)
       - semantic_vector_delta: ?
       - status: string
       - visible_source_conversation_count: ?
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - event_log_path: ?
     - fallback_mode: string
     - forensic_bundle: object
@@ -890,6 +933,18 @@ schemas: (auto-generated from contract)
       - unknown_mapping_count: integer
       - visible_current_source_bytes: integer
       - visible_current_source_count: integer
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - event_log_path: ?
     - fallback_mode: string
     - mode: string
@@ -907,6 +962,7 @@ schemas: (auto-generated from contract)
     - outcome_kind: string
     - plan_fingerprint: ?
     - raw_mirror: object
+      - amplified_sources: array
       - exists: boolean
       - layout: object
         - blob_path_template: string
@@ -953,14 +1009,23 @@ schemas: (auto-generated from contract)
       - sensitive_paths_included: boolean
       - status: string
       - summary: object
+        - amplified_source_count: integer
+        - amplified_source_excess_bytes: integer
+        - amplified_source_referenced_bytes: integer
         - checksum_mismatch_count: integer
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
         - invalid_manifest_count: integer
+        - listed_manifest_count: integer
+        - listing_mode: string
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
+        - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
+        - omitted_healthy_manifest_count: integer
+        - orphan_blob_bytes: integer
+        - orphan_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -2514,7 +2579,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -2797,6 +2864,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - errors: array
+    - exit_policy: string
     - explanation: ?
     - health_level: string
     - healthy: boolean
@@ -2916,27 +2984,37 @@ schemas: (auto-generated from contract)
       - database: object
         - conversations: ?
         - counts_skipped: boolean
+        - db_bytes: integer
         - exists: boolean
+        - integrity: string
+        - integrity_detail: ?
+        - integrity_hint: ?
         - messages: ?
         - open_error: ?
         - open_retryable: boolean
         - open_skipped: boolean
         - opened: boolean
+        - shm_present: boolean
+        - wal_bytes: integer
       - index: object
         - activity_at: ?
         - age_seconds: ?
         - checkpoint: object
         - documents: ?
         - empty_with_messages: boolean
+        - engine_incompatible: boolean
         - exists: boolean
         - fingerprint: object
         - fresh: boolean
+        - hollow: boolean
         - last_indexed_at: ?
+        - live_documents: ?
         - partial: boolean
         - partial_reason: ?
         - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
+        - segment_files: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean
@@ -2961,6 +3039,7 @@ schemas: (auto-generated from contract)
         - schema_version: string
       - rebuild: object
         - active: boolean
+        - engine_incompatible: boolean
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
@@ -2988,7 +3067,9 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
@@ -3026,6 +3107,19 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - subsystem_count: integer
       - subsystems: array
+  models-build-hnsw:
+    - action: string
+    - artifact_path: string
+    - current: boolean
+    - embedder_id: string
+    - hnsw_path: string
+    - manifest_published: boolean
+    - manifest_recorded: boolean
+    - next_command: ?
+    - state_after: string
+    - state_before: string
+    - tier: string
+    - vector_count: integer
   models-check-update:
     - current_revision: ?
     - latest_revision: ?
@@ -3063,6 +3157,17 @@ schemas: (auto-generated from contract)
     - status: string
   pack:
     - _meta: object
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - daemon: object
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - query_recoveries: array
+        - query_structure: ?
+        - time_window: object
       - elapsed_ms: integer
       - format: string
       - generated_at_ms: integer
@@ -3160,6 +3265,17 @@ schemas: (auto-generated from contract)
         - semantic_fallback: object
         - token_budget: object
         - total_matches: integer
+      - effective: object
+        - auto_corrections: array
+        - command: string
+        - daemon: object
+        - db_path: string
+        - db_path_source: string
+        - filters: object
+        - query: string
+        - query_recoveries: array
+        - query_structure: ?
+        - time_window: object
       - elapsed_ms: integer
       - explanation_cards: array
       - fallback_reason: ?
@@ -3167,6 +3283,8 @@ schemas: (auto-generated from contract)
       - hits_clamped: boolean
       - index_freshness: object
         - age_seconds: ?
+        - auto_refresh: ?
+        - engine_incompatible: boolean
         - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
@@ -3178,6 +3296,7 @@ schemas: (auto-generated from contract)
         - stale: boolean
         - stale_threshold_seconds: integer
         - status: string
+      - lexical_degrade_reason: ?
       - max_tokens: ?
       - mode_defaulted: ?
       - next_cursor: ?
@@ -3231,6 +3350,7 @@ schemas: (auto-generated from contract)
         - search_ms: integer
       - tokens_estimated: ?
       - wildcard_fallback: boolean
+      - wildcard_fallback_skipped: ?
     - _timeout: ?
     - _warning: ?
     - aggregations: ?
@@ -3252,6 +3372,16 @@ schemas: (auto-generated from contract)
     - request_id: ?
     - suggestions: array
     - total_matches: integer
+    - zero_result_diagnosis: ?
+  selftest:
+    - archive_accessed: boolean
+    - checks: array
+    - contract_version: string
+    - functional: boolean
+    - latency_ms: integer
+    - schema_version: integer
+    - status: string
+    - version: string
   sessions:
     - sessions: array
   state:
@@ -3283,13 +3413,19 @@ schemas: (auto-generated from contract)
     - database: object
       - conversations: ?
       - counts_skipped: boolean
+      - db_bytes: integer
       - exists: boolean
+      - integrity: string
+      - integrity_detail: ?
+      - integrity_hint: ?
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
       - open_skipped: boolean
       - opened: boolean
       - path: string
+      - shm_present: boolean
+      - wal_bytes: integer
     - doctor_summary: object
       - active_repair: object
         - active: boolean
@@ -3390,18 +3526,22 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3428,6 +3568,7 @@ schemas: (auto-generated from contract)
     - quarantine: object
     - rebuild: object
       - active: boolean
+      - engine_incompatible: boolean
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -3542,7 +3683,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -3629,6 +3772,8 @@ schemas: (auto-generated from contract)
       - newest_source_mtime_ms: ?
       - oldest_capture_at_ms: ?
       - oldest_source_mtime_ms: ?
+      - orphan_blob_bytes: integer
+      - orphan_blob_count: integer
       - root_path: string
       - total_blob_bytes: integer
       - total_storage_bytes: integer
@@ -3663,13 +3808,19 @@ schemas: (auto-generated from contract)
     - database: object
       - conversations: ?
       - counts_skipped: boolean
+      - db_bytes: integer
       - exists: boolean
+      - integrity: string
+      - integrity_detail: ?
+      - integrity_hint: ?
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
       - open_skipped: boolean
       - opened: boolean
       - path: string
+      - shm_present: boolean
+      - wal_bytes: integer
     - doctor_summary: object
       - active_repair: object
         - active: boolean
@@ -3770,18 +3921,22 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3808,6 +3963,7 @@ schemas: (auto-generated from contract)
     - quarantine: object
     - rebuild: object
       - active: boolean
+      - engine_incompatible: boolean
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -3922,7 +4078,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -4016,27 +4174,39 @@ schemas: (auto-generated from contract)
       - database: object
         - conversations: ?
         - counts_skipped: boolean
-        - exists: boolean
+        - db_bytes: integer
+        - exists: ?
+        - inspected: boolean
+        - integrity: string
+        - integrity_detail: ?
+        - integrity_hint: ?
         - messages: ?
         - open_error: ?
         - open_retryable: boolean
         - open_skipped: boolean
         - opened: boolean
+        - shm_present: boolean
+        - wal_bytes: integer
       - index: object
         - activity_at: ?
         - age_seconds: ?
         - checkpoint: object
         - documents: ?
         - empty_with_messages: boolean
-        - exists: boolean
+        - engine_incompatible: boolean
+        - exists: ?
         - fingerprint: object
         - fresh: boolean
+        - hollow: boolean
+        - inspected: boolean
         - last_indexed_at: ?
+        - live_documents: ?
         - partial: boolean
         - partial_reason: ?
         - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
+        - segment_files: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean
@@ -4044,6 +4214,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - inspected: boolean
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array
         - quarantined_conversations: integer
@@ -4053,12 +4224,15 @@ schemas: (auto-generated from contract)
         - schema_version: integer
         - status: string
       - pending: object
+        - inspected: boolean
         - orphaned: boolean
         - sessions: integer
         - watch_active: boolean
       - rebuild: object
         - active: boolean
+        - engine_incompatible: boolean
         - indexed_docs: ?
+        - inspected: boolean
         - job_id: ?
         - job_kind: ?
         - last_progress_age_ms: ?
@@ -4081,6 +4255,7 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - inflight_message_bytes: ?
         - inflight_message_bytes_headroom: ?
+        - inspected: boolean
         - last_progress_age_ms: ?
         - last_progress_at: ?
         - max_message_bytes_in_flight: ?
@@ -4109,7 +4284,10 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
+        - inspected: boolean
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
@@ -4126,19 +4304,21 @@ schemas: (auto-generated from contract)
       - confidence: string
       - evidence_refs: array
       - family: string
+      - inspected: boolean
       - locus: string
       - recommended_next_probe: ?
       - schema_version: integer
       - summary: string
     - schema_version: integer
     - search_completeness: object
-      - can_search: boolean
-      - complete: boolean
-      - coverage_suspect: boolean
+      - can_search: ?
+      - complete: ?
+      - coverage_suspect: ?
       - impact: string
+      - inspected: boolean
       - next_command: string
       - quarantine_status: string
-      - quarantined_conversations: integer
+      - quarantined_conversations: ?
     - starter_workflows: array
     - status: string
     - surface: string
@@ -4150,12 +4330,18 @@ schemas: (auto-generated from contract)
       - recommended_next_probe: ?
       - skipped_sections: array
       - timed_out: boolean
+    - content_source: string
     - context: integer
+    - conversation_id: integer
+    - coordinate_space: string
     - end_line: integer
     - highlight_line: ?
     - lines: array
     - path: string
     - source_exists: boolean
+    - source_id: string
     - start_line: integer
     - target_line: ?
+    - target_message_index: integer
     - total_lines: integer
+    - total_messages: integer

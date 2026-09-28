@@ -64,10 +64,22 @@
         "stalled": {
           "type": "boolean"
         },
+        "engine_incompatible": {
+          "type": "boolean"
+        },
         "activity_at": {
           "type": "null"
         },
         "documents": {
+          "type": "null"
+        },
+        "live_documents": {
+          "type": "null"
+        },
+        "hollow": {
+          "type": "boolean"
+        },
+        "segment_files": {
           "type": "null"
         },
         "empty_with_messages": {
@@ -133,6 +145,15 @@
         "path": {
           "type": "string"
         },
+        "db_bytes": {
+          "type": "integer"
+        },
+        "wal_bytes": {
+          "type": "integer"
+        },
+        "shm_present": {
+          "type": "boolean"
+        },
         "open_error": {
           "type": "null"
         },
@@ -144,6 +165,15 @@
         },
         "open_skipped": {
           "type": "boolean"
+        },
+        "integrity": {
+          "type": "string"
+        },
+        "integrity_detail": {
+          "type": "null"
+        },
+        "integrity_hint": {
+          "type": "null"
         }
       }
     },
@@ -168,6 +198,9 @@
           "type": "boolean"
         },
         "stalled": {
+          "type": "boolean"
+        },
+        "engine_incompatible": {
           "type": "boolean"
         },
         "last_progress_at": {
@@ -397,6 +430,12 @@
         },
         "hnsw_path": {
           "type": "null"
+        },
+        "hnsw_present": {
+          "type": "boolean"
+        },
+        "hnsw_state": {
+          "type": "string"
         },
         "hnsw_ready": {
           "type": "boolean"

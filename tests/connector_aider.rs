@@ -1,12 +1,10 @@
 use coding_agent_search::connectors::aider::AiderConnector;
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
-use serial_test::serial;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
 mod util;
-use util::{CwdGuard, EnvGuard};
 
 // Helper to create test fixtures
 fn create_aider_fixture(dir: &TempDir, filename: &str, content: &str) -> PathBuf {
@@ -27,8 +25,10 @@ fn aider_parses_chat_history() {
     let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/aider");
     let conn = AiderConnector::new();
     let ctx = ScanContext {
-        data_dir: fixture_root,
-        scan_roots: Vec::new(),
+        data_dir: fixture_root.clone(),
+        // Parsing fixtures are explicit sources, not cass state directories.
+        // Default detection can otherwise fall back to the process CWD/home.
+        scan_roots: vec![ScanRoot::local(fixture_root)],
         since_ts: None,
         progress_tick: None,
     };
@@ -73,7 +73,7 @@ fn aider_sets_agent_slug() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -92,7 +92,7 @@ fn aider_sets_source_path() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -111,7 +111,7 @@ fn aider_sets_external_id_from_filename() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -133,7 +133,7 @@ fn aider_title_includes_path() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -169,7 +169,7 @@ fn aider_sets_workspace_to_parent() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -193,7 +193,7 @@ fn aider_timestamps_from_mtime() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -230,7 +230,7 @@ fn aider_since_ts_filters_old_files() {
     let future_ts = chrono::Utc::now().timestamp_millis() + 100_000_000;
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: Some(future_ts),
         progress_tick: None,
     };
@@ -249,7 +249,7 @@ fn aider_no_since_ts_includes_all() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -275,7 +275,7 @@ fn aider_message_indices_sequential() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -303,7 +303,7 @@ fn aider_author_matches_role() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -328,7 +328,7 @@ fn aider_user_messages_from_prefix() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -358,7 +358,7 @@ fn aider_multiline_user_input() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -388,7 +388,7 @@ fn aider_assistant_after_user() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -416,7 +416,7 @@ fn aider_multiple_turns() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -450,7 +450,7 @@ fn aider_empty_file() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -469,7 +469,7 @@ fn aider_whitespace_only_file() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -492,7 +492,7 @@ fn aider_only_user_messages() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -518,7 +518,7 @@ fn aider_no_user_prefix_content() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -560,7 +560,7 @@ fn aider_scans_subdirectories() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -583,7 +583,7 @@ fn aider_only_scans_chat_history_files() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -611,7 +611,7 @@ fn aider_multiple_projects() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -645,7 +645,7 @@ fn aider_preserves_commands() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -671,7 +671,7 @@ fn aider_code_blocks_in_response() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -699,7 +699,7 @@ fn aider_markdown_formatting() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -729,7 +729,7 @@ fn aider_gt_in_code_not_user_input() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -750,72 +750,118 @@ fn aider_gt_in_code_not_user_input() {
 // DETECTION TESTS
 // =============================================================================
 
+/// Keep live detect() coverage without changing cwd or environment for sibling
+/// libtest threads. The parent requires a receipt emitted after the assertions.
+fn isolated_detection(test_name: &str, check: impl FnOnce()) {
+    const CHILD_TEST: &str = "CASS_AIDER_DETECTION_CHILD";
+    if dotenvy::var(CHILD_TEST).ok().as_deref() == Some(test_name) {
+        check();
+        println!("cass-aider-detection-ok:{test_name}");
+        return;
+    }
+
+    let fixture = TempDir::new().unwrap();
+    let home = fixture.path().join("home");
+    let cwd = fixture.path().join("work");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env_clear()
+        .current_dir(&cwd)
+        .env(CHILD_TEST, test_name)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("RUST_MIN_STACK", "134217728");
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let output = util::timeout::spawn_with_timeout_or_diag(
+        command,
+        test_name,
+        Some(fixture.path()),
+        std::time::Duration::from_secs(60),
+    );
+    assert!(
+        output.status.success(),
+        "Aider detection child failed: {:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("cass-aider-detection-ok:{test_name}")),
+        "Aider detection child did not reach its assertions"
+    );
+}
+
 /// Detect should only succeed when an aider history is actually present
 /// and the probe should remain fast (no recursive walk on every call).
 #[test]
-#[serial]
 fn aider_detect_requires_marker_and_is_fast() {
     use std::time::Instant;
 
-    let tmp = tempfile::TempDir::new().unwrap();
+    isolated_detection("aider_detect_requires_marker_and_is_fast", || {
+        let cwd = std::env::current_dir().unwrap();
+        // Build a moderately large directory tree to catch accidental recursion.
+        for i in 0..50 {
+            let dir = cwd.join(format!("nested/{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("noise.txt"), "noise").unwrap();
+        }
 
-    // Use RAII guards for cleanup even on panic
-    let _cwd_guard = CwdGuard::change_to(tmp.path()).unwrap();
-    let _env_guard = EnvGuard::set("CASS_AIDER_DATA_ROOT", "");
-    unsafe {
-        std::env::remove_var("CASS_AIDER_DATA_ROOT");
-    }
+        let start = Instant::now();
+        let conn = AiderConnector::new();
+        let result = conn.detect();
+        let elapsed = start.elapsed();
 
-    // Build a moderately large directory tree to catch accidental recursion.
-    for i in 0..50 {
-        let dir = tmp.path().join(format!("nested/{i}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("noise.txt"), "noise").unwrap();
-    }
-
-    let start = Instant::now();
-    let conn = AiderConnector::new();
-    let result = conn.detect();
-    let elapsed = start.elapsed();
-
-    // No marker -> should not report detected
-    assert!(
-        !result.detected,
-        "detect() should be false without marker files"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_millis(200),
-        "detect() should be fast without scanning entire tree"
-    );
-    // Guards automatically restore cwd and env on drop
+        // No marker -> should not report detected.
+        assert!(
+            !result.detected,
+            "detect() should be false without marker files"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "detect() should be fast without scanning entire tree"
+        );
+    });
 }
 
 /// Detect succeeds when .aider.chat.history.md is present in cwd
 #[test]
-#[serial]
 fn aider_detect_with_marker_file() {
-    let tmp = tempfile::TempDir::new().unwrap();
+    isolated_detection("aider_detect_with_marker_file", || {
+        let marker = std::env::current_dir()
+            .unwrap()
+            .join(".aider.chat.history.md");
+        std::fs::write(&marker, "stub").unwrap();
 
-    // Use RAII guard for cleanup even on panic
-    let _cwd_guard = CwdGuard::change_to(tmp.path()).unwrap();
+        let conn = AiderConnector::new();
+        let result = conn.detect();
 
-    let marker = tmp.path().join(".aider.chat.history.md");
-    std::fs::write(&marker, "stub").unwrap();
-
-    let conn = AiderConnector::new();
-    let result = conn.detect();
-
-    assert!(
-        result.detected,
-        "detect() should succeed when marker exists"
-    );
-    assert!(
-        result
-            .evidence
-            .iter()
-            .any(|e| e.contains(".aider.chat.history.md"))
-    );
-    // Guard automatically restores cwd on drop
+        assert!(
+            result.detected,
+            "detect() should succeed when marker exists"
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains(".aider.chat.history.md"))
+        );
+    });
 }
 
 // =============================================================================
@@ -831,7 +877,7 @@ fn aider_metadata_is_empty() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -850,7 +896,7 @@ fn aider_message_extra_is_empty() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -871,7 +917,7 @@ fn aider_message_created_at_is_none() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -892,7 +938,7 @@ fn aider_message_snippets_empty() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -933,7 +979,7 @@ fn aider_empty_directory() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -956,7 +1002,7 @@ fn aider_long_user_input() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -981,7 +1027,7 @@ fn aider_special_characters() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -1007,7 +1053,7 @@ fn aider_blank_lines_between_messages() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -1032,7 +1078,7 @@ fn aider_consecutive_user_lines_combined() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };
@@ -1062,7 +1108,7 @@ fn aider_trailing_whitespace() {
     let conn = AiderConnector::new();
     let ctx = ScanContext {
         data_dir: tmp.path().to_path_buf(),
-        scan_roots: Vec::new(),
+        scan_roots: vec![ScanRoot::local(tmp.path().to_path_buf())],
         since_ts: None,
         progress_tick: None,
     };

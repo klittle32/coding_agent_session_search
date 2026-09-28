@@ -17,23 +17,46 @@
 //! * [`run_doctor_cleanup_interrupted_artifacts`] quarantines interrupted
 //!   `raw_mirror_capture` staging dirs that otherwise block doctor mutation,
 //!   without forcing the operator to `rm` inside cass's own data dir.
+//! * [`run_doctor_repair_leaked_pages`] frees pages that left the freelist
+//!   without entering a tree (integrity_check's "page N is never used"), after
+//!   proving that is the only damage and backing up the live bundle.
 //!
 //! None of these surfaces ever delete canonical rows or source data: recovery
 //! is additive (writes reconstructed files), the FTS5 shadow is fully
-//! rebuildable from the canonical `messages`, and interrupted artifacts are
-//! moved into a quarantine dir rather than deleted.
+//! rebuildable from the canonical `messages`, interrupted artifacts are moved
+//! into a quarantine dir rather than deleted, and the leaked-page repair frees
+//! only pages that no table, index or freelist owns.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, FtsShadowParity, FtsShadowParityStatus,
+    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
+    RecoveryConversationRow,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
 /// Page size for streaming conversations during reconstruction. Keeps memory
 /// bounded on multi-GB archives (the exact failure surface from #285/#266).
 const RECOVER_CONVERSATION_PAGE: i64 = 256;
+/// Maximum canonical and FTS row IDs inspected by a read-only dry-run. The
+/// mutating path still performs exact parity validation before changing data.
+/// #345 plan of record: when the divergence scan hits this cap the dry-run
+/// stops and reports ">= N divergent" instead of paying for an exact count on
+/// a multi-million-row archive. Override with `CASS_FTS_DRYRUN_CAP`.
+const FTS_DRY_RUN_ROWID_COMPARISON_CAP: usize = 4_096;
+
+/// #345: the effective dry-run cap — `CASS_FTS_DRYRUN_CAP` (positive integer)
+/// or the default. Pure parse half kept separate for unit testing.
+fn parse_fts_dry_run_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+}
+
+fn fts_dry_run_rowid_comparison_cap() -> usize {
+    parse_fts_dry_run_cap(dotenvy::var("CASS_FTS_DRYRUN_CAP").ok().as_deref())
+}
 
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -106,6 +129,61 @@ fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
     rendered.contains("corrupt %_data record") && !is_fts5_oversized_leaf_error(err)
 }
 
+/// #434 defect 2: schema-level open refusals that name a derived FTS5 shadow
+/// object — the reported shape is `database disk image is malformed:
+/// sqlite_master is missing implicit autoindex slot 1 for table
+/// \`fts_messages_config\``, which fails during the schema reload BEFORE the
+/// ordinary FTS5 deferral applies, so `--rebuild-canonical-fts` used to refuse
+/// to open the very archive it exists to repair. Every `fts_messages*` object
+/// is fully derived from canonical rows, so the right repair is the same
+/// deferred-open drop+recreate the corrupt-`%_data` class uses — attempted
+/// below; when even the deferred open cannot get past the schema reload,
+/// doctor now says so explicitly and routes to the raw-mirror recovery path
+/// instead of repeating the refusal.
+pub(crate) fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("fts_messages")
+        && (rendered.contains("missing implicit autoindex slot")
+            || (rendered.contains("database disk image is malformed")
+                && rendered.contains("sqlite_master")))
+}
+
+/// Whether the pinned frankensqlite's deferred-FTS5 repair open accepts an
+/// FTS5 shadow table whose declared implicit autoindex has no `sqlite_master`
+/// row: the catalog cass wrote for `fts_messages_config` before the #434
+/// writer fix (GH #503). frankensqlite =0.4.4 refuses it on every open,
+/// including the repair open, so `--rebuild-canonical-fts` cannot rebuild
+/// that shadow in place. The engine fix is not in a published release yet.
+/// `pinned_engine_deferred_open_matches_the_legacy_shadow_catalog_policy`
+/// runs the real repair open on a fixture with that catalog and fails when a
+/// pin bump changes the answer, so this cannot silently go stale.
+pub(crate) const ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX: bool = false;
+
+/// The GH #503 open refusal: an `fts_messages*` shadow table declares an
+/// implicit autoindex that `sqlite_master` does not have.
+pub(crate) fn is_missing_fts5_shadow_autoindex_failure(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("missing implicit autoindex slot") && rendered.contains("`fts_messages")
+}
+
+/// The refusal both `--rebuild-canonical-fts --dry-run` and `--yes` report
+/// for the GH #503 catalog while the pinned engine cannot open it for repair:
+/// no plan is offered that the apply could not carry out.
+fn legacy_fts_shadow_catalog_unrepairable_error(
+    db_path: &Path,
+    open_err: &anyhow::Error,
+) -> CliError {
+    storage_error(
+        format!(
+            "the fts_messages FTS5 shadow in {} uses a legacy catalog (a table declaring a primary key with no sqlite_master autoindex row, written by cass before the #434 fix); this build's storage engine refuses that catalog even for the shadow repair, so it cannot be rebuilt in place ({open_err:#})",
+            db_path.display()
+        ),
+        Some(
+            "Nothing was changed, and the conversations and messages are not what the engine rejected. Keep the archive as it is and do not run 'cass doctor --fix'. Support for repairing this catalog in place needs a storage-engine release (GH #503). Meanwhile 'cass index --full --data-dir <NEW_DIR>' re-indexes the sessions whose source files still exist, without touching this archive.",
+        ),
+    )
+}
+
 /// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
 /// canonical rows and the Tantivy index are intact and fully serve search; only
 /// the optional SQLite-side FTS5 shadow cannot be materialized for this corpus.
@@ -148,12 +226,16 @@ fn print_json(envelope: &serde_json::Value) -> CliResult<()> {
 /// One reconstructed session file (or a skip with the reason).
 #[derive(Debug)]
 struct ReconstructedSession {
-    conversation_id: i64,
+    /// `None` when the canonical row's `id` itself was unreadable (#391).
+    conversation_id: Option<i64>,
     external_id: Option<String>,
     relative_or_source_path: String,
     written_path: Option<PathBuf>,
     line_count: usize,
     skipped_reason: Option<String>,
+    /// Columns whose stored type disagreed with the schema and were coerced
+    /// while reading the canonical row (empty for a healthy row).
+    coercions: Vec<String>,
 }
 
 /// Compute the on-disk output path for a reconstructed session.
@@ -244,9 +326,12 @@ pub fn run_doctor_recover_from_archive(
         )
     })?;
 
-    let total = storage
-        .total_conversation_count()
-        .map_err(|e| storage_error(format!("counting conversations: {e:#}"), None))?;
+    // The count is reporting only; on a damaged tree it may itself fail, and
+    // that must not stop the row-by-row export below (#391).
+    let (total, total_count_error) = match storage.total_conversation_count() {
+        Ok(total) => (Some(total), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
 
     std::fs::create_dir_all(&target_dir).map_err(|e| {
         io_error(
@@ -261,27 +346,87 @@ pub fn run_doctor_recover_from_archive(
     let mut results: Vec<ReconstructedSession> = Vec::new();
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut unreadable_rows = 0usize;
+    let mut quarantined_rows = 0usize;
+    let mut coerced_rows = 0usize;
     let mut total_lines = 0usize;
 
-    let mut offset: i64 = 0;
+    // Keyset pagination by `id`: no `ORDER BY started_at` sort over a possibly
+    // damaged tree, and a page is never re-read after a partial failure.
+    let mut after_id: i64 = 0;
     loop {
-        let conversations = storage
-            .list_conversations(RECOVER_CONVERSATION_PAGE, offset)
+        let rows = storage
+            .list_conversations_for_recovery(after_id, RECOVER_CONVERSATION_PAGE)
             .map_err(|e| {
                 storage_error(
-                    format!("listing conversations at offset {offset}: {e:#}"),
-                    None,
+                    format!("listing conversations after id {after_id}: {e:#}"),
+                    Some(
+                        "The page walk itself failed inside the engine, so the rows after this id cannot be reached read-only. Sessions already written are complete; recover the rest from a backup ('cass doctor backups list') or a remote mirror.",
+                    ),
                 )
             })?;
-        if conversations.is_empty() {
+        if rows.is_empty() {
             break;
         }
-        let page_len = conversations.len() as i64;
+        let page_len = rows.len() as i64;
+        let page_start_id = after_id;
+        let mut page_saw_unreadable = false;
 
-        for conversation in conversations {
+        for row in rows {
+            let (conversation, coercions) = match row {
+                RecoveryConversationRow::Readable {
+                    conversation,
+                    coercions,
+                } => (*conversation, coercions),
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    // #391: identity types are inconsistent with CASS's
+                    // contract, so messages cannot safely be attributed to
+                    // this row. The types alone do not diagnose page aliasing.
+                    // Count it, keep paging past its id, export nothing.
+                    after_id = after_id.max(id);
+                    skipped += 1;
+                    quarantined_rows += 1;
+                    results.push(ReconstructedSession {
+                        conversation_id: Some(id),
+                        external_id: None,
+                        relative_or_source_path: format!("<quarantined row: id {id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(
+                            "quarantined canonical row: identity columns violate the text/path \
+                             contract; message ownership cannot be verified"
+                                .to_string(),
+                        ),
+                        coercions,
+                    });
+                    continue;
+                }
+                RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                    // #391: a row whose id is not an integer cannot be addressed
+                    // for message reconstruction. Record it and keep exporting
+                    // the rest instead of aborting with nothing written.
+                    skipped += 1;
+                    unreadable_rows += 1;
+                    page_saw_unreadable = true;
+                    results.push(ReconstructedSession {
+                        conversation_id: None,
+                        external_id: None,
+                        relative_or_source_path: format!("<unreadable row: id {stored_id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(format!("unreadable canonical row: {reason}")),
+                        coercions: Vec::new(),
+                    });
+                    continue;
+                }
+            };
             let Some(conversation_id) = conversation.id else {
                 continue;
             };
+            after_id = after_id.max(conversation_id);
+            if !coercions.is_empty() {
+                coerced_rows += 1;
+            }
             let source_path_display = conversation.source_path.display().to_string();
 
             let lines = match storage.reconstruct_source_jsonl_for_conversation(conversation_id) {
@@ -289,12 +434,13 @@ pub fn run_doctor_recover_from_archive(
                 Err(e) => {
                     skipped += 1;
                     results.push(ReconstructedSession {
-                        conversation_id,
+                        conversation_id: Some(conversation_id),
                         external_id: conversation.external_id.clone(),
                         relative_or_source_path: source_path_display,
                         written_path: None,
                         line_count: 0,
                         skipped_reason: Some(format!("reconstruct failed: {e:#}")),
+                        coercions,
                     });
                     continue;
                 }
@@ -303,7 +449,7 @@ pub fn run_doctor_recover_from_archive(
             if lines.is_empty() {
                 skipped += 1;
                 results.push(ReconstructedSession {
-                    conversation_id,
+                    conversation_id: Some(conversation_id),
                     external_id: conversation.external_id.clone(),
                     relative_or_source_path: source_path_display,
                     written_path: None,
@@ -312,6 +458,7 @@ pub fn run_doctor_recover_from_archive(
                         "no preserved source events (extra_json/extra_bin) to reconstruct"
                             .to_string(),
                     ),
+                    coercions,
                 });
                 continue;
             }
@@ -338,17 +485,24 @@ pub fn run_doctor_recover_from_archive(
             written += 1;
             total_lines += lines.len();
             results.push(ReconstructedSession {
-                conversation_id,
+                conversation_id: Some(conversation_id),
                 external_id: conversation.external_id.clone(),
                 relative_or_source_path: source_path_display,
                 written_path: Some(out_path),
                 line_count: lines.len(),
                 skipped_reason: None,
+                coercions,
             });
         }
 
-        offset += page_len;
         if page_len < RECOVER_CONVERSATION_PAGE {
+            break;
+        }
+        // `ORDER BY c.id` sorts every non-integer id after all integer ids,
+        // so a page that carried an unreadable row has already reached the
+        // end of the addressable rows; and a page that advanced nothing would
+        // be re-read forever. Stop rather than loop or double-report.
+        if page_saw_unreadable || after_id == page_start_id {
             break;
         }
     }
@@ -360,8 +514,13 @@ pub fn run_doctor_recover_from_archive(
         "db_path": db_path.display().to_string(),
         "target_dir": target_dir.display().to_string(),
         "conversations_total": total,
+        "conversations_total_error": total_count_error,
         "sessions_written": written,
         "sessions_skipped": skipped,
+        // #391: rows the strict reader would have aborted the export on.
+        "rows_unreadable": unreadable_rows,
+        "rows_quarantined": quarantined_rows,
+        "rows_coerced": coerced_rows,
         "lines_written": total_lines,
         "sessions": results
             .iter()
@@ -372,6 +531,7 @@ pub fn run_doctor_recover_from_archive(
                 "written_path": r.written_path.as_ref().map(|p| p.display().to_string()),
                 "line_count": r.line_count,
                 "skipped_reason": r.skipped_reason,
+                "coercions": r.coercions,
             }))
             .collect::<Vec<_>>(),
         "next_action": format!(
@@ -389,7 +549,14 @@ pub fn run_doctor_recover_from_archive(
             target_dir.display()
         );
         if skipped > 0 {
-            println!("  {skipped} conversation(s) had no preserved events and were skipped.");
+            println!(
+                "  {skipped} conversation(s) were skipped (no preserved events, unreadable, or quarantined)."
+            );
+        }
+        if unreadable_rows > 0 || quarantined_rows > 0 || coerced_rows > 0 {
+            println!(
+                "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {quarantined_rows} quarantined (identity columns mis-typed), {coerced_rows} with coerced column types (see --json for details)."
+            );
         }
         println!(
             "Next: re-ingest with 'cass index --full' over {} into a fresh data dir.",
@@ -409,9 +576,10 @@ fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
     })
 }
 
-fn planned_fts_repair(parity: &FtsShadowParity) -> &'static str {
-    match parity.status {
+fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
+    match status {
         FtsShadowParityStatus::Absent => "failure_atomic_recreate",
+        FtsShadowParityStatus::Residue => "drop_residue_and_recreate_from_canonical",
         FtsShadowParityStatus::Healthy => "verify_and_record_generation",
         FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
         FtsShadowParityStatus::Excess | FtsShadowParityStatus::Divergent => {
@@ -421,9 +589,10 @@ fn planned_fts_repair(parity: &FtsShadowParity) -> &'static str {
     }
 }
 
-fn fts_repair_is_applicable(parity: &FtsShadowParity) -> bool {
-    match parity.status {
+fn fts_repair_is_applicable(status: FtsShadowParityStatus) -> bool {
+    match status {
         FtsShadowParityStatus::Absent
+        | FtsShadowParityStatus::Residue
         | FtsShadowParityStatus::Healthy
         | FtsShadowParityStatus::Partial => true,
         FtsShadowParityStatus::Excess
@@ -432,20 +601,68 @@ fn fts_repair_is_applicable(parity: &FtsShadowParity) -> bool {
     }
 }
 
-fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsShadowParity) -> serde_json::Value {
-    let applicable = fts_repair_is_applicable(parity);
+fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
+    serde_json::json!({
+        "status": parity.status_as_str(),
+        "canonical_messages": parity.canonical_messages,
+        "indexable_messages": parity.indexable_messages,
+        "indexed_messages": parity.indexed_messages,
+        "inspection_complete": parity.inspection_complete,
+        "comparison_cap": parity.comparison_cap,
+        "canonical_ids_examined": parity.canonical_ids_examined,
+        "indexed_ids_examined": parity.indexed_ids_examined,
+        "observed_missing_canonical_rowids_at_least": parity.observed_missing_canonical_rowids_at_least,
+        "observed_excess_fts_rowids_at_least": parity.observed_excess_fts_rowids_at_least,
+        "divergent_rowids_at_least": parity.divergent_rowids_at_least(),
+        "detail": parity.detail,
+    })
+}
+
+/// `retirement_recorded` is [`FrankenStorage::fts_shadow_retirement_is_current`]:
+/// no registration, no leftover shadow table, and both retirement markers
+/// already describing the current corpus and bound.
+fn fts_rebuild_dry_run_envelope(
+    db_path: &Path,
+    parity: &FtsDryRunParity,
+    retirement_recorded: bool,
+) -> serde_json::Value {
+    let exceeds_bound = crate::storage::sqlite::fts_shadow_max_messages()
+        .is_some_and(|bound| u64::try_from(parity.indexable_messages).unwrap_or(0) > bound);
+    // GH #497 follow-up: an oversized corpus whose shadow is already retired
+    // is settled. The apply would only re-report the retirement, so the plan
+    // must not claim a mutation.
+    let settled_retirement = exceeds_bound
+        && retirement_recorded
+        && parity.exact_status == Some(FtsShadowParityStatus::Absent);
+    let applicable = if settled_retirement {
+        Some(false)
+    } else {
+        parity.exact_status.map(fts_repair_is_applicable)
+    };
+    let planned_action = match parity.exact_status {
+        _ if settled_retirement => "none_shadow_retired_not_viable",
+        Some(FtsShadowParityStatus::Residue) if exceeds_bound => "drop_residue_and_mark_not_viable",
+        Some(FtsShadowParityStatus::Absent) if exceeds_bound => "record_not_viable_retirement",
+        Some(status) => planned_fts_repair(status),
+        None => "exact_parity_inspection_deferred_to_apply",
+    };
+    let apply_command = match applicable {
+        Some(true) | None => Some("cass doctor --rebuild-canonical-fts --yes --json"),
+        Some(false) => None,
+    };
     serde_json::json!({
         "schema_version": 1,
         "doctor_contract_version": 1,
         "kind": "rebuild_canonical_fts_dry_run",
         "dry_run": true,
         "db_path": db_path.display().to_string(),
-        "parity": fts_parity_json(parity),
-        "planned_action": planned_fts_repair(parity),
+        "parity": fts_dry_run_parity_json(parity),
+        "planned_action": planned_action,
         "would_mutate": applicable,
+        "shadow_retired_not_viable": settled_retirement,
         "canonical_rows_modified": false,
-        "apply_command": applicable.then_some("cass doctor --rebuild-canonical-fts --yes --json"),
-        "note": "Read-only inspection only; --yes never overrides --dry-run.",
+        "apply_command": apply_command,
+        "note": "Read-only bounded inspection only; an indeterminate result never means healthy. The --yes path performs exact parity validation before any mutation, and --yes never overrides --dry-run.",
     })
 }
 
@@ -485,6 +702,29 @@ pub fn run_doctor_rebuild_canonical_fts(
         ));
     }
 
+    // GH #495: every mutating FTS repair shares the authoritative index-run
+    // lock with index/watch. This prevents residue cleanup from racing a
+    // watcher that still has the old virtual-table shape loaded.
+    let _mutation_guard = if dry_run {
+        None
+    } else {
+        Some(
+            crate::indexer::acquire_search_maintenance_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+            .map_err(|err| {
+                storage_error(
+                    format!(
+                        "acquiring exclusive index-run lock for canonical FTS5 repair: {err:#}"
+                    ),
+                    Some("Stop the active cass index/watch process, then retry the repair."),
+                )
+            })?,
+        )
+    };
+
     let storage_open = if dry_run {
         FrankenStorage::open_readonly(&db_path)
     } else {
@@ -492,12 +732,23 @@ pub fn run_doctor_rebuild_canonical_fts(
     };
     let storage = match storage_open {
         Ok(storage) => storage,
-        // #368 defect 3: the FTS5 shadow structure is corrupt enough that the
-        // archive cannot be opened normally (the schema reload decodes the
-        // corrupt %_data). Open with FTS5 hydration DEFERRED and rebuild the
-        // shadow by dropping + recreating it from canonical rows — the shadow is
-        // fully derived and canonical rows are never touched.
-        Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+        // #368 defect 3 / #434 defect 2: the FTS5 shadow is corrupt enough that
+        // the archive cannot be opened normally (the schema reload decodes the
+        // corrupt %_data, or refuses a shadow object's sqlite_master state).
+        // Open with FTS5 hydration DEFERRED and rebuild the shadow by dropping
+        // + recreating it from canonical rows — the shadow is fully derived
+        // and canonical rows are never touched.
+        Err(open_err)
+            if is_fts5_shadow_open_corruption_error(&open_err)
+                || is_fts_shadow_schema_level_open_failure(&open_err) =>
+        {
+            if !ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX
+                && is_missing_fts5_shadow_autoindex_failure(&open_err)
+            {
+                return Err(legacy_fts_shadow_catalog_unrepairable_error(
+                    &db_path, &open_err,
+                ));
+            }
             if dry_run {
                 // A dry-run must stay read-only and non-locking: report the
                 // planned repair straight from the open error, WITHOUT opening
@@ -519,12 +770,17 @@ pub fn run_doctor_rebuild_canonical_fts(
                 return Ok(());
             }
             let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
+                // #434 defect 2: BOTH structured opens failed. Say so
+                // explicitly instead of repeating the refusal, and route to
+                // the checksum-verified raw-mirror recovery path.
                 storage_error(
                     format!(
-                        "opening canonical archive {} with deferred FTS5 validation for corrupt-shadow repair: {e:#}",
+                        "no structured open of {} is possible: the ordinary open failed ({open_err:#}) and the deferred-FTS5 repair open also failed ({e:#})",
                         db_path.display()
                     ),
-                    Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                    Some(
+                        "The archive's schema state is damaged beyond what the deferred-FTS5 repair open tolerates, so doctor cannot repair the derived shadow in place. Preserve the complete archive bundle (db + -wal + -shm + sidecars) and recover instead: 'cass doctor check --json' ranks the recovery authorities, 'cass doctor --fix --json' verifies the checksum-verified raw mirror and stages an isolated reconstruct candidate, and 'cass doctor --recover-from-archive <DIR>' rebuilds the source tree from the archive's preserved events when the archive is still readable read-only.",
+                    ),
                 )
             })?;
             let inserted = deferred
@@ -559,42 +815,92 @@ pub fn run_doctor_rebuild_canonical_fts(
                     db_path.display()
                 ),
                 Some(
-                    "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                     'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
+                    // #434 defect 1: an open failure proves a schema-level open
+                    // failure, NOT that canonical rows are unreadable (stock
+                    // readers served every canonical row of the #434 archive).
+                    "The archive failed to open at the schema level; that does not by itself mean \
+                     the canonical rows are unreadable. Run 'cass doctor check --json' to see what \
+                     is actually readable and which recovery authority doctor ranks first. If \
+                     doctor confirms the canonical rows are unreadable, 'cass doctor \
+                     --recover-from-archive <DIR>' rebuilds the source tree from the archive's \
+                     preserved events.",
                 ),
             ));
         }
     };
+    if dry_run {
+        let before = storage
+            .inspect_search_fallback_fts_parity_dry_run(fts_dry_run_rowid_comparison_cap())
+            .map_err(|e| {
+                storage_error(
+                    format!("performing bounded canonical/FTS5 row-parity inspection: {e:#}"),
+                    Some(
+                        "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+                    ),
+                )
+            })?;
+        let retirement_recorded = storage.fts_shadow_retirement_is_current().map_err(|e| {
+            storage_error(
+                format!("inspecting the fallback FTS shadow retirement markers: {e:#}"),
+                Some(
+                    "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+                ),
+            )
+        })?;
+        let envelope = fts_rebuild_dry_run_envelope(&db_path, &before, retirement_recorded);
+        if structured_format.is_some() {
+            print_json(&envelope)?;
+        } else {
+            println!(
+                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}, divergent>={}{}",
+                before.status_as_str(),
+                before.inspection_complete,
+                before.canonical_messages,
+                before.indexable_messages,
+                before.indexed_messages,
+                before.comparison_cap,
+                before.divergent_rowids_at_least(),
+                if before.inspection_complete {
+                    ""
+                } else {
+                    " (capped; a divergence floor, not an exact count — raise CASS_FTS_DRYRUN_CAP or run --yes for exact parity)"
+                },
+            );
+        }
+        return Ok(());
+    }
+
     let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
-            format!("inspecting canonical/FTS5 row parity: {e:#}"),
+            format!("inspecting exact canonical/FTS5 row parity before repair: {e:#}"),
             Some(
                 "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
             ),
         )
     })?;
 
-    if dry_run {
-        let envelope = fts_rebuild_dry_run_envelope(&db_path, &before);
-        if structured_format.is_some() {
-            print_json(&envelope)?;
-        } else {
-            println!(
-                "Canonical FTS5 dry-run: status={}, planned_action={}, canonical={}, indexable={}, indexed={:?}",
-                before.status.as_str(),
-                planned_fts_repair(&before),
-                before.canonical_messages,
-                before.indexable_messages,
-                before.indexed_messages
+    let retirement_recorded_before = storage.fts_shadow_retirement_is_current().map_err(|e| {
+        storage_error(
+            format!("inspecting the fallback FTS shadow retirement markers before repair: {e:#}"),
+            Some(
+                "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+            ),
+        )
+    })?;
+    let repair = match storage.ensure_search_fallback_fts_consistency() {
+        Ok(repair) => repair,
+        Err(e) if fts_shadow_not_viable_detail_in(&e).is_some() => {
+            return report_fts_shadow_retired(
+                &storage,
+                &db_path,
+                &before,
+                retirement_recorded_before,
+                &e,
+                structured_format,
             );
         }
-        return Ok(());
-    }
-
-    let repair = storage
-        .ensure_search_fallback_fts_consistency()
-        .map_err(|e| {
-            if is_fts5_oversized_leaf_error(&e) {
+        Err(e) => {
+            return Err(if is_fts5_oversized_leaf_error(&e) {
                 // GH #369: a known, content-dependent engine limitation — not
                 // archive corruption. Surface a distinct, reassuring diagnostic
                 // instead of the generic storage wall so operators do not treat
@@ -607,8 +913,30 @@ pub fn run_doctor_rebuild_canonical_fts(
                         "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
                     ),
                 )
-            }
-        })?;
+            });
+        }
+    };
+    // GH #438: an explicit repair of a shadow whose rows already match must
+    // still rewrite segments written by an older engine (frankensqlite#404);
+    // queryable rows do not prove a valid segment format. Optimize rewrites
+    // them with the current writer (a no-op on an already optimized index)
+    // and the FTS5 integrity-check then validates the result.
+    let segments_optimized = if matches!(repair, FtsConsistencyRepair::AlreadyHealthy { .. }) {
+        storage
+            .optimize_fts_messages_segments()
+            .and_then(|()| storage.validate_fts_messages_integrity())
+            .map_err(|e| {
+                storage_error(
+                    format!("rewriting existing FTS5 segments of a parity-healthy shadow: {e:#}"),
+                    Some(
+                        "Canonical rows are unchanged. Re-run the dry-run; if segment rewriting keeps failing, remove the derived shadow with `cass index --full` after preserving the database bundle.",
+                    ),
+                )
+            })?;
+        true
+    } else {
+        false
+    };
     let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
         storage_error(
             format!("validating canonical/FTS5 parity after repair: {e:#}"),
@@ -626,6 +954,37 @@ pub fn run_doctor_rebuild_canonical_fts(
             Some("Re-run the dry-run; do not treat this repair as complete."),
         ));
     }
+    // GH #497 follow-up: exact parity is verified, so the "shadow may be
+    // half-rebuilt" marker (left by a failed/skipped index repair or by a
+    // size retirement) no longer describes this archive. Clear it here, or
+    // `cass status` keeps reporting `fallback_fts_repair.pending` until the
+    // next full index run.
+    let repair_pending_cleared = match storage.read_fallback_fts_repair_pending() {
+        Ok(Some(_)) => {
+            storage
+                .record_fallback_fts_repair_pending(None)
+                .map_err(|e| {
+                    storage_error(
+                        format!(
+                            "clearing the fallback FTS repair-pending marker after a verified repair: {e:#}"
+                        ),
+                        Some(
+                            "The shadow itself was repaired and verified; re-run the same command to clear the stale marker.",
+                        ),
+                    )
+                })?;
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            return Err(storage_error(
+                format!("reading the fallback FTS repair-pending marker after repair: {e:#}"),
+                Some(
+                    "The shadow itself was repaired and verified; re-run the same command to clear the stale marker.",
+                ),
+            ));
+        }
+    };
     let (repair_kind, inserted_rows) = match repair {
         FtsConsistencyRepair::AlreadyHealthy { .. } => ("already_healthy", 0),
         FtsConsistencyRepair::IncrementalCatchUp { inserted_rows, .. } => {
@@ -643,6 +1002,8 @@ pub fn run_doctor_rebuild_canonical_fts(
         "db_path": db_path.display().to_string(),
         "repair_kind": repair_kind,
         "inserted_rows": inserted_rows,
+        "segments_optimized": segments_optimized,
+        "repair_pending_marker_cleared": repair_pending_cleared,
         "parity_before": fts_parity_json(&before),
         "parity_after": fts_parity_json(&after),
         "mutated_asset_class": "canonical_fts5_shadow",
@@ -654,8 +1015,96 @@ pub fn run_doctor_rebuild_canonical_fts(
         print_json(&envelope)?;
     } else {
         println!(
-            "Canonical FTS5 repair complete ({repair_kind}, {inserted_rows} rows inserted, {} rows indexed) in {}",
+            "Canonical FTS5 repair complete ({repair_kind}{}, {inserted_rows} rows inserted, {} rows indexed) in {}",
+            if segments_optimized {
+                ", existing segments rewritten with the current writer"
+            } else {
+                ""
+            },
             after.indexable_messages,
+            db_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The not-viable detail carried by a repair error, if the repair stopped
+/// because the corpus is over `CASS_FTS_SHADOW_MAX_MESSAGES`.
+fn fts_shadow_not_viable_detail_in(error: &anyhow::Error) -> Option<String> {
+    error.chain().map(ToString::to_string).find(|message| {
+        crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(message)
+    })
+}
+
+/// GH #497 follow-up: the repair stopped because the corpus is over the
+/// shadow bound. When the archive now holds the current retirement (no
+/// registration, no shadow table, both markers describing this corpus and
+/// bound), that is the converged state
+/// for this corpus, so report it as a completed repair (exit 0,
+/// `repair_kind = retired_not_viable`) instead of a storage failure.
+/// `shadow_mutated` says whether this run retired the shadow or found the
+/// retirement already recorded.
+fn report_fts_shadow_retired(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    before: &FtsShadowParity,
+    retirement_recorded_before: bool,
+    error: &anyhow::Error,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let detail = fts_shadow_not_viable_detail_in(error).unwrap_or_else(|| format!("{error:#}"));
+    let retired = storage.fts_shadow_retirement_is_current().map_err(|e| {
+        storage_error(
+            format!("verifying the fallback FTS shadow retirement after repair: {e:#}"),
+            Some("Repair is not complete until the retirement is verified."),
+        )
+    })?;
+    if !retired {
+        return Err(storage_error(
+            format!(
+                "safely repairing canonical FTS5 shadow tables: {detail}; the retirement was not \
+                 recorded (a derived FTS object remains, or a retirement marker is missing or \
+                 does not describe the current corpus)"
+            ),
+            Some(
+                "Preserve the complete database bundle. Re-run the dry-run to inspect exact current parity before any retry.",
+            ),
+        ));
+    }
+    let after = storage.inspect_search_fallback_fts_parity().map_err(|e| {
+        storage_error(
+            format!("validating the retired canonical FTS5 shadow: {e:#}"),
+            Some("Repair is not complete until the retirement is verified."),
+        )
+    })?;
+    let shadow_mutated = !retirement_recorded_before;
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "doctor_contract_version": 1,
+        "kind": "rebuild_canonical_fts",
+        "db_path": db_path.display().to_string(),
+        "repair_kind": "retired_not_viable",
+        "inserted_rows": 0,
+        "segments_optimized": false,
+        "shadow_retired": true,
+        "shadow_mutated": shadow_mutated,
+        "detail": detail,
+        "parity_before": fts_parity_json(before),
+        "parity_after": fts_parity_json(&after),
+        "mutated_asset_class": shadow_mutated.then_some("canonical_fts5_shadow"),
+        "canonical_rows_modified": false,
+        "note": "The canonical corpus is over CASS_FTS_SHADOW_MAX_MESSAGES, so the derived SQL-fallback FTS shadow is retired rather than rebuilt; this is the settled state for this archive, not a failure. Quill lexical search is unaffected. Canonical rows are never modified.",
+    });
+    if structured_format.is_some() {
+        print_json(&envelope)?;
+    } else if shadow_mutated {
+        println!(
+            "Canonical FTS5 shadow retired (not viable for this corpus) in {}: {detail}",
+            db_path.display()
+        );
+    } else {
+        println!(
+            "Canonical FTS5 shadow is already retired (not viable for this corpus); nothing to do in {}: {detail}",
             db_path.display()
         );
     }
@@ -670,6 +1119,627 @@ pub fn run_doctor_rebuild_canonical_fts(
 /// moves them into `<data_dir>/doctor/quarantine/interrupted-artifacts/`
 /// (renamed, never deleted — cass never deletes; the operator owns final
 /// reclamation), clearing the gate.
+/// The engine's integrity verdict for one canonical archive, classified for the
+/// in-place leaked-page repair (2l1b0.73).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeakedPagesVerdict {
+    /// quick_check and integrity_check both report `ok`.
+    Clean,
+    /// The only failure is an unowned page. frankensqlite's integrity_check
+    /// reports at most one failure per database, and it scans for unowned pages
+    /// only after the freelist and every table and index b-tree were walked
+    /// with no doubly owned, out-of-range, or malformed page. A lone
+    /// "page N is never used" row therefore proves the damage is leaked pages
+    /// alone: pages that left the freelist without entering a tree.
+    LeakedPagesOnly { first_leaked_page: u64 },
+    /// Any other failure: a doubled reference, a malformed page or freelist,
+    /// an index that disagrees with its table. Freeing leaked pages cannot
+    /// repair these, and running the repair over them is refused.
+    OtherDamage { diagnostics: Vec<String> },
+}
+
+impl LeakedPagesVerdict {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::LeakedPagesOnly { .. } => "leaked_pages",
+            Self::OtherDamage { .. } => "other_damage",
+        }
+    }
+
+    fn first_leaked_page(&self) -> Option<u64> {
+        match self {
+            Self::LeakedPagesOnly { first_leaked_page } => Some(*first_leaked_page),
+            _ => None,
+        }
+    }
+
+    fn diagnostics(&self) -> &[String] {
+        match self {
+            Self::OtherDamage { diagnostics } => diagnostics,
+            _ => &[],
+        }
+    }
+}
+
+/// The page number of an engine "page N is never used" diagnostic, with or
+/// without the `database disk image is malformed: ` prefix fsqlite adds.
+fn leaked_page_number(diagnostic: &str) -> Option<u64> {
+    let detail = diagnostic.trim();
+    let detail = detail
+        .strip_prefix("database disk image is malformed: ")
+        .unwrap_or(detail);
+    let number = detail
+        .strip_prefix("page ")?
+        .strip_suffix(" is never used")?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+
+/// Classify quick_check and integrity_check output rows. `ok` rows and the
+/// engine's informational `note:` rows are not failures.
+fn classify_leaked_pages(quick_check: &[String], integrity_check: &[String]) -> LeakedPagesVerdict {
+    let failures = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .map(|row| row.trim())
+            .filter(|row| !row.is_empty() && !row.eq_ignore_ascii_case("ok"))
+            .filter(|row| !row.starts_with("note:"))
+            .map(str::to_string)
+            .collect()
+    };
+    let quick = failures(quick_check);
+    let full = failures(integrity_check);
+    if quick.is_empty() && full.is_empty() {
+        return LeakedPagesVerdict::Clean;
+    }
+    if quick.is_empty()
+        && let [only] = full.as_slice()
+        && let Some(first_leaked_page) = leaked_page_number(only)
+    {
+        return LeakedPagesVerdict::LeakedPagesOnly { first_leaked_page };
+    }
+    LeakedPagesVerdict::OtherDamage {
+        diagnostics: quick.into_iter().chain(full).collect(),
+    }
+}
+
+/// The command doctor's read-only guidance names for a leak-only integrity
+/// failure; the database check message carries it verbatim.
+pub(crate) const LEAKED_PAGES_DRY_RUN_COMMAND: &str =
+    "cass doctor --repair-leaked-pages --dry-run --json";
+
+/// True when a live quick_check status plus integrity_check diagnostics are the
+/// leak-only class the in-place repair accepts.
+pub(crate) fn integrity_is_leaked_pages_only(
+    quick_check_status: &str,
+    integrity_diagnostics: &[String],
+) -> bool {
+    matches!(
+        classify_leaked_pages(&[quick_check_status.to_string()], integrity_diagnostics),
+        LeakedPagesVerdict::LeakedPagesOnly { .. }
+    )
+}
+
+/// True when a cached failing attestation recorded a full integrity_check whose
+/// only diagnostic is a leaked page.
+pub(crate) fn attested_integrity_is_leaked_pages_only(
+    check_depth: &str,
+    detail: Option<&str>,
+) -> bool {
+    check_depth == "integrity_check"
+        && detail.is_some_and(|detail| leaked_page_number(detail).is_some())
+}
+
+/// What one read-only inspection of the canonical archive observed.
+struct LeakedPagesInspection {
+    verdict: LeakedPagesVerdict,
+    /// `None` when damage kept the value from being read.
+    page_count: Option<i64>,
+    freelist_count: Option<i64>,
+    conversations: Option<i64>,
+    messages: Option<i64>,
+    elapsed_ms: u64,
+}
+
+impl LeakedPagesInspection {
+    fn other_damage(detail: String, started: std::time::Instant) -> Self {
+        Self {
+            verdict: LeakedPagesVerdict::OtherDamage {
+                diagnostics: vec![detail],
+            },
+            page_count: None,
+            freelist_count: None,
+            conversations: None,
+            messages: None,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+const LEAKED_PAGES_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn leaked_pages_single_integer(
+    conn: &crate::franken_sync::Connection,
+    sql: &str,
+) -> Result<i64, String> {
+    use crate::franken_sync::compat::RowExt as _;
+    let row = conn.query_row(sql).map_err(|err| format!("{sql}: {err}"))?;
+    row.get_typed::<i64>(0)
+        .map_err(|err| format!("{sql}: reading the result: {err}"))
+}
+
+fn leaked_pages_text_rows(
+    conn: &crate::franken_sync::Connection,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    use crate::franken_sync::compat::RowExt as _;
+    conn.query(sql)
+        .map_err(|err| format!("{sql}: {err}"))?
+        .iter()
+        .map(|row| {
+            row.get_typed::<String>(0)
+                .map_err(|err| format!("{sql}: reading a diagnostic row: {err}"))
+        })
+        .collect()
+}
+
+/// Run the engine's own quick_check and integrity_check on a read-only open of
+/// the canonical archive and record the counts the repair must preserve.
+fn inspect_leaked_pages(db_path: &Path) -> CliResult<LeakedPagesInspection> {
+    let started = std::time::Instant::now();
+    let mut conn = match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+        db_path,
+        LEAKED_PAGES_OPEN_TIMEOUT,
+    ) {
+        Ok(conn) => conn,
+        // Damage can fail the open itself (a freelist entry naming a live
+        // page, say). That is other damage, not a busy archive to retry.
+        Err(err)
+            if crate::doctor_open_error_message_is_affirmative_corruption(&format!("{err:#}")) =>
+        {
+            return Ok(LeakedPagesInspection::other_damage(
+                format!("read-only open failed: {err:#}"),
+                started,
+            ));
+        }
+        Err(err) => {
+            return Err(io_error(
+                format!(
+                    "opening canonical archive {} read-only for the leaked-page inspection: {err:#}",
+                    db_path.display()
+                ),
+                Some("Retry once no cass index or watch process holds the archive."),
+            ));
+        }
+    };
+    let result = (|| -> Result<LeakedPagesInspection, String> {
+        let checks = leaked_pages_text_rows(&conn, "PRAGMA quick_check(1);").and_then(|quick| {
+            leaked_pages_text_rows(&conn, "PRAGMA integrity_check(8);").map(|full| (quick, full))
+        });
+        let (quick, full) = match checks {
+            Ok(rows) => rows,
+            Err(err) if crate::doctor_open_error_message_is_affirmative_corruption(&err) => {
+                return Ok(LeakedPagesInspection::other_damage(err, started));
+            }
+            Err(err) => return Err(err),
+        };
+        let verdict = classify_leaked_pages(&quick, &full);
+        // Counts must be readable for the verdicts the repair acts on; damage
+        // elsewhere may leave them unreadable, which the verdict already says.
+        let count = |sql: &str| match &verdict {
+            LeakedPagesVerdict::OtherDamage { .. } => {
+                Ok(leaked_pages_single_integer(&conn, sql).ok())
+            }
+            _ => leaked_pages_single_integer(&conn, sql).map(Some),
+        };
+        Ok(LeakedPagesInspection {
+            page_count: count("PRAGMA page_count;")?,
+            freelist_count: count("PRAGMA freelist_count;")?,
+            conversations: count("SELECT COUNT(*) FROM conversations;")?,
+            messages: count("SELECT COUNT(*) FROM messages;")?,
+            verdict,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    })();
+    if conn.close_without_checkpoint_in_place().is_err() {
+        conn.close_best_effort_in_place();
+    }
+    result.map_err(|err| {
+        io_error(
+            format!(
+                "inspecting canonical archive {} for leaked pages: {err}",
+                db_path.display()
+            ),
+            Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+        )
+    })
+}
+
+fn leaked_pages_count_text(count: Option<i64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+}
+
+fn leaked_pages_inspection_json(inspection: &LeakedPagesInspection) -> serde_json::Value {
+    serde_json::json!({
+        "status": inspection.verdict.status(),
+        "first_leaked_page": inspection.verdict.first_leaked_page(),
+        "diagnostics": inspection.verdict.diagnostics(),
+        "page_count": inspection.page_count,
+        "freelist_count": inspection.freelist_count,
+        "conversations": inspection.conversations,
+        "messages": inspection.messages,
+        "elapsed_ms": inspection.elapsed_ms,
+    })
+}
+
+/// Files of the live SQLite bundle: the DB, its WAL when present, and its SHM
+/// only beside a WAL. `doctor backups verify` refuses to restore an SHM
+/// without its WAL, and an SHM alone carries no committed data.
+fn leaked_pages_bundle_components(db_path: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut components = vec![("", db_path.to_path_buf())];
+    for suffix in ["-wal", "-shm"] {
+        match crate::doctor_sqlite_sidecar_path(db_path, suffix) {
+            Some(path) if path.is_file() => components.push((suffix, path)),
+            // Without a WAL there is no SHM worth keeping.
+            _ if suffix == "-wal" => break,
+            _ => {}
+        }
+    }
+    components
+}
+
+/// Copy the quiescent live bundle into a backup that `cass doctor backups
+/// verify|restore` accept, and return the backup id and its manifest.
+fn backup_bundle_before_leaked_pages_repair(
+    data_dir: &Path,
+    db_path: &Path,
+    inspection: &LeakedPagesInspection,
+) -> CliResult<(String, PathBuf, serde_json::Value)> {
+    let components = leaked_pages_bundle_components(db_path);
+    let required_bytes: u64 = components
+        .iter()
+        .filter_map(|(_, path)| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    let backup_root = crate::doctor_candidate_promotion_root(data_dir);
+    crate::doctor_forensic_create_private_dir_all(&backup_root).map_err(|err| {
+        io_error(
+            format!(
+                "creating the doctor backup root {}: {err}",
+                backup_root.display()
+            ),
+            None,
+        )
+    })?;
+    // Keep 64 MiB spare so the backup cannot fill the disk the repair then
+    // needs for its own commit.
+    let available = fs2::available_space(&backup_root).map_err(|err| {
+        io_error(
+            format!(
+                "measuring free space under {}: {err}",
+                backup_root.display()
+            ),
+            None,
+        )
+    })?;
+    let margin = 64 * 1024 * 1024;
+    if available < required_bytes.saturating_add(margin) {
+        return Err(io_error(
+            format!(
+                "the pre-repair backup needs {required_bytes} bytes plus a 64 MiB margin, but only {available} bytes are free under {}",
+                backup_root.display()
+            ),
+            Some(
+                "Free space on the data dir's filesystem, then re-run the repair. The archive was not modified.",
+            ),
+        ));
+    }
+
+    let backup_id = crate::doctor_candidate_id("leaked-pages-repair", crate::doctor_now_ms());
+    let backup_dir = backup_root.join(&backup_id).join("backup");
+    let file_name = db_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "agent_search.db".to_string());
+    let mut artifacts = Vec::new();
+    for (suffix, source) in &components {
+        let artifact_kind = match *suffix {
+            "" => "prior_live_archive_db_backup",
+            "-wal" => "prior_live_archive_wal_backup",
+            _ => "prior_live_archive_shm_backup",
+        };
+        let target = backup_dir.join(format!("{file_name}{suffix}"));
+        let (size_bytes, blake3) = crate::doctor_copy_regular_file_to_private_target(
+            source,
+            &target,
+            None,
+            "leaked-page repair backup",
+        )
+        .map_err(|err| {
+            io_error(
+                err,
+                Some("The archive was not modified; free space or fix permissions and retry."),
+            )
+        })?;
+        artifacts.push(serde_json::json!({
+            "artifact_kind": artifact_kind,
+            "asset_class": "backup_bundle",
+            "source_path": source.display().to_string(),
+            "redacted_source_path": crate::doctor_redacted_path(&source.display().to_string(), data_dir),
+            "backup_path": target.display().to_string(),
+            "redacted_backup_path": crate::doctor_redacted_path(&target.display().to_string(), data_dir),
+            "target_path": source.display().to_string(),
+            "redacted_target_path": crate::doctor_redacted_path(&source.display().to_string(), data_dir),
+            "size_bytes": size_bytes,
+            "checksum_blake3": blake3,
+            "copied_to_backup": true,
+            "promoted_to_live": false,
+        }));
+    }
+    let manifest_path = backup_dir.join("manifest.json");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "manifest_kind": crate::DOCTOR_LEAKED_PAGES_REPAIR_BACKUP_MANIFEST_KIND,
+        "promotion_id": &backup_id,
+        "backup_dir": backup_dir.display().to_string(),
+        "redacted_backup_dir": crate::doctor_redacted_path(&backup_dir.display().to_string(), data_dir),
+        "inspection_before": leaked_pages_inspection_json(inspection),
+        "artifacts": artifacts,
+    });
+    crate::doctor_write_private_json_artifact(
+        &manifest_path,
+        &manifest,
+        "leaked-page repair backup manifest",
+    )
+    .map_err(|err| {
+        io_error(
+            err,
+            Some("The archive was not modified; fix the doctor backup dir and retry."),
+        )
+    })?;
+    Ok((backup_id, manifest_path, manifest))
+}
+
+/// `cass doctor --repair-leaked-pages`: return leaked pages (integrity_check's
+/// "page N is never used" class) to the freelist in place, after proving they
+/// are the only damage and backing up the live bundle (2l1b0.73).
+///
+/// frankensqlite's one-time first-open migration runs the same engine repair
+/// once per archive (its marker records `repair_orphaned_pages:<n>`); pages that
+/// leak afterwards stay leaked, fail integrity_check, and waste their bytes.
+/// Freeing them changes no row: the repair returns pages that no table, index
+/// or freelist owns, and the counts and integrity_check are re-verified after.
+pub fn run_doctor_repair_leaked_pages(
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    dry_run: bool,
+    yes: bool,
+    structured_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let db_path = resolve_db_path(&data_dir, db_override.as_deref());
+
+    if !dry_run && !yes {
+        return Err(CliError {
+            code: 4,
+            kind: "refused-unsafe",
+            message: "`cass doctor --repair-leaked-pages` rewrites the canonical archive's freelist and requires `--yes`".to_string(),
+            hint: Some(
+                "Inspect first with `cass doctor --repair-leaked-pages --dry-run --json`; apply with `--yes` only when it reports status=leaked_pages. The live bundle is backed up first and restorable with `cass doctor backups restore <id>`.".to_string(),
+            ),
+            retryable: false,
+        });
+    }
+    if !db_path.exists() {
+        return Err(CliError {
+            code: 13,
+            kind: "not-found",
+            message: format!("canonical archive {} does not exist", db_path.display()),
+            hint: Some("Run `cass index --full` to create the archive.".to_string()),
+            retryable: false,
+        });
+    }
+
+    // Same exclusive index-run lock as every other canonical-archive mutation,
+    // held across inspection, backup, repair and re-verification so the
+    // classified image is the one repaired.
+    let _mutation_guard = if dry_run {
+        None
+    } else {
+        Some(
+            crate::indexer::acquire_search_maintenance_mutation_lock(
+                &data_dir,
+                &db_path,
+                crate::search::asset_state::SearchMaintenanceJobKind::LexicalRefresh,
+            )
+            .map_err(|err| CliError {
+                code: 7,
+                kind: "index-busy",
+                message: format!(
+                    "acquiring the exclusive index-run lock for the leaked-page repair: {err:#}"
+                ),
+                hint: Some("Stop the active cass index/watch process, then retry.".to_string()),
+                retryable: true,
+            })?,
+        )
+    };
+
+    let before = inspect_leaked_pages(&db_path)?;
+    if dry_run {
+        let (planned_action, next_command) = match &before.verdict {
+            LeakedPagesVerdict::Clean => ("none", None),
+            LeakedPagesVerdict::LeakedPagesOnly { .. } => (
+                "free_leaked_pages_in_place",
+                Some("cass doctor --repair-leaked-pages --yes --json"),
+            ),
+            LeakedPagesVerdict::OtherDamage { .. } => {
+                ("refuse", Some("cass doctor repair --dry-run --json"))
+            }
+        };
+        let backup_required_bytes: u64 = leaked_pages_bundle_components(&db_path)
+            .iter()
+            .filter_map(|(_, path)| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "doctor_contract_version": 1,
+            "kind": "repair_leaked_pages",
+            "mode": "dry_run",
+            "db_path": db_path.display().to_string(),
+            "inspection": leaked_pages_inspection_json(&before),
+            "planned_action": planned_action,
+            "backup_required_bytes": backup_required_bytes,
+            "next_command": next_command,
+            "note": "Read-only. The apply path re-inspects under the index-run lock, backs up the live bundle, frees only pages no table, index or freelist owns, and re-runs integrity_check.",
+        });
+        if structured_format.is_some() {
+            print_json(&envelope)?;
+        } else {
+            println!(
+                "Leaked-page dry-run: status={}, planned_action={planned_action}, page_count={}, freelist_count={}{}",
+                before.verdict.status(),
+                leaked_pages_count_text(before.page_count),
+                leaked_pages_count_text(before.freelist_count),
+                next_command
+                    .map(|command| format!("; next: {command}"))
+                    .unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+
+    match &before.verdict {
+        LeakedPagesVerdict::Clean => {
+            let envelope = serde_json::json!({
+                "schema_version": 1,
+                "doctor_contract_version": 1,
+                "kind": "repair_leaked_pages",
+                "mode": "apply",
+                "db_path": db_path.display().to_string(),
+                "status": "already_clean",
+                "inspection": leaked_pages_inspection_json(&before),
+                "canonical_rows_modified": false,
+            });
+            if structured_format.is_some() {
+                print_json(&envelope)?;
+            } else {
+                println!(
+                    "Canonical archive {} passes integrity_check; nothing to repair.",
+                    db_path.display()
+                );
+            }
+            return Ok(());
+        }
+        LeakedPagesVerdict::OtherDamage { diagnostics } => {
+            return Err(CliError {
+                code: 5,
+                kind: "data-corruption",
+                message: format!(
+                    "canonical archive {} has damage beyond leaked pages ({}); an in-place freelist repair cannot fix it and was not attempted",
+                    db_path.display(),
+                    diagnostics.join("; ")
+                ),
+                hint: Some(
+                    "Preserve the archive bundle (db + -wal + -shm) and follow `cass doctor repair --dry-run --json`, which ranks the reconstruction authorities.".to_string(),
+                ),
+                retryable: false,
+            });
+        }
+        LeakedPagesVerdict::LeakedPagesOnly { .. } => {}
+    }
+
+    let (backup_id, backup_manifest_path, backup_manifest) =
+        backup_bundle_before_leaked_pages_repair(&data_dir, &db_path, &before)?;
+    let restore_hint = format!(
+        "The pre-repair bundle is backed up as {backup_id}: verify with `cass doctor backups verify {backup_id} --json` and restore with `cass doctor backups restore {backup_id} --json`."
+    );
+
+    let repair_started = std::time::Instant::now();
+    let freed_pages = (|| -> Result<usize, String> {
+        let conn = crate::storage::sqlite::open_franken_raw_connection_with_timeout(
+            &db_path,
+            LEAKED_PAGES_OPEN_TIMEOUT,
+        )
+        .map_err(|err| format!("opening the archive writable: {err:#}"))?;
+        let freed = conn
+            .repair_orphaned_pages()
+            .map_err(|err| format!("freeing leaked pages: {err}"))?;
+        conn.close()
+            .map_err(|err| format!("closing the repaired archive: {err}"))?;
+        Ok(freed)
+    })()
+    .map_err(|err| CliError {
+        code: 3,
+        kind: "repair-failure",
+        message: format!("leaked-page repair of {} failed: {err}", db_path.display()),
+        hint: Some(restore_hint.clone()),
+        retryable: false,
+    })?;
+    let repair_ms = u64::try_from(repair_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let after = inspect_leaked_pages(&db_path)?;
+    let rows_unchanged = after.conversations.is_some()
+        && after.messages.is_some()
+        && after.conversations == before.conversations
+        && after.messages == before.messages;
+    if after.verdict != LeakedPagesVerdict::Clean || !rows_unchanged {
+        return Err(CliError {
+            code: 3,
+            kind: "repair-failure",
+            message: format!(
+                "after freeing {freed_pages} leaked page(s), {} is {} with {} conversations / {} messages (before: {} / {}){}",
+                db_path.display(),
+                after.verdict.status(),
+                leaked_pages_count_text(after.conversations),
+                leaked_pages_count_text(after.messages),
+                leaked_pages_count_text(before.conversations),
+                leaked_pages_count_text(before.messages),
+                if after.verdict.diagnostics().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", after.verdict.diagnostics().join("; "))
+                }
+            ),
+            hint: Some(restore_hint),
+            retryable: false,
+        });
+    }
+
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "doctor_contract_version": 1,
+        "kind": "repair_leaked_pages",
+        "mode": "apply",
+        "db_path": db_path.display().to_string(),
+        "status": "repaired",
+        "freed_pages": freed_pages,
+        "repair_ms": repair_ms,
+        "inspection_before": leaked_pages_inspection_json(&before),
+        "inspection_after": leaked_pages_inspection_json(&after),
+        "canonical_rows_modified": false,
+        "backup_id": &backup_id,
+        "backup_manifest_path": backup_manifest_path.display().to_string(),
+        "backup_artifacts": backup_manifest["artifacts"].clone(),
+        "verify_command": format!("cass doctor backups verify {backup_id} --json"),
+        "restore_rehearsal_command": format!("cass doctor backups restore {backup_id} --json"),
+        "note": "Freed pages joined the freelist and are reused by later writes; the file does not shrink.",
+    });
+    if structured_format.is_some() {
+        print_json(&envelope)?;
+    } else {
+        println!(
+            "Freed {freed_pages} leaked page(s) in {}; integrity_check now passes with {} conversations and {} messages unchanged. Pre-repair backup: {backup_id}.",
+            db_path.display(),
+            leaked_pages_count_text(after.conversations),
+            leaked_pages_count_text(after.messages)
+        );
+    }
+    Ok(())
+}
+
 pub fn run_doctor_cleanup_interrupted_artifacts(
     data_dir_override: Option<PathBuf>,
     yes: bool,
@@ -801,6 +1871,26 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
 mod tests {
     use super::*;
     use crate::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+
+    fn exact_dry_run_parity(parity: FtsShadowParity) -> FtsDryRunParity {
+        FtsDryRunParity {
+            exact_status: Some(parity.status),
+            canonical_messages: parity.canonical_messages,
+            indexable_messages: parity.indexable_messages,
+            indexed_messages: parity.indexed_messages,
+            inspection_complete: true,
+            comparison_cap: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            canonical_ids_examined: usize::try_from(parity.indexable_messages.max(0))
+                .unwrap_or(usize::MAX),
+            indexed_ids_examined: parity
+                .indexed_messages
+                .and_then(|count| usize::try_from(count.max(0)).ok())
+                .unwrap_or(0),
+            observed_missing_canonical_rowids_at_least: 0,
+            observed_excess_fts_rowids_at_least: 0,
+            detail: parity.detail,
+        }
+    }
 
     fn write_message(storage: &FrankenStorage, conversation_id: i64, idx: i64, raw_line: &str) {
         // Store the verbatim line via the historical-raw-json sentinel wrapper
@@ -1121,6 +2211,86 @@ mod tests {
         assert!(canonical.3.contains("canonical sentinel"));
     }
 
+    /// GH #438: an explicit repair of a parity-healthy shadow must rewrite its
+    /// segments (stock validators reject segments written before
+    /// frankensqlite#404 even though reads work), not report "already
+    /// healthy" and leave them. Three catch-up passes leave several segments;
+    /// the repair must merge them into one without changing any search result.
+    #[test]
+    fn rebuild_canonical_fts_rewrites_segments_of_a_parity_healthy_shadow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let segment_count = |storage: &FrankenStorage| -> i64 {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(DISTINCT segid) FROM fts_messages_idx",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .expect("count FTS segments")
+        };
+        let matches = |storage: &FrankenStorage| -> i64 {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'content'",
+                    &[] as &[ParamValue],
+                    |row| row.get_typed(0),
+                )
+                .expect("match canonical content")
+        };
+        let before_matches = {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let conversation_id =
+                seed_conversation(&storage, agent_id, "fts-segments", "/orig/segments.jsonl");
+            for idx in 0..3 {
+                write_message(&storage, conversation_id, idx, r#"{"type":"user"}"#);
+                storage
+                    .ensure_search_fallback_fts_consistency()
+                    .expect("build or catch up the FTS shadow");
+            }
+            assert_eq!(
+                storage
+                    .inspect_search_fallback_fts_parity()
+                    .expect("inspect FTS")
+                    .status,
+                FtsShadowParityStatus::Healthy
+            );
+            assert!(
+                segment_count(&storage) >= 2,
+                "fixture must leave several segments to rewrite"
+            );
+            matches(&storage)
+        };
+
+        run_doctor_rebuild_canonical_fts(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            false,
+            true,
+            Some(RobotFormat::Json),
+        )
+        .expect("repair a parity-healthy shadow");
+
+        let storage = FrankenStorage::open(&db_path).expect("reopen db");
+        assert_eq!(
+            segment_count(&storage),
+            1,
+            "segments must be rewritten into one"
+        );
+        assert_eq!(
+            matches(&storage),
+            before_matches,
+            "search results must not change"
+        );
+        assert_eq!(before_matches, 3);
+        storage
+            .validate_fts_messages_integrity()
+            .expect("rewritten segments pass the FTS5 integrity-check");
+    }
+
     #[test]
     fn divergent_fts_dry_run_contract_refuses_mutation() {
         let parity = FtsShadowParity {
@@ -1130,7 +2300,8 @@ mod tests {
             indexed_messages: Some(2),
             detail: Some("equal counts conceal rowid divergence".to_string()),
         };
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity);
+        let parity = exact_dry_run_parity(parity);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity, false);
         assert_eq!(
             envelope["planned_action"],
             "refuse_unsafe_destructive_rebuild"
@@ -1138,6 +2309,59 @@ mod tests {
         assert_eq!(envelope["would_mutate"], false);
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
         assert_eq!(envelope["parity"]["status"], "divergent");
+    }
+
+    /// GH #497 follow-up: over the shadow bound, the dry-run plan must match
+    /// what the apply does. A residue shadow is dropped and retired, an absent
+    /// shadow without the retirement markers gets them, and an already
+    /// recorded retirement is settled: nothing to apply, nothing mutated.
+    #[test]
+    fn gh497_oversized_fts_dry_run_plans_match_the_retirement_state() {
+        let Some(bound) = crate::storage::sqlite::fts_shadow_max_messages() else {
+            // CASS_FTS_SHADOW_MAX_MESSAGES=0 in this environment disables the
+            // bound, so no corpus is oversized and there is nothing to plan.
+            return;
+        };
+        let over_bound = i64::try_from(bound.saturating_add(1)).unwrap_or(i64::MAX);
+        let oversized = |status| {
+            exact_dry_run_parity(FtsShadowParity {
+                status,
+                canonical_messages: over_bound,
+                indexable_messages: over_bound,
+                indexed_messages: None,
+                detail: None,
+            })
+        };
+        let db = Path::new("/tmp/oversized.db");
+
+        let settled =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Absent), true);
+        assert_eq!(settled["planned_action"], "none_shadow_retired_not_viable");
+        assert_eq!(settled["would_mutate"], false);
+        assert_eq!(settled["shadow_retired_not_viable"], true);
+        assert_eq!(settled["apply_command"], serde_json::Value::Null);
+
+        let unrecorded =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Absent), false);
+        assert_eq!(unrecorded["planned_action"], "record_not_viable_retirement");
+        assert_eq!(unrecorded["would_mutate"], true);
+        assert_eq!(unrecorded["shadow_retired_not_viable"], false);
+
+        let residue =
+            fts_rebuild_dry_run_envelope(db, &oversized(FtsShadowParityStatus::Residue), false);
+        assert_eq!(
+            residue["planned_action"],
+            "drop_residue_and_mark_not_viable"
+        );
+        assert_eq!(residue["would_mutate"], true);
+
+        // Within the bound a recorded marker is obsolete: the apply clears it
+        // and recreates the shadow, so the plan says so.
+        let mut fits = oversized(FtsShadowParityStatus::Absent);
+        fits.indexable_messages = 1;
+        let fits = fts_rebuild_dry_run_envelope(db, &fits, true);
+        assert_eq!(fits["planned_action"], "failure_atomic_recreate");
+        assert_eq!(fits["would_mutate"], true);
     }
 
     #[test]
@@ -1149,13 +2373,101 @@ mod tests {
             indexed_messages: None,
             detail: Some("counting fts_messages_docsize failed".to_string()),
         };
-        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity);
+        let parity = exact_dry_run_parity(parity);
+        let envelope =
+            fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity, false);
         assert_eq!(
             envelope["planned_action"],
             "refuse_unqueryable_preserve_bundle"
         );
         assert_eq!(envelope["would_mutate"], false);
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
+    }
+
+    /// #345: `CASS_FTS_DRYRUN_CAP` truthiness/validity contract (pure parse
+    /// half — the env wrapper only feeds it the raw string).
+    #[test]
+    fn gh345_dry_run_cap_env_parsing() {
+        assert_eq!(
+            parse_fts_dry_run_cap(None),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(parse_fts_dry_run_cap(Some("512")), 512);
+        assert_eq!(parse_fts_dry_run_cap(Some(" 8 ")), 8);
+        // Zero and garbage fall back to the default (a zero cap would make
+        // every dry-run indeterminate and trip the storage-layer ensure).
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("0")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("not-a-number")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+    }
+
+    /// #345: a capped dry-run envelope must carry the ">= N divergent" floor
+    /// while staying indeterminate and deferring exact parity to the apply.
+    #[test]
+    fn gh345_capped_dry_run_envelope_reports_divergence_floor() {
+        let parity = FtsDryRunParity {
+            exact_status: None,
+            canonical_messages: 2_000_000,
+            indexable_messages: 2_000_000,
+            indexed_messages: Some(1_395_000),
+            inspection_complete: false,
+            comparison_cap: 4_096,
+            canonical_ids_examined: 4_096,
+            indexed_ids_examined: 4_096,
+            observed_missing_canonical_rowids_at_least: 7,
+            observed_excess_fts_rowids_at_least: 2,
+            detail: Some(
+                "bounded dry-run stopped after at most 4096 row IDs per domain (>= 9 divergent row ID(s) observed within the cap: missing >= 7, excess >= 2); exact parity is deferred to --yes before any mutation".to_string(),
+            ),
+        };
+        assert_eq!(parity.divergent_rowids_at_least(), 9);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity, false);
+        assert_eq!(envelope["parity"]["status"], "indeterminate");
+        assert_eq!(envelope["parity"]["inspection_complete"], false);
+        assert_eq!(envelope["parity"]["divergent_rowids_at_least"], 9);
+        assert_eq!(
+            envelope["planned_action"],
+            "exact_parity_inspection_deferred_to_apply"
+        );
+        assert_eq!(envelope["would_mutate"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn gh345_indeterminate_fts_dry_run_defers_exact_parity_without_claiming_mutation() {
+        let parity = FtsDryRunParity {
+            exact_status: None,
+            canonical_messages: 2_000_000,
+            indexable_messages: 2_000_000,
+            indexed_messages: Some(39_000),
+            inspection_complete: false,
+            comparison_cap: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            canonical_ids_examined: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            indexed_ids_examined: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            observed_missing_canonical_rowids_at_least: 0,
+            observed_excess_fts_rowids_at_least: 0,
+            detail: Some("bounded comparison reached its cap".to_string()),
+        };
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity, false);
+        assert_eq!(envelope["parity"]["status"], "indeterminate");
+        assert_eq!(envelope["parity"]["inspection_complete"], false);
+        assert_eq!(
+            envelope["planned_action"],
+            "exact_parity_inspection_deferred_to_apply"
+        );
+        assert_eq!(envelope["would_mutate"], serde_json::Value::Null);
+        assert_eq!(
+            envelope["apply_command"],
+            "cass doctor --rebuild-canonical-fts --yes --json"
+        );
     }
 
     /// GH #362: a single whitespace-delimited token beyond the FTS5 u16
@@ -1347,6 +2659,91 @@ mod tests {
         );
     }
 
+    /// GH #434 defect 2: the schema-level open refusal reported against real
+    /// archives (both the 0.6.26 read-path refusal and the doctor
+    /// `--rebuild-canonical-fts` inspection refusal carried the identical
+    /// engine string) must route into the deferred-FTS5 drop+recreate repair
+    /// branch instead of the generic "cannot open" wall, while failures naming
+    /// canonical (non-shadow) objects keep the generic routing.
+    #[test]
+    fn gh434_schema_level_shadow_open_failures_route_to_deferred_repair() {
+        // Verbatim shapes from the #434 report (index refusal + doctor refusal).
+        let index_refusal = anyhow::anyhow!(
+            "opening raw frankensqlite db readonly at /home/claude/.local/share/coding-agent-search/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&index_refusal));
+
+        let doctor_refusal = anyhow::anyhow!(
+            "opening frankensqlite db readonly at /tmp/cass-check/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&doctor_refusal));
+
+        // The same autoindex failure on a CANONICAL table is not repairable by
+        // recreating the derived shadow — it must keep the generic routing.
+        let canonical_refusal = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&canonical_refusal));
+
+        // The %_data structure class keeps its own predicate; neither predicate
+        // swallows the other.
+        let data_corruption = anyhow::anyhow!(
+            "fts5: corrupt %_data record: structure segment count exceeds FTS5 maximum"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&data_corruption));
+        assert!(is_fts5_shadow_open_corruption_error(&data_corruption));
+
+        // The gh#369 oversized-leaf shape is a write-time engine limitation,
+        // not an open-blocking schema failure.
+        let oversized =
+            anyhow::anyhow!("fts5: corrupt %_data record: segment leaf term offset exceeds u16");
+        assert!(!is_fts_shadow_schema_level_open_failure(&oversized));
+    }
+
+    /// GH #503: ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX must describe the
+    /// pinned engine. The real deferred-FTS5 repair open runs on a copy of a
+    /// small archive whose `fts_messages_config` carries the pre-#434 catalog;
+    /// a pin bump that changes the outcome fails here until the constant (and
+    /// with it the status hint and the doctor refusal) is updated.
+    #[test]
+    fn pinned_engine_deferred_open_matches_the_legacy_shadow_catalog_policy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/gh503/legacy_fts_config_shadow.db"),
+            &db_path,
+        )
+        .unwrap();
+
+        let ordinary = FrankenStorage::open_readonly(&db_path)
+            .err()
+            .expect("the legacy shadow catalog fails an ordinary open");
+        assert!(
+            is_missing_fts5_shadow_autoindex_failure(&ordinary),
+            "fixture must reproduce the #503 refusal: {ordinary:#}"
+        );
+
+        let repair_open = FrankenStorage::open_deferred_fts5_for_repair(&db_path);
+        assert_eq!(
+            repair_open.is_ok(),
+            ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX,
+            "the pinned engine's repair open disagrees with the constant: {:?}",
+            repair_open.as_ref().err()
+        );
+        if let Err(err) = repair_open {
+            assert!(is_missing_fts5_shadow_autoindex_failure(&err), "{err:#}");
+        }
+
+        // The predicate names only the shadow shape.
+        let canonical = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        assert!(!is_missing_fts5_shadow_autoindex_failure(&canonical));
+    }
+
     /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one
     /// batch, not a single overlong token) must be recognized so the operator
     /// gets a reassuring "search still works via Tantivy" diagnostic rather than
@@ -1407,5 +2804,421 @@ mod tests {
             hint.contains("Tantivy") && hint.contains("No action is needed"),
             "hint must state search still works and no action is needed"
         );
+    }
+    #[test]
+    fn recovery_listing_tolerates_type_mismatched_rows() {
+        // #391: a page-aliasing corruption leaves integers where TEXT is
+        // declared. The strict lister failed the whole page with
+        // `type mismatch: expected text, got integer`; the recovery lister
+        // must coerce, report the coercion, and keep going.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let damaged = seed_conversation(&storage, agent_id, "sess-bad", "/orig/bad.jsonl");
+        // TEXT affinity rewrites an integer to text on INSERT/UPDATE, so the
+        // mismatch (what stock SQLite's integrity_check reports as "NUMERIC
+        // value in conversations.title") cannot be planted through SQL.
+        // Exercise the mapper directly with a SELECT shaped exactly like the
+        // listing projection, presenting the values a damaged page would.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 'sess-bad', 7, ?2, 1000, 'not-a-timestamp', 1.5,
+                        NULL, 'local', NULL, NULL",
+                &[
+                    ParamValue::from(damaged),
+                    ParamValue::from("/orig/bad.jsonl"),
+                ] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            RecoveryConversationRow::Readable {
+                conversation,
+                coercions,
+            } => {
+                assert_eq!(conversation.id, Some(damaged));
+                assert_eq!(conversation.external_id.as_deref(), Some("sess-bad"));
+                assert_eq!(conversation.title.as_deref(), Some("7"));
+                assert_eq!(conversation.started_at, Some(1000));
+                assert_eq!(conversation.ended_at, None, "unparseable text is dropped");
+                assert_eq!(conversation.approx_tokens, Some(1), "real truncates");
+                assert_eq!(coercions.len(), 3, "{coercions:?}");
+                assert!(coercions[0].starts_with("title: integer 7"));
+                assert!(coercions[1].contains("ended_at: text \"not-a-timestamp\""));
+                assert!(coercions[1].ends_with("(dropped)"));
+                assert!(coercions[2].starts_with("approx_tokens: real 1.5"));
+            }
+            other => panic!("expected a readable row, got {other:?}"),
+        }
+
+        // An id that is not an integer is reported, not fatal.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT 'garbage', 'claude', NULL, NULL, NULL, '/p', NULL, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        match &rows[0] {
+            RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                assert_eq!(stored_id, "text");
+                assert!(reason.contains("not an integer"));
+            }
+            other => panic!("expected an unreadable row, got {other:?}"),
+        }
+
+        // The real listing pages by id and reads healthy rows unchanged.
+        let page = storage
+            .list_conversations_for_recovery(0, 1)
+            .expect("first page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable");
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert_eq!(conversation.external_id.as_deref(), Some("sess-ok"));
+        assert!(coercions.is_empty());
+        let page = storage
+            .list_conversations_for_recovery(healthy, 10)
+            .expect("second page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable { conversation, .. } = &page[0] else {
+            panic!("second row must be readable");
+        };
+        assert_eq!(conversation.id, Some(damaged));
+        assert!(
+            storage
+                .list_conversations_for_recovery(damaged, 10)
+                .expect("past the end")
+                .is_empty()
+        );
+    }
+
+    /// Plant a BLOB in a declared-TEXT column. TEXT affinity converts numerics
+    /// on write but stores a blob as-is, so this is the one mis-typed value
+    /// that can be planted through SQL (the shape stock SQLite reports as
+    /// "NUMERIC value in conversations.title" otherwise needs a damaged page).
+    fn plant_blob(storage: &FrankenStorage, conversation_id: i64, column: &str) {
+        storage
+            .raw()
+            .execute_compat(
+                &format!("UPDATE conversations SET {column} = X'DEADBEEF' WHERE id = ?1"),
+                &[ParamValue::from(conversation_id)] as &[ParamValue],
+            )
+            .expect("plant blob");
+    }
+
+    #[test]
+    fn recovery_listing_quarantines_rows_with_mistyped_identity_columns() {
+        // #391: an aliased page decodes a foreign cell through the
+        // `conversations` schema, so an identity column (`source_path`,
+        // `external_id`, ...) holds a non-text value. Such a row is not a
+        // conversation with one damaged cell — its `id` would address some
+        // other conversation's messages — so it is quarantined, while a row
+        // whose only coercions are title/timestamps still exports.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+        let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+        plant_blob(&storage, coerced, "title");
+        plant_blob(&storage, aliased, "source_path");
+
+        let page = storage
+            .list_conversations_for_recovery(0, 10)
+            .expect("page");
+        assert_eq!(page.len(), 3, "{page:?}");
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable: {:?}", page[0]);
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert!(coercions.is_empty());
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[1]
+        else {
+            panic!(
+                "a row with only a coerced title must stay readable: {:?}",
+                page[1]
+            );
+        };
+        assert_eq!(conversation.id, Some(coerced));
+        assert_eq!(conversation.source_path, Path::new("/orig/title.jsonl"));
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("title: 4-byte blob"));
+        let RecoveryConversationRow::Quarantined { id, coercions } = &page[2] else {
+            panic!(
+                "a row with a mis-typed source_path must be quarantined: {:?}",
+                page[2]
+            );
+        };
+        assert_eq!(*id, aliased);
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: 4-byte blob"));
+
+        // Paging by id continues past a quarantined row.
+        let rest = storage
+            .list_conversations_for_recovery(aliased, 10)
+            .expect("past the end");
+        assert!(rest.is_empty(), "{rest:?}");
+
+        // The other shapes an aliased page presents, exercised on the mapper
+        // with the listing projection: an integer or NULL where `source_path`
+        // is declared, an integer `external_id`, an integer `source_id`.
+        let mapper = |row: &crate::franken_sync::Row| {
+            Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+        };
+        for (sql, expect) in [
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: integer 1700000000",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, NULL, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: NULL or empty",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 4242, NULL, '/p', 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "external_id: integer 4242",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, '/p', 1000, NULL, NULL,
+                        NULL, 99, NULL, NULL",
+                "source_id: integer 99",
+            ),
+        ] {
+            let rows: Vec<RecoveryConversationRow> = storage
+                .raw()
+                .query_map_collect(sql, &[ParamValue::from(aliased)] as &[ParamValue], mapper)
+                .expect("query");
+            match &rows[0] {
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    assert_eq!(*id, aliased);
+                    assert!(coercions[0].starts_with(expect), "{sql}: {coercions:?}");
+                }
+                other => panic!("{sql}: expected a quarantined row, got {other:?}"),
+            }
+        }
+        // Identity coercions are listed before content coercions on the same row.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[ParamValue::from(aliased)] as &[ParamValue],
+                mapper,
+            )
+            .expect("query");
+        let RecoveryConversationRow::Quarantined { coercions, .. } = &rows[0] else {
+            panic!("expected a quarantined row, got {:?}", rows[0]);
+        };
+        assert_eq!(coercions.len(), 2, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: integer 1700000000"));
+        assert!(coercions[1].starts_with("title: integer 7"));
+    }
+
+    #[test]
+    fn recover_from_archive_quarantines_mistyped_rows_and_exports_coerced_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let target = tmp.path().join("recovered");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+            let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+            let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+            for cid in [healthy, coerced, aliased] {
+                write_message(
+                    &storage,
+                    cid,
+                    0,
+                    &format!(r#"{{"type":"user","uuid":"u{cid}","text":"hi"}}"#),
+                );
+            }
+            plant_blob(&storage, coerced, "title");
+            plant_blob(&storage, aliased, "source_path");
+        }
+
+        run_doctor_recover_from_archive(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            target.clone(),
+            Some(RobotFormat::Json),
+        )
+        .expect("recover");
+
+        let mut written: Vec<String> = std::fs::read_dir(&target)
+            .expect("read recovered dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        written.sort();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-ok")),
+            "{written:?}"
+        );
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-title")),
+            "a row with only a coerced title still exports: {written:?}"
+        );
+        assert!(
+            !written.iter().any(|n| n.starts_with("sess-alias")),
+            "a quarantined row must not be exported: {written:?}"
+        );
+    }
+
+    fn rows(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn leaked_pages_classifier_accepts_only_a_lone_engine_leak_row() {
+        assert_eq!(
+            classify_leaked_pages(&rows(&["ok"]), &rows(&["ok"])),
+            LeakedPagesVerdict::Clean
+        );
+        // The engine's informational notes are not failures.
+        assert_eq!(
+            classify_leaked_pages(
+                &rows(&["ok"]),
+                &rows(&[
+                    "ok",
+                    "note: orphaned FTS5 contentless content shadow table x"
+                ])
+            ),
+            LeakedPagesVerdict::Clean
+        );
+        for leak in [
+            "database disk image is malformed: page 8196 is never used",
+            "page 8196 is never used",
+        ] {
+            assert_eq!(
+                classify_leaked_pages(&rows(&["ok"]), &rows(&[leak])),
+                LeakedPagesVerdict::LeakedPagesOnly {
+                    first_leaked_page: 8196
+                },
+                "{leak}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaked_pages_classifier_refuses_every_other_failure() {
+        for (quick, full) in [
+            // A doubled reference fails the ownership walk before any orphan
+            // scan, so it never reads as a leak.
+            (
+                vec!["ok"],
+                vec!["database disk image is malformed: page 7 is referenced multiple times"],
+            ),
+            // quick_check itself failing is structural damage.
+            (
+                vec!["database disk image is malformed: btree page 3 is malformed"],
+                vec![],
+            ),
+            // More than one failure row is not the engine's leak-only shape.
+            (
+                vec!["ok"],
+                vec![
+                    "database disk image is malformed: page 9 is never used",
+                    "*** in database aux ***\nindex mismatch",
+                ],
+            ),
+            // Near misses of the leak text.
+            (vec!["ok"], vec!["page 9 is never used again"]),
+            (vec!["ok"], vec!["page -9 is never used"]),
+            (vec!["ok"], vec!["page  is never used"]),
+            (
+                vec!["ok"],
+                vec!["Page 9 is never used; page 10 is never used"],
+            ),
+            (
+                vec!["ok"],
+                vec!["row 4 missing from index idx_messages_created"],
+            ),
+        ] {
+            let verdict = classify_leaked_pages(&rows(&quick), &rows(&full));
+            assert!(
+                matches!(verdict, LeakedPagesVerdict::OtherDamage { .. }),
+                "quick={quick:?} full={full:?} => {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaked_pages_backup_takes_shm_only_beside_a_wal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp.path().join("agent_search.db");
+        std::fs::write(&db, b"db").expect("db");
+        let suffixes = || -> Vec<&'static str> {
+            leaked_pages_bundle_components(&db)
+                .into_iter()
+                .map(|(suffix, _)| suffix)
+                .collect()
+        };
+        assert_eq!(suffixes(), vec![""]);
+        std::fs::write(temp.path().join("agent_search.db-shm"), b"shm").expect("shm");
+        assert_eq!(
+            suffixes(),
+            vec![""],
+            "an SHM without its WAL is not backed up"
+        );
+        std::fs::write(temp.path().join("agent_search.db-wal"), b"wal").expect("wal");
+        assert_eq!(suffixes(), vec!["", "-wal", "-shm"]);
+        std::fs::remove_file(temp.path().join("agent_search.db-shm")).expect("rm shm");
+        assert_eq!(suffixes(), vec!["", "-wal"]);
+    }
+
+    #[test]
+    fn leaked_pages_guidance_predicates_match_the_classifier() {
+        assert!(integrity_is_leaked_pages_only(
+            "ok",
+            &rows(&["database disk image is malformed: page 12 is never used"])
+        ));
+        assert!(!integrity_is_leaked_pages_only(
+            "ok",
+            &rows(&["database disk image is malformed: page 12 is referenced multiple times"])
+        ));
+        assert!(!integrity_is_leaked_pages_only("ok", &[]));
+        assert!(attested_integrity_is_leaked_pages_only(
+            "integrity_check",
+            Some("database disk image is malformed: page 12 is never used")
+        ));
+        // quick_check never scans for unowned pages, so it cannot attest a leak.
+        assert!(!attested_integrity_is_leaked_pages_only(
+            "quick_check",
+            Some("database disk image is malformed: page 12 is never used")
+        ));
+        assert!(!attested_integrity_is_leaked_pages_only(
+            "integrity_check",
+            None
+        ));
     }
 }

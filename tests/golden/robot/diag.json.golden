@@ -1,13 +1,13 @@
 {
   "version": "[VERSION]",
   "platform": {
-    "os": "linux",
-    "arch": "x86_64"
+    "os": "[OS]",
+    "arch": "[ARCH]"
   },
   "paths": {
     "data_dir": "[TEST_HOME]/coding-agent-search",
     "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db",
-    "index_path": "[TEST_HOME]/coding-agent-search/index/v8"
+    "index_path": "[TEST_HOME]/coding-agent-search/index/v9-quill"
   },
   "database": {
     "exists": false,
@@ -81,6 +81,11 @@
       "found": false
     },
     {
+      "name": "omp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "factory",
       "path": "(not detected)",
       "found": false
@@ -102,6 +107,11 @@
     },
     {
       "name": "kimi",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "kiro",
       "path": "(not detected)",
       "found": false
     },
@@ -136,7 +146,17 @@
       "found": false
     },
     {
-      "name": "letta_code",
+      "name": "devin",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "grok_bot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "codebuff",
       "path": "(not detected)",
       "found": false
     },
@@ -152,6 +172,11 @@
     },
     {
       "name": "hermes",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "shelley",
       "path": "(not detected)",
       "found": false
     }

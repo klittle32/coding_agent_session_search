@@ -35,13 +35,6 @@ fn error_kind_rs_path() -> PathBuf {
         .join("cli_error_kind.rs")
 }
 
-const LEGACY_SNAKE_CASE_KIND_EXEMPTIONS: &[&str] = &[
-    "failed_seed_bundle_file",
-    "lexical_generation",
-    "lexical_shard",
-    "retained_publish_backup",
-];
-
 fn extract_kind_str_mappings() -> BTreeMap<String, (String, usize)> {
     let source =
         std::fs::read_to_string(error_kind_rs_path()).expect("read src/model/cli_error_kind.rs");
@@ -67,6 +60,10 @@ fn extract_kind_literals() -> BTreeMap<String, Vec<usize>> {
 
 fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
     let source = std::fs::read_to_string(lib_rs_path()).expect("read src/lib.rs");
+    extract_kind_exit_codes_from_source(&source)
+}
+
+fn extract_kind_exit_codes_from_source(source: &str) -> BTreeMap<String, Vec<i32>> {
     let kind_re =
         regex::Regex::new(r#"CliErrorKind::([A-Za-z][A-Za-z0-9]*)\.kind_str\(\)"#).unwrap();
     let code_re = regex::Regex::new(r"code:\s*(\d+)").unwrap();
@@ -84,16 +81,18 @@ fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
                 panic!("CliErrorKind::{variant} used in src/lib.rs but not mapped in kind_str()");
             };
 
-            // Look backwards up to 10 lines for `code: N` struct fields or
-            // `CliError::already_reported(N, ...)` helper calls.
-            for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)) {
+            // Associate this kind with its nearest code field or helper call.
+            // Earlier codes in the window can belong to adjacent error producers.
+            for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)).rev() {
                 if let Some(cm) = code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
+                    break;
                 }
                 if let Some(cm) = already_reported_code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
+                    break;
                 }
             }
         }
@@ -123,12 +122,45 @@ fn build_golden_json(kinds: &BTreeMap<String, Vec<i32>>) -> serde_json::Value {
 }
 
 #[test]
+fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
+    let source = r#"
+        let manifest = read_manifest().map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: err.to_string(),
+        })?.ok_or_else(|| CliError {
+            code: 3,
+            kind: CliErrorKind::MissingIndex.kind_str(),
+        })?;
+        let first = CliError {
+            code: 9,
+            kind: CliErrorKind::Io.kind_str(),
+        };
+        let second = CliError {
+            code: 14,
+            kind: CliErrorKind::Io.kind_str(),
+        };
+        let reported = CliError::already_reported(1, CliErrorKind::Selftest.kind_str(), message);
+        let from = CliError::already_reported_from(2, CliErrorKind::Selftest.kind_str(), error);
+    "#;
+    assert_eq!(
+        serde_json::to_value(extract_kind_exit_codes_from_source(source)).unwrap(),
+        serde_json::json!({
+            "io": [9, 14],
+            "missing-index": [3],
+            "selftest": [1, 2],
+            "storage": [5],
+        })
+    );
+}
+
+#[test]
 fn error_kinds_are_strictly_kebab_case() {
     let kinds = extract_kind_literals();
     let mut violations = Vec::new();
 
     for (kind, lines) in &kinds {
-        if kind.contains('_') && !LEGACY_SNAKE_CASE_KIND_EXEMPTIONS.contains(&kind.as_str()) {
+        if kind.contains('_') {
             violations.push(format!(
                 "  {kind} (lines: {lines:?}) — contains underscore, should be: {}",
                 kind.replace('_', "-")

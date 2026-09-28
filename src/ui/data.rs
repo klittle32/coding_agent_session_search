@@ -51,6 +51,24 @@ fn normalized_ui_source_identity_sql_expr(
     )
 }
 
+fn normalized_ui_source_origin_kind_sql_expr(
+    source_id_column: &str,
+    origin_kind_column: &str,
+    origin_host_column: &str,
+) -> String {
+    format!(
+        "CASE \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN 'remote' \
+            WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN 'remote' \
+            ELSE '{local}' \
+         END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
 fn normalize_ui_source_id_value(source_id: Option<&str>) -> String {
     let trimmed = source_id.unwrap_or_default().trim();
     if trimmed.is_empty()
@@ -382,6 +400,8 @@ pub(crate) fn load_conversation_uncached(
 ) -> Result<Option<ConversationView>> {
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let normalized_origin_kind_sql =
+        normalized_ui_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
     // LEFT JOIN + COALESCE on agents for the same NULL-agent_id safety as
     // load_conversation_by_id_uncached.
     let (sql, params) = if let Some(source_id) = source_id {
@@ -392,6 +412,7 @@ pub(crate) fn load_conversation_uncached(
                  FROM conversations c
                  LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
                  ORDER BY c.started_at DESC LIMIT 1"
             ),
@@ -405,8 +426,9 @@ pub(crate) fn load_conversation_uncached(
                  FROM conversations c
                  LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE c.source_path = ?1
-                 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END,
+                 ORDER BY CASE WHEN {normalized_origin_kind_sql} = '{local}' THEN 0 ELSE 1 END,
                           c.started_at DESC
                  LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
@@ -451,11 +473,18 @@ fn cached_conversation_matches_lookup_head(
         return Ok(false);
     };
 
-    let normalized_source_sql = normalized_ui_source_identity_sql_expr("source_id", "origin_host");
+    let normalized_source_sql =
+        normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let normalized_origin_kind_sql =
+        normalized_ui_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
     let (sql, params) = if let Some(source_id) = source_id {
         (
             format!(
-                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
+                "SELECT c.id, {normalized_source_sql}
+                 FROM conversations c
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
+                 ORDER BY c.started_at DESC LIMIT 1"
             ),
             crate::franken_sync::params![
                 source_path,
@@ -465,7 +494,12 @@ fn cached_conversation_matches_lookup_head(
     } else {
         (
             format!(
-                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, started_at DESC LIMIT 1",
+                "SELECT c.id, {normalized_source_sql}
+                 FROM conversations c
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE c.source_path = ?1
+                 ORDER BY CASE WHEN {normalized_origin_kind_sql} = '{local}' THEN 0 ELSE 1 END,
+                          c.started_at DESC LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
             crate::franken_sync::params![source_path],
@@ -583,19 +617,41 @@ pub(crate) fn search_hit_has_secondary_identity_hint(hit: &SearchHit) -> bool {
         || !title.is_empty()
 }
 
+/// Search coordinates are stored indices plus one, never positions in a view.
+/// Invalid/overflowing indices have no canonical coordinate to navigate to.
+pub(crate) fn canonical_message_number(idx: i64) -> Option<usize> {
+    usize::try_from(idx).ok()?.checked_add(1)
+}
+
 pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &SearchHit) -> bool {
-    let conversation_id_mismatch = match hit.conversation_id {
-        Some(expected_conversation_id) if view.convo.id == Some(expected_conversation_id) => {
-            return true;
-        }
-        Some(_) => true,
-        None => false,
-    };
     let normalized_hit_source_id = normalize_ui_hit_source_id(hit);
-    if view.convo.source_id != normalized_hit_source_id
+    if normalize_ui_source_id_parts(
+        Some(&view.convo.source_id),
+        view.convo.origin_host.as_deref(),
+    ) != normalized_hit_source_id
         || view.convo.source_path != std::path::Path::new(&hit.source_path)
     {
         return false;
+    }
+
+    // A canonical ID is a constraint, not a hint to discard when lookup fails.
+    // Check source/path first: an ID from a different archive or source must
+    // not authorize an unrelated cached view. Display text can be truncated,
+    // but a requested stored ordinal must exist exactly once in that view.
+    if let Some(number) = hit.line_number
+        && (number == 0
+            || view
+                .messages
+                .iter()
+                .filter(|message| canonical_message_number(message.idx) == Some(number))
+                .take(2)
+                .count()
+                != 1)
+    {
+        return false;
+    }
+    if let Some(expected_conversation_id) = hit.conversation_id {
+        return view.convo.id == Some(expected_conversation_id);
     }
 
     let snippet = hit.snippet.trim();
@@ -609,9 +665,6 @@ pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &Searc
         .filter(|title| !title.is_empty());
     let has_identity_hint = search_hit_has_identity_hint(hit);
     let has_strong_message_identity_hint = hit.created_at.is_some() || !hit.content.is_empty();
-    if conversation_id_mismatch && !search_hit_has_secondary_identity_hint(hit) {
-        return false;
-    }
     if !has_identity_hint {
         return true;
     }
@@ -630,13 +683,11 @@ pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &Searc
         }
     }
 
-    view.messages.iter().enumerate().any(|(pos, msg)| {
-        let line_from_idx = (msg.idx >= 0).then_some((msg.idx as usize) + 1);
-        let line_from_pos = pos + 1;
+    view.messages.iter().any(|msg| {
+        let line_from_idx = canonical_message_number(msg.idx);
 
         if let Some(expected_line) = hit.line_number
             && line_from_idx != Some(expected_line)
-            && line_from_pos != expected_line
         {
             return false;
         }
@@ -647,7 +698,7 @@ pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &Searc
                     && view.convo.started_at == Some(expected_created_at)
                     && hit
                         .line_number
-                        .is_some_and(|line| line == line_from_idx.unwrap_or(line_from_pos)));
+                        .is_some_and(|line| Some(line) == line_from_idx));
             if !created_matches {
                 return false;
             }
@@ -674,7 +725,10 @@ pub fn load_conversation_for_hit(
     hit: &SearchHit,
 ) -> Result<Option<ConversationView>> {
     let cache_scope = storage_cache_scope(storage);
-    if let Some(scope) = cache_scope.as_deref()
+    // Path-keyed caches cannot prove uniqueness for a legacy hit without a
+    // conversation ID. Resolve those hits against all matching conversations.
+    if hit.conversation_id.is_some()
+        && let Some(scope) = cache_scope.as_deref()
         && let Some(cached) = CONVERSATION_CACHE.get_scoped(
             scope,
             Some(normalize_ui_hit_source_id(hit).as_str()),
@@ -692,18 +746,18 @@ pub fn load_conversation_for_hit(
         );
     }
 
-    let fallback_hit = if let Some(conversation_id) = hit.conversation_id {
-        if let Some(view) = load_conversation_by_id_uncached(storage, conversation_id)?
-            && conversation_view_matches_hit(&view, hit)
-        {
-            return Ok(Some(view));
-        }
-        let mut fallback_hit = hit.clone();
-        fallback_hit.conversation_id = None;
-        fallback_hit
-    } else {
-        hit.clone()
-    };
+    if let Some(conversation_id) = hit.conversation_id {
+        return Ok(load_conversation_by_id_uncached(storage, conversation_id)?
+            .filter(|view| conversation_view_matches_hit(view, hit)));
+    }
+    if !search_hit_has_identity_hint(hit) {
+        // Preserve unanchored browsing; only hit-followup promises exactness.
+        return load_conversation_uncached(
+            storage,
+            Some(normalize_ui_hit_source_id(hit).as_str()),
+            &hit.source_path,
+        );
+    }
 
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
@@ -720,13 +774,11 @@ pub fn load_conversation_for_hit(
     );
     let rows = storage.raw().query_map_collect(
         &sql,
-        crate::franken_sync::params![
-            fallback_hit.source_path.as_str(),
-            normalize_ui_hit_source_id(&fallback_hit)
-        ],
+        crate::franken_sync::params![hit.source_path.as_str(), normalize_ui_hit_source_id(hit)],
         ui_conversation_row_parts,
     )?;
 
+    let mut matched = None;
     for (convo_id, convo, workspace) in rows {
         let messages = storage.fetch_messages(convo_id)?;
         let view = ConversationView {
@@ -734,20 +786,17 @@ pub fn load_conversation_for_hit(
             messages,
             workspace,
         };
-        if conversation_view_matches_hit(&view, &fallback_hit) {
-            return Ok(Some(view));
+        if conversation_view_matches_hit(&view, hit) {
+            if matched.is_some() {
+                // Equal text/timestamps in a shared provider file do not make
+                // the newest conversation the one selected by search.
+                return Ok(None);
+            }
+            matched = Some(view);
         }
     }
 
-    if search_hit_has_identity_hint(&fallback_hit) {
-        Ok(None)
-    } else {
-        load_conversation_uncached(
-            storage,
-            Some(normalize_ui_hit_source_id(&fallback_hit).as_str()),
-            &fallback_hit.source_path,
-        )
-    }
+    Ok(matched)
 }
 
 /// Load a conversation with caching, returning Arc for efficiency.
@@ -1596,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn load_conversation_prefers_local_source_for_shared_path() {
+    fn load_conversation_prefers_named_local_source_for_shared_path() {
         use crate::storage::sqlite::FrankenStorage;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1608,9 +1657,9 @@ mod tests {
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('backup-local', 'local', NULL, 0, 0)",
         )
-        .expect("insert local source");
+        .expect("insert named local source");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
         )
@@ -1619,7 +1668,7 @@ mod tests {
             use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
-                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 100)",
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, 'backup-local', 100)",
                 &param_slice_to_values(&p),
             )
             .expect("insert local conversation");
@@ -1642,7 +1691,7 @@ mod tests {
             .expect("load conversation")
             .expect("conversation present");
 
-        assert_eq!(loaded.convo.source_id, "local");
+        assert_eq!(loaded.convo.source_id, "backup-local");
         assert_eq!(loaded.convo.title.as_deref(), Some("Local Session"));
         assert_eq!(loaded.messages[0].content, "local body");
     }
@@ -1694,6 +1743,135 @@ mod tests {
 
         CONVERSATION_CACHE.invalidate(None, shared_path);
         CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+    }
+
+    #[test]
+    fn gh493_canonical_message_numbers_reject_invalid_indices_without_position_fallback() {
+        assert_eq!(canonical_message_number(-1), None);
+        assert_eq!(canonical_message_number(i64::MIN), None);
+        assert_eq!(canonical_message_number(0), Some(1));
+        assert_eq!(canonical_message_number(128), Some(129));
+        assert_eq!(canonical_message_number(540), Some(541));
+        assert_eq!(
+            canonical_message_number(i64::MAX),
+            usize::try_from(i64::MAX)
+                .ok()
+                .and_then(|idx| idx.checked_add(1))
+        );
+    }
+
+    fn gh493_sparse_view_fixture() -> (tempfile::TempDir, FrankenStorage, SearchHit) {
+        let root = tempdir().expect("tempdir");
+        let storage = FrankenStorage::open(&root.path().join("cass.db")).expect("archive");
+        storage.raw().execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'codex', 'Codex', 'local', 0, 0)").unwrap();
+        storage.raw().execute("INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'sparse', 'Sparse', '/gh493/shared.db', 'local', 100)").unwrap();
+        for (id, idx) in [(1_i64, 1_i64), (2, 16), (3, 89)] {
+            storage.raw().execute_compat(
+                "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (?1, 1, ?2, 'user', 101, 'identical repeated body')",
+                crate::franken_sync::params![id, idx],
+            ).unwrap();
+        }
+        let hit = SearchHit {
+            title: "Sparse".into(),
+            snippet: "identical repeated body".into(),
+            content: "identical repeated body".into(),
+            content_hash: 0,
+            conversation_id: Some(1),
+            score: 1.0,
+            agent: "codex".into(),
+            source_path: "/gh493/shared.db".into(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(101),
+            line_number: Some(17),
+            match_type: MatchType::Exact,
+        };
+        (root, storage, hit)
+    }
+
+    #[test]
+    fn gh493_hit_lookup_never_uses_dense_positions_or_ignores_source_identity() {
+        let (_root, storage, hit) = gh493_sparse_view_fixture();
+        let view = load_conversation_for_hit(&storage, &hit).unwrap().unwrap();
+        for conversation_id in [Some(1), None] {
+            for (number, valid) in [
+                (0, false),
+                (1, false),
+                (2, true),
+                (3, false),
+                (17, true),
+                (90, true),
+                (91, false),
+            ] {
+                let mut request = hit.clone();
+                request.conversation_id = conversation_id;
+                request.line_number = Some(number);
+                assert_eq!(
+                    conversation_view_matches_hit(&view, &request),
+                    valid,
+                    "stored ordinal {number}, conversation {conversation_id:?}"
+                );
+                assert_eq!(
+                    load_conversation_for_hit(&storage, &request)
+                        .unwrap()
+                        .is_some(),
+                    valid
+                );
+            }
+        }
+        for (source, path) in [("remote", "/gh493/shared.db"), ("local", "/gh493/other.db")] {
+            let mut request = hit.clone();
+            request.source_id = source.into();
+            request.source_path = path.into();
+            assert!(!conversation_view_matches_hit(&view, &request));
+            assert!(
+                load_conversation_for_hit(&storage, &request)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut duplicate_view = view.clone();
+        duplicate_view.messages.push(view.messages[1].clone());
+        assert!(!conversation_view_matches_hit(&duplicate_view, &hit));
+        let mut truncated = hit;
+        truncated.title = "old display title".into();
+        truncated.content = "truncated display payload".into();
+        assert!(
+            conversation_view_matches_hit(&view, &truncated),
+            "exact source/path/conversation/ordinal is independent of display text"
+        );
+    }
+
+    #[test]
+    fn gh493_legacy_hit_ambiguity_cannot_be_hidden_by_a_path_cache() {
+        let (_root, storage, mut hit) = gh493_sparse_view_fixture();
+        // Populate the ordinary path cache before another session appears.
+        load_conversation_for_source(&storage, "local", &hit.source_path)
+            .unwrap()
+            .unwrap();
+        storage.raw().execute("INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'twin', 'Sparse', '/gh493/shared.db', 'local', 200)").unwrap();
+        storage.raw().execute("INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (4, 2, 16, 'user', 101, 'identical repeated body')").unwrap();
+        hit.conversation_id = None;
+        assert!(
+            load_conversation_for_hit(&storage, &hit).unwrap().is_none(),
+            "matching text in two sessions is ambiguous, even with a warm cache"
+        );
+        for id in [1, 2] {
+            hit.conversation_id = Some(id);
+            assert_eq!(
+                load_conversation_for_hit(&storage, &hit)
+                    .unwrap()
+                    .unwrap()
+                    .convo
+                    .id,
+                Some(id)
+            );
+        }
+        hit.conversation_id = Some(999);
+        assert!(load_conversation_for_hit(&storage, &hit).unwrap().is_none());
     }
 
     #[test]
@@ -1803,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_view_matches_hit_falls_back_when_stale_conversation_id_has_other_hints() {
+    fn conversation_view_matches_hit_refuses_stale_conversation_id_even_with_matching_hints() {
         let view = ConversationView {
             convo: Conversation {
                 id: Some(1),
@@ -1852,7 +2030,13 @@ mod tests {
             origin_host: None,
         };
 
-        assert!(conversation_view_matches_hit(&view, &hit));
+        assert!(!conversation_view_matches_hit(&view, &hit));
+        let mut exact = hit.clone();
+        exact.conversation_id = view.convo.id;
+        assert!(conversation_view_matches_hit(&view, &exact));
+        let mut legacy = hit;
+        legacy.conversation_id = None;
+        assert!(conversation_view_matches_hit(&view, &legacy));
     }
 
     #[test]
@@ -2128,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn load_conversation_for_hit_falls_back_when_conversation_id_is_stale() {
+    fn load_conversation_for_hit_refuses_stale_id_without_substituting_matching_content() {
         let tmp = tempdir().expect("tempdir");
         let db_path = tmp.path().join("cass.db");
         let storage = FrankenStorage::open(&db_path).expect("open db");
@@ -2162,9 +2346,19 @@ mod tests {
             origin_kind: "local".to_string(),
             origin_host: None,
         };
-        let loaded = load_conversation_for_hit(&storage, &hit)
-            .expect("load attempt succeeds")
-            .expect("should fall back to provenance match after stale conversation id misses");
+        assert!(
+            load_conversation_for_hit(&storage, &hit)
+                .expect("load attempt succeeds")
+                .is_none()
+        );
+
+        // The same uniquely identifying legacy hit remains usable when no ID
+        // was supplied. An explicit stale ID is never silently erased.
+        let mut legacy = hit;
+        legacy.conversation_id = None;
+        let loaded = load_conversation_for_hit(&storage, &legacy)
+            .expect("load legacy hit")
+            .expect("unique message remains discoverable");
 
         assert_eq!(loaded.convo.id, Some(1));
         assert_eq!(
@@ -2227,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn load_conversation_for_hit_prefers_exact_conversation_id_over_stale_path() {
+    fn load_conversation_for_hit_rejects_conflicting_path_and_source_despite_matching_id() {
         use crate::storage::sqlite::FrankenStorage;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -2269,8 +2463,14 @@ mod tests {
             origin_host: Some("dev@laptop".to_string()),
         };
 
-        let loaded = load_conversation_for_hit(&storage, &hit)
-            .expect("load exact conversation")
+        assert!(load_conversation_for_hit(&storage, &hit).unwrap().is_none());
+        let mut exact = hit;
+        exact.source_path = "/db/real/path.sqlite".into();
+        exact.source_id = "  LOCAL  ".into();
+        exact.origin_kind = "local".into();
+        exact.origin_host = None;
+        let loaded = load_conversation_for_hit(&storage, &exact)
+            .expect("load exact source/path/conversation")
             .expect("matching conversation");
 
         assert_eq!(loaded.convo.id, Some(1));

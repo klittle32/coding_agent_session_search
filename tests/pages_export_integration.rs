@@ -7,6 +7,7 @@ use chrono::{TimeZone, Utc};
 use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
 use coding_agent_search::franken_sync::{Connection, Row as FrankenRow, params as fparams};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
+use coding_agent_search::pages::summary::ExclusionSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +18,17 @@ type TestResult<T> = anyhow::Result<T>;
 fn open_db(path: &Path) -> TestResult<Connection> {
     let path_str = path.to_string_lossy();
     Ok(Connection::open(path_str.as_ref())?)
+}
+
+/// Staged-export verifiers must not dirty the artifact they attest: a
+/// read-write FrankenSQLite open stamps `.fsqlite-migration-state` next to
+/// the database, which the engine then rejects as a verifier-created sidecar.
+fn open_db_readonly(path: &Path) -> TestResult<Connection> {
+    let path_str = path.to_string_lossy();
+    Ok(coding_agent_search::franken_sync::compat::open_with_flags(
+        path_str.as_ref(),
+        coding_agent_search::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?)
 }
 
 fn query_i64(conn: &Connection, sql: &str) -> TestResult<i64> {
@@ -82,6 +94,17 @@ fn create_source_db(conn: &Connection) -> TestResult<()> {
             created_at INTEGER,
             attachment_refs TEXT,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS snippets (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            file_path TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            language TEXT,
+            snippet_text TEXT,
+            FOREIGN KEY (message_id) REFERENCES messages(id)
         );
         "#,
     )?)
@@ -176,6 +199,11 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
         )?;
     }
 
+    conn.execute(
+        "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+         VALUES (14, 'src/db.rs', 1, 2, 'rust', 'initial snapshot snippet')",
+    )?;
+
     Ok(())
 }
 
@@ -212,6 +240,83 @@ fn verify_export_schema(conn: &Connection) -> TestResult<()> {
     assert!(message_columns.contains(&"attachment_refs".to_string()));
 
     Ok(())
+}
+
+fn assert_review_exclusion_fixture_payload(conn: &Connection) {
+    assert_eq!(
+        query_strings(conn, "SELECT title FROM conversations ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(conn, "SELECT content FROM messages ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(conn, "SELECT snippet_text FROM snippets ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM conversations
+             WHERE title IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages
+             WHERE content IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM snippets
+             WHERE snippet_text IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_fts
+             WHERE messages_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_code_fts
+             WHERE messages_code_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
 }
 
 // =============================================================================
@@ -255,6 +360,65 @@ fn export_engine_exports_all_conversations_with_no_filter() {
 
     let msg_count = query_i64(&out_conn, "SELECT COUNT(*) FROM messages").unwrap();
     assert_eq!(msg_count, 14);
+}
+
+/// gz8xg: a successful publish must leave nothing of the staged candidate
+/// behind — including fsqlite's `-fsqlite-ns-gate` / `-fsqlite-ns-use`
+/// identity records stamped beside the `VACUUM INTO` target — on both the
+/// first publication and a re-publish over an existing output.
+#[test]
+fn export_engine_publish_leaves_no_staged_candidate_litter() {
+    fn staged_litter(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".export.db.tmp."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    let filter = || ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+
+    ExportEngine::new(&source_path, &output_path, filter())
+        .execute(|_, _| {}, None)
+        .unwrap();
+    assert!(output_path.is_file());
+    let after_first = staged_litter(tmp.path());
+    assert!(
+        after_first.is_empty(),
+        "first publish left staged-candidate entries: {after_first:?}"
+    );
+
+    // Re-publish over the existing output (the park-prior / backup path).
+    ExportEngine::new(&source_path, &output_path, filter())
+        .execute(|_, _| {}, None)
+        .unwrap();
+    assert!(output_path.is_file());
+    let after_second = staged_litter(tmp.path());
+    assert!(
+        after_second.is_empty(),
+        "re-publish left staged-candidate entries: {after_second:?}"
+    );
+    let out_conn = open_db(&output_path).unwrap();
+    assert_eq!(
+        query_i64(&out_conn, "SELECT COUNT(*) FROM conversations").unwrap(),
+        4
+    );
 }
 
 #[test]
@@ -407,6 +571,85 @@ fn export_engine_combined_filters() {
     // Only conversation 3 matches (claude + project-b)
     assert_eq!(stats.conversations_processed, 1);
     assert_eq!(stats.messages_processed, 4);
+}
+
+#[test]
+fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+
+    src_conn
+        .execute("UPDATE conversations SET title = 'DropWorkspace7xy' WHERE id = 1")
+        .unwrap();
+    src_conn
+        .execute("UPDATE conversations SET title = 'DropConversation7xy' WHERE id = 3")
+        .unwrap();
+    src_conn
+        .execute("UPDATE conversations SET title = 'DropPattern7xy' WHERE id = 4")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropWorkspace7xy' WHERE id = 1")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropConversation7xy' WHERE id = 6")
+        .unwrap();
+    src_conn
+        .execute("UPDATE messages SET content = 'DropPattern7xy' WHERE id = 10")
+        .unwrap();
+    src_conn
+        .execute_batch(
+            "INSERT INTO snippets (message_id, snippet_text) VALUES (1, 'DropWorkspace7xy');
+             INSERT INTO snippets (message_id, snippet_text) VALUES (6, 'DropConversation7xy');
+             INSERT INTO snippets (message_id, snippet_text) VALUES (10, 'DropPattern7xy');
+             INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (5, 1, 2, 'KeepNeighbor7xy', '/home/user/project-b/sessions/keep.jsonl', 1718704800000, 1);
+             INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
+             VALUES (15, 5, 0, 'user', 'KeepNeighbor7xy', 1718704800000);
+             INSERT INTO snippets (message_id, snippet_text) VALUES (15, 'KeepNeighbor7xy');",
+        )
+        .unwrap();
+    drop(src_conn);
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let mut exclusions = ExclusionSet::new();
+    exclusions.exclude_workspace("/home/user/project-a");
+    exclusions.exclude_conversation(3);
+    exclusions.add_pattern("^DropPattern7xy$").unwrap();
+
+    let progress_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress_observer = Arc::clone(&progress_calls);
+    let engine = ExportEngine::new(&source_path, &output_path, filter).with_exclusions(exclusions);
+    let (stats, ()) = engine
+        .execute_verified(
+            move |current, total| {
+                progress_observer.lock().unwrap().push((current, total));
+            },
+            None,
+            |staged_db_path| {
+                let staged_conn = open_db_readonly(staged_db_path)?;
+                assert_review_exclusion_fixture_payload(&staged_conn);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(stats.conversations_processed, 1);
+    assert_eq!(stats.messages_processed, 1);
+    assert_eq!(progress_calls.lock().unwrap().as_slice(), &[(1, 1)]);
+
+    let out_conn = open_db(&output_path).unwrap();
+    assert_review_exclusion_fixture_payload(&out_conn);
 }
 
 // =============================================================================
@@ -730,6 +973,198 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
     let msg_count = query_i64(&preserved_conn, "SELECT COUNT(*) FROM messages").unwrap();
     assert_eq!(conv_count, 4);
     assert_eq!(msg_count, 14);
+}
+
+#[test]
+fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    std::fs::write(&output_path, b"previous approved generation").unwrap();
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let error = engine
+        .execute_verified(
+            |_, _| {},
+            None,
+            |_| -> anyhow::Result<()> {
+                anyhow::bail!("secret approval rejected staged generation")
+            },
+        )
+        .expect_err("rejected staged export must not publish");
+
+    assert!(error.to_string().contains("verification failed"));
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"previous approved generation"
+    );
+    let rejected_sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".export.db.tmp.") || name.starts_with(".export.db.builder.")
+        })
+        .collect();
+    assert!(
+        rejected_sidecars.is_empty(),
+        "rejected secret-bearing stage must not remain beside the prior output: {rejected_sidecars:?}"
+    );
+}
+
+#[test]
+fn export_engine_rejects_sidecar_created_by_staged_verifier() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    std::fs::write(&output_path, b"previous approved generation").unwrap();
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let error = engine
+        .execute_verified(
+            |_, _| {},
+            None,
+            |staged_path| {
+                let mut sidecar = staged_path.as_os_str().to_os_string();
+                sidecar.push("-wal-cert-head");
+                std::fs::write(sidecar, b"verifier-created sidecar")?;
+                Ok(())
+            },
+        )
+        .expect_err("a verifier-created sidecar must block main-file-only publication");
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("verifier left an unbound SQLite sidecar"),
+        "unexpected verifier-sidecar error: {message}"
+    );
+    assert!(
+        message.contains("-wal-cert-head"),
+        "verifier-sidecar error omitted exact artifact: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"previous approved generation"
+    );
+    let rejected_sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".export.db.tmp.") || name.starts_with(".export.db.builder.")
+        })
+        .collect();
+    assert!(
+        rejected_sidecars.is_empty(),
+        "verifier-created sidecar rejection leaked staging artifacts: {rejected_sidecars:?}"
+    );
+}
+
+#[test]
+fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    src_conn.execute("PRAGMA journal_mode = WAL;").unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+
+    let writer = open_db(&source_path).unwrap();
+    let inserted = std::cell::Cell::new(false);
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let stats = engine
+        .execute(
+            |current, _| {
+                if current == 1 && !inserted.replace(true) {
+                    writer
+                        .execute(
+                            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (4, 99, 'user', 'concurrent append')",
+                        )
+                        .expect("concurrent writer should commit in WAL mode");
+                    writer
+                        .execute(
+                            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+                             VALUES (14, 'src/db.rs', 3, 4, 'rust', 'concurrent snippet append')",
+                        )
+                        .expect("concurrent snippet writer should commit in WAL mode");
+                }
+            },
+            None,
+        )
+        .unwrap();
+
+    assert!(inserted.get(), "test mutation must execute");
+    assert_eq!(
+        query_i64(&writer, "SELECT COUNT(*) FROM messages").unwrap(),
+        15
+    );
+    assert_eq!(
+        query_i64(&writer, "SELECT COUNT(*) FROM snippets").unwrap(),
+        2
+    );
+    assert_eq!(stats.messages_processed, 14);
+
+    let exported = open_db(&output_path).unwrap();
+    assert_eq!(
+        query_i64(&exported, "SELECT COUNT(*) FROM messages").unwrap(),
+        14
+    );
+    assert_eq!(
+        query_i64(&exported, "SELECT COUNT(*) FROM snippets").unwrap(),
+        1
+    );
+    assert_eq!(
+        query_i64(
+            &exported,
+            "SELECT message_count FROM conversations WHERE id = 4"
+        )
+        .unwrap(),
+        5
+    );
+    assert_eq!(
+        query_i64(
+            &exported,
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 4"
+        )
+        .unwrap(),
+        5
+    );
 }
 
 // =============================================================================

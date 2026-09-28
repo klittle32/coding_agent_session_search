@@ -34,6 +34,12 @@
 //! - **[`model_manager`]**: Detects model availability; this module records
 //!   which model was used to build each artifact.
 
+mod shards;
+
+pub use shards::{SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactShardV2};
+
+pub(crate) mod selection;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -494,6 +500,25 @@ impl SemanticShardManifest {
                     b.shard_index,
                 ))
         });
+    }
+
+    /// Stop every shard generation for one embedder from shadowing a freshly
+    /// rebuilt monolithic artifact while retaining its provenance record and
+    /// files for explicit inspection/GC.
+    pub fn mark_shards_stale_for_embedder(&mut self, embedder_id: &str) -> usize {
+        let mut changed = 0usize;
+        for shard in self
+            .shards
+            .iter_mut()
+            .filter(|shard| shard.embedder_id == embedder_id)
+        {
+            if shard.ready || shard.ann_ready {
+                shard.ready = false;
+                shard.ann_ready = false;
+                changed = changed.saturating_add(1);
+            }
+        }
+        changed
     }
 
     pub fn summary(
@@ -1336,6 +1361,9 @@ pub struct SemanticArtifactValidationEvidence {
 #[serde(deny_unknown_fields)]
 pub struct SemanticGenerationArtifact {
     pub role: SemanticArtifactRole,
+    /// Explicit ordered partition binding for schema v2; absent in schema v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<SemanticArtifactShardV2>,
     /// Manifest-relative path beneath the selected generation directory.
     pub relative_path: String,
     pub artifact_sha256: String,
@@ -1952,7 +1980,13 @@ impl SemanticGenerationManifestV1 {
     }
 
     fn canonical_digest_bytes(&self) -> Vec<u8> {
-        let mut encoder = SemanticCanonicalEncoder::new(b"cass.semantic-generation-manifest.v1");
+        let domain: &[u8] =
+            if self.schema_version == SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
+                b"cass.semantic-generation-manifest.v2"
+            } else {
+                b"cass.semantic-generation-manifest.v1"
+            };
+        let mut encoder = SemanticCanonicalEncoder::new(domain);
         encoder.u32(self.schema_version);
         encoder.text(&self.generation_id);
         encoder.text(&self.build_id);
@@ -1977,6 +2011,9 @@ impl SemanticGenerationManifestV1 {
         encoder.len(self.artifacts.len());
         for artifact in &self.artifacts {
             encode_generation_artifact(&mut encoder, artifact);
+            if self.schema_version == SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
+                shards::encode_shard(&mut encoder, artifact.shard.as_ref());
+            }
         }
         encoder.finish()
     }
@@ -2003,11 +2040,14 @@ impl SemanticGenerationManifestV1 {
 
     /// Validate every authoritative field without consulting the filesystem.
     pub fn validate(&self) -> Result<(), SemanticGenerationError> {
-        if self.schema_version != SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
-            if self.schema_version > SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
+        if !(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION
+            ..=SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
+            if self.schema_version > SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
                 return Err(SemanticGenerationError::UnsupportedManifestSchema {
                     found: u64::from(self.schema_version),
-                    supported: u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION),
+                    supported: u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION),
                 });
             }
             return invalid_manifest(
@@ -2097,7 +2137,12 @@ impl SemanticGenerationManifestV1 {
                 "sealed generations must declare artifacts",
             );
         }
-        if self.artifacts.len() > MAX_SEMANTIC_ARTIFACTS {
+        let artifact_limit = if self.schema_version == SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
+            MAX_SEMANTIC_ARTIFACTS
+        } else {
+            shards::MAX_SHARDS_PER_TIER * 4
+        };
+        if self.artifacts.len() > artifact_limit {
             return invalid_manifest(
                 SemanticManifestInvariantClass::Topology,
                 "semantic generation declares too many artifact roles",
@@ -2109,19 +2154,18 @@ impl SemanticGenerationManifestV1 {
         let mut portable_paths = BTreeSet::new();
         let mut previous_role = None;
         for artifact in &self.artifacts {
-            if previous_role.is_some_and(|previous| previous >= artifact.role) {
+            let key = (
+                artifact.role,
+                artifact.shard.as_ref().map_or(0, |shard| shard.ordinal),
+            );
+            if previous_role.is_some_and(|previous| previous >= key) {
                 return invalid_manifest(
                     SemanticManifestInvariantClass::Topology,
-                    "artifacts must be strictly sorted by role with no duplicates",
+                    "artifacts must be strictly sorted by role and shard ordinal with no duplicates",
                 );
             }
-            previous_role = Some(artifact.role);
-            if !roles.insert(artifact.role) {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Topology,
-                    "duplicate artifact role",
-                );
-            }
+            previous_role = Some(key);
+            roles.insert(artifact.role);
             let normalized =
                 normalized_manifest_relative_path(&artifact.relative_path).map_err(|reason| {
                     SemanticGenerationError::InvalidManifest {
@@ -2149,6 +2193,8 @@ impl SemanticGenerationManifestV1 {
                 self.sealed_at_ms,
             )?;
         }
+
+        shards::validate(self)?;
 
         for required in required_vector_roles(self.realized_topology) {
             if !roles.contains(&required) {
@@ -2180,18 +2226,21 @@ impl SemanticGenerationManifestV1 {
             );
         }
 
-        for ann_role in [
-            SemanticArtifactRole::FastAnn,
-            SemanticArtifactRole::QualityAnn,
-        ] {
-            if let Some(ann) = self.artifact(ann_role) {
+        for ann in self
+            .artifacts
+            .iter()
+            .filter(|artifact| !artifact.role.is_vector())
+        {
+            let ann_role = ann.role;
+            {
                 let Some(base_role) = ann_role.base_vector_role() else {
                     return invalid_manifest(
                         SemanticManifestInvariantClass::AnnBinding,
                         "internal artifact-role contract is inconsistent",
                     );
                 };
-                let Some(base) = self.artifact(base_role) else {
+                let ordinal = ann.shard.as_ref().map_or(0, |shard| shard.ordinal);
+                let Some(base) = self.artifact_at(base_role, ordinal) else {
                     return invalid_manifest(
                         SemanticManifestInvariantClass::AnnBinding,
                         "ANN artifact has no manifest-declared base vector",
@@ -2211,7 +2260,8 @@ impl SemanticGenerationManifestV1 {
                         reason: "ANN embedding identity differs from its vector base".to_owned(),
                     });
                 }
-                if binding.base_role != base_role
+                if ann.shard != base.shard
+                    || binding.base_role != base_role
                     || binding.base_artifact_sha256 != base.artifact_sha256
                     || binding.base_storage_fingerprint
                         != base.embedding_identity.identity.storage.fingerprint()
@@ -2222,7 +2272,6 @@ impl SemanticGenerationManifestV1 {
                     || ann.vector_slot_count != base.vector_slot_count
                     || ann.live_vector_count != base.live_vector_count
                     || ann.tombstone_vector_count != base.tombstone_vector_count
-                    || ann.wal_entry_count != base.wal_entry_count
                     || ann.generation_corpus_sha256 != base.generation_corpus_sha256
                     || ann.covered_live_docset_sha256 != base.covered_live_docset_sha256
                     || ann.covered_content_sha256 != base.covered_content_sha256
@@ -2268,11 +2317,30 @@ impl SemanticGenerationManifestV1 {
         Ok(())
     }
 
+    /// Compatibility accessor for a single-artifact role. Never silently choose
+    /// one shard from a multi-shard tier; use artifacts_for/artifact_at instead.
     pub fn artifact(&self, role: SemanticArtifactRole) -> Option<&SemanticGenerationArtifact> {
+        let mut artifacts = self.artifacts_for(role);
+        let first = artifacts.next()?;
+        artifacts.next().is_none().then_some(first)
+    }
+
+    pub fn artifacts_for(
+        &self,
+        role: SemanticArtifactRole,
+    ) -> impl Iterator<Item = &SemanticGenerationArtifact> {
         self.artifacts
-            .binary_search_by_key(&role, |artifact| artifact.role)
-            .ok()
-            .and_then(|index| self.artifacts.get(index))
+            .iter()
+            .filter(move |artifact| artifact.role == role)
+    }
+
+    pub fn artifact_at(
+        &self,
+        role: SemanticArtifactRole,
+        ordinal: u32,
+    ) -> Option<&SemanticGenerationArtifact> {
+        self.artifacts_for(role)
+            .find(|artifact| artifact.shard.as_ref().map_or(0, |shard| shard.ordinal) == ordinal)
     }
 
     /// Durably seal an immutable generation manifest.
@@ -2572,7 +2640,12 @@ impl SemanticGenerationManifestV1 {
                     source: error.to_string(),
                 }
             })?;
-            resolved.insert(artifact.role, canonical);
+            // The historical role-keyed map can describe only a singleton.
+            // All shards were still validated above; never expose one arbitrary
+            // shard through the legacy accessor.
+            if self.artifact(artifact.role).is_some() {
+                resolved.insert(artifact.role, canonical);
+            }
         }
         Ok(resolved)
     }
@@ -2799,53 +2872,17 @@ pub fn load_current_semantic_generation(
     let mut pointer_for_log = None;
     let mut manifest_for_log = None;
     let result = (|| {
-        let pointer_path = SemanticCurrentPointerV1::path(data_dir);
-        match fs::symlink_metadata(&pointer_path) {
-            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
-                return Err(SemanticGenerationError::InvalidPointer {
-                    reason: "current pointer must not be a symlink or reparse point".to_owned(),
-                });
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(SemanticGenerationError::InvalidPointer {
-                    reason: "current pointer is not a regular file".to_owned(),
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SemanticGenerationError::MissingPointer);
-            }
-            Err(error) => {
-                return Err(SemanticGenerationError::PointerIo {
-                    source: error.to_string(),
-                });
-            }
-        }
-        let pointer_bytes =
-            read_bounded_file(&pointer_path, MAX_SEMANTIC_POINTER_BYTES).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::InvalidData {
-                    SemanticGenerationError::PointerParse {
-                        source: error.to_string(),
-                    }
-                } else {
-                    SemanticGenerationError::PointerIo {
-                        source: error.to_string(),
-                    }
-                }
-            })?;
-        let pointer = parse_current_pointer_bytes(&pointer_bytes)?;
-        pointer_for_log = Some(pointer.clone());
-        pointer.validate()?;
-        let loaded = load_manifest_selected_by_pointer(data_dir, &pointer)?;
-        manifest_for_log = Some(loaded.manifest.clone());
-        if let Some(expected) = expected_corpus
-            && expected != &loaded.manifest.corpus
-        {
-            return Err(SemanticGenerationError::StaleCorpus {
-                expected: corpus_identity_sha256(expected)?,
-                actual: corpus_identity_sha256(&loaded.manifest.corpus)?,
-            });
-        }
+        let selected = selection::read_observed(
+            data_dir,
+            expected_corpus,
+            &mut pointer_for_log,
+            &mut manifest_for_log,
+        )?;
+        let pointer = selected.pointer;
+        let loaded = LoadedManifest {
+            manifest: selected.manifest,
+            generation_dir: selected.generation_dir,
+        };
         let artifact_paths = loaded
             .manifest
             .validate_artifacts_on_disk(data_dir, false)?;
@@ -3189,14 +3226,14 @@ fn parse_generation_manifest_bytes(
             generation_id: generation_id.to_owned(),
             source,
         })?;
-    let supported = u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION);
+    let supported = u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION);
     if schema_version > supported {
         return Err(SemanticGenerationError::UnsupportedManifestSchema {
             found: schema_version,
             supported,
         });
     }
-    if schema_version < supported {
+    if schema_version < u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION) {
         return invalid_manifest(
             SemanticManifestInvariantClass::HistoricalSchema,
             &format!(
@@ -4307,7 +4344,7 @@ fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn sha256_reader(file: &fs::File) -> std::io::Result<String> {
@@ -4321,7 +4358,7 @@ fn sha256_reader(file: &fs::File) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -4346,6 +4383,7 @@ fn portable_file_identity(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn portable_file_identity(
     file: &fs::File,
     _metadata: &fs::Metadata,
@@ -4370,6 +4408,8 @@ fn portable_file_identity(
         file_index_low: u32,
     }
 
+    // SAFETY: declaration matches the documented kernel32 prototype.
+    #[allow(unsafe_code)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetFileInformationByHandle(
@@ -4685,6 +4725,7 @@ fn persist_named_temp(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn windows_move_file_write_through(
     source: &Path,
     destination: &Path,
@@ -4696,6 +4737,8 @@ fn windows_move_file_write_through(
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
+    // SAFETY: declarations match the documented kernel32 prototypes.
+    #[allow(unsafe_code)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(
@@ -5057,6 +5100,7 @@ mod tests {
             covered_content_sha256: covered_content_sha256.clone(),
         };
         SemanticGenerationArtifact {
+            shard: None,
             role,
             relative_path: relative_path.to_owned(),
             artifact_sha256,
@@ -5088,7 +5132,6 @@ mod tests {
         ann.vector_slot_count = base.vector_slot_count;
         ann.live_vector_count = base.live_vector_count;
         ann.tombstone_vector_count = base.tombstone_vector_count;
-        ann.wal_entry_count = base.wal_entry_count;
         ann.generation_corpus_sha256 = base.generation_corpus_sha256.clone();
         ann.covered_live_docset_sha256 = base.covered_live_docset_sha256.clone();
         ann.covered_content_sha256 = base.covered_content_sha256.clone();
@@ -5097,7 +5140,6 @@ mod tests {
         ann.validation.vector_slot_count = ann.vector_slot_count;
         ann.validation.live_vector_count = ann.live_vector_count;
         ann.validation.tombstone_vector_count = ann.tombstone_vector_count;
-        ann.validation.wal_entry_count = ann.wal_entry_count;
         ann.validation.generation_corpus_sha256 = ann.generation_corpus_sha256.clone();
         ann.validation.covered_live_docset_sha256 = ann.covered_live_docset_sha256.clone();
         ann.validation.covered_content_sha256 = ann.covered_content_sha256.clone();
@@ -5789,6 +5831,39 @@ mod tests {
         assert_eq!(loaded.shards[0].shard_index, 0);
         assert_eq!(loaded.shards[1].shard_index, 1);
         assert!(loaded.updated_at_ms > 0);
+    }
+
+    #[test]
+    fn invalidating_embedder_shards_preserves_records_and_other_generations() {
+        let hash_fast = test_shard(0, 1, true);
+        let mut hash_quality = test_shard(0, 1, true);
+        hash_quality.tier = TierKind::Quality;
+        hash_quality.db_fingerprint = "fp-quality-hash".to_string();
+        let mut minilm_quality = test_shard(0, 1, true);
+        minilm_quality.tier = TierKind::Quality;
+        minilm_quality.embedder_id = "minilm-384".to_string();
+        minilm_quality.db_fingerprint = "fp-quality-minilm".to_string();
+        let mut shards = SemanticShardManifest {
+            shards: vec![hash_fast, hash_quality, minilm_quality],
+            ..Default::default()
+        };
+
+        assert_eq!(shards.mark_shards_stale_for_embedder("fnv1a-384"), 2);
+        assert_eq!(shards.shards.len(), 3);
+        assert!(
+            shards
+                .shards
+                .iter()
+                .filter(|shard| shard.embedder_id == "fnv1a-384")
+                .all(|shard| !shard.ready && !shard.ann_ready)
+        );
+        assert!(
+            shards
+                .shards
+                .iter()
+                .find(|shard| shard.embedder_id == "minilm-384")
+                .is_some_and(|shard| shard.ready)
+        );
     }
 
     #[test]
@@ -7090,7 +7165,7 @@ mod tests {
 
         let future = tempfile::tempdir().unwrap();
         let mut future_manifest = manifest;
-        future_manifest.schema_version = SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION + 1;
+        future_manifest.schema_version = SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION + 1;
         write_generation_artifacts(
             future.path(),
             &future_manifest,
@@ -7428,15 +7503,20 @@ mod tests {
             b"base-vector",
             &corpus,
         );
-        let ann = bind_ann_to_base(
-            complete_generation_artifact(
-                SemanticArtifactRole::FastAnn,
-                "fast/search.hnsw",
-                b"ann-index",
-                &corpus,
-            ),
-            &base,
+        let ann_template = complete_generation_artifact(
+            SemanticArtifactRole::FastAnn,
+            "fast/search.hnsw",
+            b"ann-index",
+            &corpus,
         );
+        let mut base_with_wal = base.clone();
+        base_with_wal.wal_entry_count = 7;
+        base_with_wal.validation.wal_entry_count = 7;
+        let ann_from_live_base = bind_ann_to_base(ann_template.clone(), &base_with_wal);
+        assert_eq!(ann_from_live_base.wal_entry_count, 0);
+        assert_eq!(ann_from_live_base.validation.wal_entry_count, 0);
+
+        let ann = bind_ann_to_base(ann_template, &base);
         let manifest = test_generation_manifest(
             SemanticGenerationTopology::FastOnly,
             vec![base.clone(), ann],
@@ -8542,7 +8622,7 @@ mod tests {
             test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
         let mut future_manifest = serde_json::to_value(&manifest).unwrap();
         future_manifest["schema_version"] =
-            serde_json::json!(u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION) + 1);
+            serde_json::json!(u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION) + 1);
         future_manifest.as_object_mut().unwrap().insert(
             "future_provenance".to_owned(),
             serde_json::json!({"epoch": 2}),

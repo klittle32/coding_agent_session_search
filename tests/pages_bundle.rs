@@ -29,8 +29,16 @@ mod tests {
     }
 
     fn run_node_module_assertions(script: &str) -> Result<()> {
+        // `--experimental-detect-module` loads the ES-module assets as modules
+        // on Node 20.10+ and is a no-op where detection is the default
+        // (22.7+). Node 24 removed `--experimental-default-type`.
         let output = Command::new("node")
-            .args(["--input-type=module", "--eval", script])
+            .args([
+                "--experimental-detect-module",
+                "--input-type=module",
+                "--eval",
+                script,
+            ])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()?;
 
@@ -65,6 +73,22 @@ mod tests {
         "coi-detector.js",
         "attachments.js",
         "settings.js",
+    ];
+
+    const EXPECTED_VENDOR_ASSETS: &[&str] = &[
+        "vendor/sqlite3.mjs",
+        "vendor/sqlite3.wasm",
+        "vendor/sqlite3-opfs-async-proxy.js",
+        "vendor/argon2.js",
+        "vendor/argon2-wasm.js",
+        "vendor/argon2.wasm",
+        "vendor/fflate.js",
+        "vendor/html5-qrcode.min.js",
+        "vendor/manifest.json",
+        "vendor/LICENSE-sqlite-wasm.txt",
+        "vendor/LICENSE-argon2-browser.txt",
+        "vendor/LICENSE-fflate.txt",
+        "vendor/LICENSE-html5-qrcode.txt",
     ];
 
     #[test]
@@ -115,6 +139,12 @@ mod tests {
             assert!(
                 site_dir.join(*expected_asset).exists(),
                 "{expected_asset} should exist"
+            );
+        }
+        for expected_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                site_dir.join(*expected_asset).is_file(),
+                "{expected_asset} should be bundled as a regular file"
             );
         }
 
@@ -236,11 +266,11 @@ mod tests {
         // encrypted archive produced. Missing an imported module produces a
         // deployable bundle whose viewer fails only at browser runtime, so the
         // test names the complete asset set instead of checking a loose count.
+        let minimum_runtime_assets = EXPECTED_PAGE_ASSETS.len() + EXPECTED_VENDOR_ASSETS.len();
         assert!(
-            manifest.files.len() >= EXPECTED_PAGE_ASSETS.len(),
-            "integrity manifest must list at least the {} embedded \
-             PAGES_ASSETS + payload chunks; got {} entries: {:?}",
-            EXPECTED_PAGE_ASSETS.len(),
+            manifest.files.len() >= minimum_runtime_assets,
+            "integrity manifest must list at least the {minimum_runtime_assets} embedded \
+             first-party and vendor runtime assets plus payload chunks; got {} entries: {:?}",
             manifest.files.len(),
             manifest.files.keys().collect::<Vec<_>>()
         );
@@ -251,6 +281,12 @@ mod tests {
                  got keys: {:?}",
                 expected_asset,
                 manifest.files.keys().collect::<Vec<_>>()
+            );
+        }
+        for expected_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                manifest.files.contains_key(*expected_asset),
+                "integrity manifest must list pinned vendor asset `{expected_asset}`"
             );
         }
 
@@ -663,7 +699,7 @@ mod tests {
         let conversation_js = include_str!("../src/pages_assets/conversation.js");
         assert!(
             conversation_js
-                .contains("el.setAttribute('href', sanitizeDestinationUrl(attr.value));"),
+                .contains("el.setAttribute(\"href\", sanitizeDestinationUrl(attr.value));"),
             "fallback HTML sanitizer should sanitize href attributes, not just markdown link generation"
         );
 
@@ -826,20 +862,20 @@ mod tests {
         let search_js = include_str!("../src/pages_assets/search.js");
 
         assert!(
-            database_js.contains("searchMode = 'auto', since = null, until = null"),
+            database_js.contains("searchMode = \"auto\",\n    since = null,\n    until = null"),
             "searchConversations should accept time filters at the database boundary"
         );
         assert!(
-            database_js.contains("sql += ' AND c.started_at >= ?';")
-                && database_js.contains("sql += ' AND c.started_at <= ?';"),
+            database_js.contains("sql += \" AND c.started_at >= ?\";")
+                && database_js.contains("sql += \" AND c.started_at <= ?\";"),
             "FTS search should add time predicates to SQL instead of filtering after LIMIT/OFFSET"
         );
 
         let since_predicate = database_js
-            .find("sql += ' AND c.started_at >= ?';")
+            .find("sql += \" AND c.started_at >= ?\";")
             .expect("expected lower-bound search predicate");
         let until_predicate = database_js
-            .find("sql += ' AND c.started_at <= ?';")
+            .find("sql += \" AND c.started_at <= ?\";")
             .expect("expected upper-bound search predicate");
         let result_ordering = database_js
             .find("ORDER BY score")
@@ -867,21 +903,23 @@ mod tests {
 
         assert!(
             database_js.contains(
-                "export function getConversationsByAgent(agent, limit = 50, since = null, until = null)"
+                "export function getConversationsByAgent(agent, limit = 50, since = null, until = null, offset = 0)"
             ),
             "agent-filtered recent queries should accept optional time bounds"
         );
         assert!(
-            database_js.contains("sql += ' AND started_at >= ?';")
-                && database_js.contains("sql += ' AND started_at <= ?';"),
+            database_js.contains("sql += \" AND started_at >= ?\";")
+                && database_js.contains("sql += \" AND started_at <= ?\";"),
             "agent-filtered recent queries should apply time bounds in SQL before LIMIT"
         );
         assert!(
-            search_js.contains("const hasTimeFilter = currentFilters.since !== null || currentFilters.until !== null;"),
+            search_js.contains(
+                "} else if (currentFilters.since !== null || currentFilters.until !== null) {"
+            ),
             "recent search should treat an explicit since=0 route filter as present"
         );
         assert!(
-            search_js.contains("currentFilters.since,\n                currentFilters.until,"),
+            search_js.contains("currentFilters.since,\n      currentFilters.until,\n      offset,"),
             "recent search should pass time bounds when an agent filter is also active"
         );
     }
@@ -913,9 +951,9 @@ mod tests {
             "search should centralize virtual-results teardown so error/reset paths do not leave stale virtual list state behind"
         );
         assert!(
-            search_js.contains("destroyVirtualResultsView();\n        showNoResults();")
-                && search_js.contains("destroyVirtualResultsView();\n    hideNoResults();")
-                && search_js.contains("destroyVirtualResultsView();\n    hideLoading();"),
+            search_js.contains("destroyVirtualResultsView();\n    showNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n  hideNoResults();")
+                && search_js.contains("destroyVirtualResultsView();\n  hideLoading();"),
             "search no-results, error, and clear/reset paths should all tear down virtual-results presentation"
         );
     }
@@ -1021,7 +1059,11 @@ mod tests {
                         storage: SESSION_CONFIG.STORAGE_SESSION,
                         duration: 60_000,
                     });
-                    await seedManager.startSession(new Uint8Array([1, 2, 3, 4]), true);
+                    const expectedDek = Uint8Array.from(
+                        { length: 32 },
+                        (_, index) => index + 1
+                    );
+                    await seedManager.startSession(new Uint8Array(expectedDek), true);
 
                     const persistedEntries = new Map(globalThis.sessionStorage.data);
                     seedManager.endSession();
@@ -1036,7 +1078,11 @@ mod tests {
                     });
 
                     const restoredDek = await restoredManager.restoreSession();
-                    if (!(restoredDek instanceof Uint8Array) || restoredDek.length !== 4) {
+                    if (
+                        !(restoredDek instanceof Uint8Array)
+                        || restoredDek.length !== expectedDek.length
+                        || restoredDek.some((byte, index) => byte !== expectedDek[index])
+                    ) {
                         throw new Error('expected restoreSession to return the persisted DEK');
                     }
 
@@ -1444,12 +1490,13 @@ mod tests {
             "auth QR open flow should snapshot the current scanner session before async work"
         );
         assert!(
-            auth_js.contains("if (qrScanner && !elements.qrScanner?.classList.contains('hidden'))"),
+            auth_js
+                .contains("if (qrScanner && !elements.qrScanner?.classList.contains(\"hidden\"))"),
             "auth QR open flow should refuse to spawn a second scanner while one is already active"
         );
         assert!(
             auth_js.contains("!isCurrentQrScannerSession(sessionToken)")
-                && auth_js.contains("elements.qrScanner?.classList.contains('hidden')"),
+                && auth_js.contains("elements.qrScanner?.classList.contains(\"hidden\")"),
             "auth QR open flow should abort stale scanner starts after cancel or lock"
         );
         assert!(
@@ -1469,7 +1516,7 @@ mod tests {
             auth_js.contains("let activeSessionExpiryTs = 0;")
                 && auth_js.contains("let activeSessionExpiryTimerId = null;")
                 && auth_js.contains(
-                    "document.addEventListener('visibilitychange', handleSessionVisibilityChange);"
+                    "document.addEventListener(\"visibilitychange\", handleSessionVisibilityChange);"
                 ),
             "auth should track active session expiry in memory and recheck it when the page becomes visible again"
         );
@@ -1483,7 +1530,7 @@ mod tests {
         assert!(
             auth_js.contains("scheduleActiveSessionExpiry(expiry);")
                 && auth_js.contains(
-                    "showError('Your session expired. Please unlock the archive again.');"
+                    "showError(\"Your session expired. Please unlock the archive again.\");"
                 ),
             "auth should actively enforce live session expiry instead of only checking expiry on page reload"
         );
@@ -1502,7 +1549,7 @@ mod tests {
             "conversation load failures should be logged with conversation context"
         );
         assert!(
-            conversation_js.contains("showError('Failed to load conversation');"),
+            conversation_js.contains("showError(\"Failed to load conversation\");"),
             "conversation load failures should render a user-visible error panel instead of becoming unhandled promise rejections"
         );
         assert!(
@@ -1531,50 +1578,40 @@ mod tests {
             "settings initialization and async handlers should await the async render path"
         );
         assert!(
-            settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, 'success');\n        await render();"),
+            settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, \"success\");\n    await render();"),
             "storage mode changes should await the async settings rerender so rerender failures stay inside the handler error path"
         );
         assert!(
             settings_js.contains(
-                "showNotification('Current storage cleared', 'success');\n        await render();"
+                "showNotification(\"Current storage cleared\", \"success\");\n    await render();"
             ),
             "clear-current-storage should await the async settings rerender"
         );
         assert!(
             settings_js.contains(
-                "showNotification('OPFS cache cleared', 'success');\n        await render();"
+                "showNotification(\"OPFS data cleared\", \"success\");\n    await render();"
             ),
-            "clear-OPFS should await the async settings rerender"
+            "legacy OPFS cleanup should await the async settings rerender"
         );
         assert!(
-            settings_js.contains("await render();\n    } catch (err) {\n        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);"),
-            "OPFS toggle rerender should be awaited and caught instead of becoming an unhandled promise rejection"
-        );
-        assert!(
-            settings_js.contains("showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');\n                await render();"),
-            "the partial OPFS-clear path should also await the rerender before returning"
-        );
-        assert!(
-            settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
-                && settings_js.contains("await rerenderSettingsUI('storage mode change failure');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS enable cancellation');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS enable failure');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS disable failure');"),
-            "settings rollback paths should rerender the canonical UI after canceled or failed optimistic control changes"
+            settings_js
+                .contains("The active decrypted database is kept in memory only and is never")
+                && settings_js.contains("Legacy decrypted database files were detected in OPFS.")
+                && !settings_js.contains("opfs-toggle")
+                && !settings_js.contains("handleOPFSToggle")
+                && settings_js.contains("await rerenderSettingsUI(\"storage mode cancellation\");")
+                && settings_js
+                    .contains("await rerenderSettingsUI(\"storage mode change failure\");"),
+            "settings must describe OPFS as legacy plaintext residue, not expose it as an active cache mode"
         );
 
         let storage_js = include_str!("../src/pages_assets/storage.js");
         assert!(
-            storage_js.contains(
-                "console.warn('[Storage] OPFS→other migration not yet supported; data remains in OPFS');"
-            ),
-            "storage migration should warn truthfully when OPFS->other migration is intentionally unsupported"
-        );
-        assert!(
-            storage_js.contains(
-                "would require an async UX path with\n            // explicit progress/error handling"
-            ),
-            "storage migration warning should explain why OPFS->other migration is deferred"
+            storage_js.contains("const LEGACY_OPFS_MODE = \"opfs\";")
+                && storage_js.contains("clearLegacyOpfsPreferences();")
+                && !storage_js.contains("StorageMode.OPFS")
+                && !storage_js.contains("case StorageMode.OPFS"),
+            "storage should retain cleanup for legacy OPFS preferences without treating OPFS as an active backend"
         );
 
         let viewer_js = include_str!("../src/pages_assets/viewer.js");
@@ -1606,26 +1643,29 @@ mod tests {
 
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
-            auth_js.contains("import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';"),
+            auth_js.contains(
+                "import {\n  COI_STATE,\n  getCOIState,\n  initCOIDetection,\n  onServiceWorkerActivated,\n} from \"./coi-detector.js\";"
+            ),
             "COI bootstrap should now live in auth.js"
         );
         assert!(
             auth_js.contains("registerServiceWorker().catch((error) => {")
                 && auth_js.contains("initCOIDetection({")
                 && auth_js.contains("onServiceWorkerActivated(async () => {")
-                && auth_js.contains("authScreen?.classList.add('hidden');"),
+                && auth_js.contains("authScreen?.classList.add(\"hidden\");"),
             "auth.js should own service-worker registration, initial auth hiding, COI initialization, and activation rechecks"
         );
         assert!(
-            auth_js.contains("const appScreen = document.getElementById('app-screen');")
-                && auth_js.contains("if (appScreen && !appScreen.classList.contains('hidden')) {")
+            auth_js.contains("const appScreen = document.getElementById(\"app-screen\");")
+                && auth_js
+                    .contains("if (appScreen && !appScreen.classList.contains(\"hidden\")) {")
                 && auth_js.contains("const revealAuthScreenIfLocked = () => {")
                 && auth_js.contains("revealAuthScreenIfLocked();"),
             "COI bootstrap should only re-show the auth screen while the app is still locked, including late failure paths"
         );
         assert!(
-            auth_js.contains("}).catch((error) => {")
-                && auth_js.contains("console.error('[App] COI initialization failed:', error);")
+            auth_js.contains("})\n    .catch((error) => {")
+                && auth_js.contains("console.error(\"[App] COI initialization failed:\", error);")
                 && auth_js.contains("revealAuthScreenIfLocked();"),
             "COI bootstrap failures should fall back to revealing the auth screen instead of leaving the page blank"
         );
@@ -1637,8 +1677,43 @@ mod tests {
         assert!(
             coi_detector_js.contains("Promise.resolve(registeredCallback()).catch((error) => {")
                 && coi_detector_js
-                    .contains("console.error('[COI] Activation callback failed:', error);"),
+                    .contains("console.error(\"[COI] Activation callback failed:\", error);"),
             "service worker activation fanout should catch rejected async callbacks instead of leaking unhandled promise rejections"
+        );
+        assert!(
+            coi_detector_js
+                .contains("const ARCHIVE_SCOPE_URL = new URL(\"./\", import.meta.url).href;")
+                && coi_detector_js
+                    .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
+                && coi_detector_js.contains(
+                    "registrations.find((registration) => registration.scope === expectedScope)"
+                )
+                && coi_detector_js.contains(
+                    "Boolean(registration?.active || registration?.installing || registration?.waiting)"
+                )
+                && coi_detector_js.contains("registration?.active?.state === \"activated\"")
+                && coi_detector_js.contains("waitForExactServiceWorkerActivation(maxWaitMs)")
+                && coi_detector_js.contains("candidateWorker?.state === \"redundant\"")
+                && coi_detector_js.contains("Math.min(100, remainingMs)")
+                && coi_detector_js.contains(
+                    "console.warn(\"[COI] Archive service worker is not active - degrading\");"
+                )
+                && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()")
+                && !coi_detector_js.contains("navigator.serviceWorker.ready"),
+            "COI detection must not mistake a broader or workerless registration for this archive's active installation"
+        );
+
+        let installing_fallback = coi_detector_js
+            .split_once("case COI_STATE.SW_INSTALLING:")
+            .expect("SW_INSTALLING fallback")
+            .1
+            .split_once("return COI_STATE.DEGRADED;")
+            .expect("bounded SW_INSTALLING fallback")
+            .0;
+        assert!(
+            installing_fallback.contains("showDegradedModeWarning();")
+                && !installing_fallback.contains("showReloadRequiredUI("),
+            "an exact worker that remains inactive after the bounded wait must degrade instead of entering an ineffective auto-reload loop"
         );
     }
 
@@ -1647,17 +1722,17 @@ mod tests {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         assert!(
             sw_js.contains(
-                "const payload = event.data && typeof event.data === 'object' ? event.data : null;"
+                "const payload = event.data && typeof event.data === \"object\" ? event.data : null;"
             ) && sw_js.contains("if (!payload) {")
                 && sw_js.contains("Ignoring malformed message payload")
-                && sw_js.contains("rejectRequest('Malformed message payload');"),
+                && sw_js.contains("rejectRequest(\"Malformed message payload\");"),
             "service worker message handling should guard against null or non-object payloads before destructuring and fail fast to the caller"
         );
         assert!(
-            sw_js.contains("if (typeof type !== 'string' || type.length === 0) {")
+            sw_js.contains("if (typeof type !== \"string\" || type.length === 0) {")
                 && sw_js.contains("Ignoring message without a valid type")
-                && sw_js.contains("rejectRequest('Message type must be a non-empty string');")
-                && sw_js.contains("type: 'REQUEST_INVALID',")
+                && sw_js.contains("rejectRequest(\"Message type must be a non-empty string\");")
+                && sw_js.contains("type: \"REQUEST_INVALID\",")
                 && sw_js.contains("rejectRequest(`Unknown message type: ${type}`);"),
             "service worker message handling should reject invalid or unknown message types without forcing controller RPC callers to time out"
         );
@@ -1667,15 +1742,57 @@ mod tests {
     fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         assert!(
-            sw_js.contains("if (response.ok) {\n            try {")
-                && sw_js.contains("log(LOG.WARN, 'Cache open error:', cacheError);")
+            sw_js.contains("const cacheWrite = getCurrentCache()")
+                && sw_js.contains("log(LOG.WARN, \"Cache put error:\", error);")
+                && sw_js.contains("trackBackgroundTask(cacheWrite);")
+                && sw_js.contains("Promise.all(backgroundTasks)")
                 && sw_js.contains("return addSecurityHeaders(response);"),
-            "service worker fetch handling should treat cache-write failures as best-effort and still return a successful network response"
+            "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
         );
         assert!(
-            sw_js.contains("if (request.mode === 'navigate') {\n            try {")
-                && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
+            sw_js.contains("if (cacheEligible && request.mode === \"navigate\") {\n      try {")
+                && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
+                && sw_js
+                    .contains("log(LOG.WARN, \"Navigation cache fallback error:\", cacheError);"),
             "navigation fallback should not crash if the Cache API itself fails during offline fallback"
+        );
+        assert!(
+            sw_js.contains("const cacheEligible = isCacheEligibleRequest(request, url);")
+                && sw_js.contains("url.search === \"\"")
+                && sw_js.contains("!request.headers.has(\"authorization\")")
+                && sw_js.contains("!request.headers.has(\"range\")")
+                && sw_js.contains("request.cache !== \"no-store\"")
+                && sw_js.contains("responseAllowsCaching(response)")
+                && sw_js.contains("response.status === 200")
+                && sw_js.contains("directiveName === \"no-store\"")
+                && sw_js.contains("directiveName === \"no-cache\"")
+                && sw_js.contains("directiveName === \"private\"")
+                && !sw_js.contains("caches.match("),
+            "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
+        );
+
+        let install_body = sw_js
+            .split_once("self.addEventListener(\"install\"")
+            .expect("install handler")
+            .1
+            .split_once("self.addEventListener(\"activate\"")
+            .expect("bounded install handler")
+            .0;
+        assert!(
+            !install_body.contains("self.skipWaiting()")
+                && sw_js.contains("event.waitUntil(skipWaitingTask);")
+                && sw_js.contains("event.waitUntil(clearCacheTask);")
+                && sw_js.contains("const CACHE_VERSION = \"v7\";"),
+            "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
+        );
+        assert!(
+            sw_js.contains("await Promise.allSettled(targets.map((key) => caches.delete(key)));")
+                && sw_js.contains("const remaining = (await caches.keys())")
+                && sw_js.contains("if (remaining.length > 0) {")
+                && sw_js.contains("!Number.isInteger(data.level)")
+                && sw_js.contains("!Object.values(LOG).includes(data.level)")
+                && sw_js.contains("rejectRequest(\"Invalid log level\");"),
+            "cache cleanup must verify its postcondition and message-controlled log levels must be validated"
         );
     }
 
@@ -1684,19 +1801,70 @@ mod tests {
         let sw_register_js = include_str!("../src/pages_assets/sw-register.js");
         assert!(
             sw_register_js.contains("void applyUpdate().catch((error) => {")
-                && sw_register_js.contains("console.error('[SW] Failed to apply update:', error);"),
+                && sw_register_js
+                    .contains("console.error(\"[SW] Failed to apply update:\", error);"),
             "service worker update UI should catch async applyUpdate failures instead of leaking unhandled rejections"
         );
         assert!(
-            sw_register_js.contains("if (!('serviceWorker' in navigator)) {")
+            sw_register_js.contains("if (!(\"serviceWorker\" in navigator)) {")
                 && sw_register_js.contains("if (!currentRegistration) {")
                 && sw_register_js.contains("return true;"),
             "service worker unregister should treat unsupported or already-unregistered states as successful no-ops"
         );
         assert!(
-            sw_register_js.contains("return 'serviceWorker' in navigator\n            && (registration !== null || navigator.serviceWorker.controller !== null);")
-                && sw_register_js.contains("return 'serviceWorker' in navigator\n            && navigator.serviceWorker.controller !== null;"),
-            "service worker status getters should guard navigator.serviceWorker access on unsupported browsers"
+            sw_register_js
+                .contains("const ARCHIVE_SCOPE_URL = new URL(\"./\", import.meta.url).href;")
+                && sw_register_js
+                    .contains("const SERVICE_WORKER_URL = new URL(\"./sw.js\", import.meta.url).href;")
+                && sw_register_js.contains(
+                    "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n      scope: ARCHIVE_SCOPE_URL,"
+                )
+                && sw_register_js.contains("await waitForExactRegistrationActivation(registration);")
+                && sw_register_js.contains("DEFAULT_SW_ACTIVATION_TIMEOUT_MS = 30_000")
+                && sw_register_js.contains("Timed out waiting for archive service worker activation")
+                && sw_register_js.contains("candidateWorker.state === \"activated\"")
+                && sw_register_js.contains("candidateWorker.state === \"redundant\"")
+                && !sw_register_js.contains("navigator.serviceWorker.ready")
+                && sw_register_js
+                    .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
+                && sw_register_js.contains("registrations.find(hasExactScope) || null")
+                && sw_register_js.contains(
+                    "const activeWorker =\n    currentRegistration?.active?.state === \"activated\""
+                )
+                && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
+                && sw_register_js.contains("channel.port1.close();")
+                && sw_register_js.contains("channel.port2.close();")
+                && sw_register_js.contains(
+                    "throw new Error(\"Failed to enumerate service worker registrations\", { cause: error });"
+                )
+                && !sw_register_js.contains("getRegistration(getCurrentScopeUrl())"),
+            "registration RPC and unregister must resolve the exact archive scope instead of a broader longest-prefix registration"
+        );
+        assert!(
+            sw_register_js.contains("noticeWaitingUpdate(registration);")
+                && sw_register_js.contains("if (!reg?.waiting || !reg.active)")
+                && sw_register_js.contains("watchInstallingWorker(reg, reg.installing);")
+                && sw_register_js.contains("const watchedInstallingWorkers = new WeakSet();")
+                && sw_register_js.contains("newWorker.state === \"installed\"")
+                && sw_register_js.contains(
+                    "return \"serviceWorker\" in navigator && hasExactScope(registration);"
+                )
+                && sw_register_js.contains(
+                    "hasExactScope(registration) &&\n      registration.active?.state === \"activated\"\n    );"
+                ),
+            "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
+        );
+        assert!(
+            sw_register_js.contains("if (!currentRegistration?.waiting) {")
+                && sw_register_js.contains("const controllerChanged = await waitForActivation;")
+                && sw_register_js.contains("waitingWorker.state !== \"activated\"")
+                && sw_register_js.contains("currentRegistration.active !== waitingWorker")
+                && sw_register_js.contains(
+                    "throw new Error(\n      \"Archive update did not become the active controller; the page was not reloaded\",\n    );"
+                )
+                && sw_register_js.find("waitingWorker.state !== \"activated\"")
+                    < sw_register_js.find("window.location.reload();"),
+            "update application must not reload the old worker after an activation timeout"
         );
     }
 
@@ -1728,7 +1896,7 @@ mod tests {
         let stats_js = include_str!("../src/pages_assets/stats.js");
         assert!(
             stats_js.contains(
-                ".sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))"
+                ".sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))"
             ),
             "database fallback top-term ranking should use alphabetical tie-breaking so equal-frequency terms do not depend on object insertion order"
         );
@@ -2004,24 +2172,25 @@ mod tests {
         let attachments_js = include_str!("../src/pages_assets/attachments.js");
         assert!(
             attachments_js.contains("function shouldCacheManifestAbsence(error) {")
-                && attachments_js.contains("return error?.code === 'ATTACHMENT_MANIFEST_ABSENT';")
+                && attachments_js
+                    .contains("return error?.code === \"ATTACHMENT_MANIFEST_ABSENT\";")
                 && attachments_js.contains("isManifestLoaded = shouldCacheManifestAbsence(error);"),
             "attachment init should only memoize true manifest absence instead of treating every manifest failure as a permanent no-attachments state"
         );
         assert!(
             attachments_js.contains("if (response.status === 404) {")
                 && attachments_js.contains(
-                    "throw createAttachmentError('Manifest not found', 'ATTACHMENT_MANIFEST_ABSENT');"
+                    "throw createAttachmentError(\"Manifest not found\", \"ATTACHMENT_MANIFEST_ABSENT\");"
                 )
-                && attachments_js.contains("'ATTACHMENT_MANIFEST_FETCH_FAILED'")
-                && attachments_js.contains("'ATTACHMENT_MANIFEST_INVALID'"),
+                && attachments_js.contains("\"ATTACHMENT_MANIFEST_FETCH_FAILED\"")
+                && attachments_js.contains("\"ATTACHMENT_MANIFEST_INVALID\""),
             "attachment manifest loading should distinguish missing manifests from retryable fetch or parse failures"
         );
         assert!(
             attachments_js.contains("if (shouldCacheManifestAbsence(error)) {")
                 && attachments_js.contains("throw error;")
                 && attachments_js
-                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {"),
+                    .contains("if (error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\") {"),
             "attachment invalidation handling should use stable error codes instead of brittle string matching"
         );
     }
@@ -2033,7 +2202,7 @@ mod tests {
             conversation_js.contains("state.ready = true;")
                 && conversation_js.contains("return state.available;")
                 && conversation_js
-                    .contains("if (error?.code === 'ATTACHMENT_REQUEST_INVALIDATED') {")
+                    .contains("if (error?.code === \"ATTACHMENT_REQUEST_INVALIDATED\") {")
                 && conversation_js.contains("state.ready = false;")
                 && conversation_js.contains("state.available = false;"),
             "conversation attachment readiness should only become terminal after a successful or absent manifest load, not after a transient manifest failure"
@@ -2044,7 +2213,7 @@ mod tests {
     fn test_search_keyboard_navigation_tracks_logical_result_indices() {
         let search_js = include_str!("../src/pages_assets/search.js");
         assert!(
-            search_js.contains("function focusResultCardAtIndex(index, align = 'start') {")
+            search_js.contains("function focusResultCardAtIndex(index, align = \"start\") {")
                 && search_js.contains("virtualList.scrollToIndex(index, align);")
                 && search_js.contains("return elements.resultsList.querySelector(`.result-card[data-result-index=\"${index}\"]`);"),
             "search keyboard navigation should resolve result focus by logical index so virtualized results beyond the current DOM window stay reachable"
@@ -2055,9 +2224,10 @@ mod tests {
             "both direct and virtual result cards should expose a stable logical index for keyboard navigation"
         );
         assert!(
-            search_js.contains("focusResultCardAtIndex(currentIndex + 1, 'end');")
-                && search_js.contains("focusResultCardAtIndex(currentIndex - 1, 'start');")
-                && search_js.contains("focusResultCardAtIndex(currentResults.length - 1, 'end');"),
+            search_js.contains("focusResultCardAtIndex(currentIndex + 1, \"end\");")
+                && search_js.contains("focusResultCardAtIndex(currentIndex - 1, \"start\");")
+                && search_js
+                    .contains("focusResultCardAtIndex(currentResults.length - 1, \"end\");"),
             "Arrow/Home/End navigation should move by logical result index instead of only among currently rendered siblings"
         );
     }
@@ -2312,11 +2482,11 @@ mod tests {
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
             auth_js.contains(
-                "const payload = event?.data && typeof event.data === 'object' ? event.data : null;"
+                "const payload = event?.data && typeof event.data === \"object\" ? event.data : null;"
             ) && auth_js.contains("Ignoring malformed worker message payload")
                 && auth_js
-                    .contains("void handleWorkerError(new Error('Malformed worker response'));")
-                && auth_js.contains("case 'WORKER_ERROR':")
+                    .contains("void handleWorkerError(new Error(\"Malformed worker response\"));")
+                && auth_js.contains("case \"WORKER_ERROR\":")
                 && auth_js.contains(
                     "void handleWorkerError(new Error(`Unknown worker message type: ${type}`));"
                 ),
@@ -2326,12 +2496,12 @@ mod tests {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
             crypto_worker_js.contains("Ignoring malformed worker request payload")
-                && crypto_worker_js.contains("type: 'WORKER_ERROR',")
-                && crypto_worker_js.contains("error: 'Malformed worker request payload',")
+                && crypto_worker_js.contains("type: \"WORKER_ERROR\",")
+                && crypto_worker_js.contains("error: \"Malformed worker request payload\",")
                 && crypto_worker_js
                     .contains("throw new Error(`Unknown worker message type: ${type}`);")
                 && crypto_worker_js.contains("type: getWorkerFailureMessageType(type),")
-                && crypto_worker_js.contains("return 'WORKER_ERROR';"),
+                && crypto_worker_js.contains("return \"WORKER_ERROR\";"),
             "crypto worker should report malformed or unknown payloads and fall back to a generic worker failure type"
         );
     }
@@ -2340,7 +2510,7 @@ mod tests {
     fn test_crypto_worker_rejects_unsupported_archive_compression() {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
-            crypto_worker_js.contains("cfg.compression !== 'deflate'")
+            crypto_worker_js.contains("cfg.compression !== \"deflate\"")
                 && crypto_worker_js.contains("Unsupported archive compression")
                 && !crypto_worker_js.contains("// No compression"),
             "crypto worker should fail closed when encrypted config.json declares unsupported compression"
@@ -2351,12 +2521,15 @@ mod tests {
     fn test_crypto_worker_inflates_each_encrypted_payload_chunk_independently() {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
-            crypto_worker_js.contains("const plaintextChunks = [];")
-                && crypto_worker_js.contains("await decompressDeflate(new Uint8Array(decrypted))")
-                && crypto_worker_js.contains("const dbBytes = concatenateChunks(plaintextChunks);")
+            crypto_worker_js.contains("dbBytes = new Uint8Array(payload.total_plaintext_size);")
+                && crypto_worker_js.contains("const plaintext = await decompressDeflate(")
+                && crypto_worker_js.contains("payload.chunk_size")
+                && crypto_worker_js.contains("dbBytes.set(plaintext, totalDecrypted);")
+                && crypto_worker_js.contains("plaintext.fill(0);")
+                && !crypto_worker_js.contains("const plaintextChunks = [];")
                 && !crypto_worker_js
                     .contains("const compressed = concatenateChunks(decryptedChunks);"),
-            "crypto worker must inflate each independently-compressed payload chunk before concatenating plaintext"
+            "crypto worker must inflate each independent chunk directly into one bounded database buffer"
         );
     }
 
@@ -2380,6 +2553,8 @@ mod tests {
                 const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
                 const context = {
                     console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
                     self: {
                         location: { href: 'https://example.test/archive/' },
                         postMessage() {},
@@ -2394,8 +2569,30 @@ mod tests {
                     payload: {
                         chunk_size: 32 * 1024 * 1024,
                         chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
                         files: [],
                     },
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
                 };
 
                 context.validateSupportedPayloadFormat(config);
@@ -2416,5 +2613,535 @@ mod tests {
                 }
             "#,
         )
+    }
+
+    #[test]
+    fn crypto_worker_rejects_dangerous_archive_metadata_before_crypto() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const baseConfig = () => ({
+                    version: 2,
+                    compression: 'deflate',
+                    export_id: Buffer.alloc(16).toString('base64'),
+                    base_nonce: Buffer.alloc(12).toString('base64'),
+                    kdf_defaults: {
+                        memory_kb: 65536,
+                        iterations: 3,
+                        parallelism: 4,
+                    },
+                    payload: {
+                        chunk_size: 1024,
+                        chunk_count: 0,
+                        total_compressed_size: 0,
+                        total_plaintext_size: 0,
+                        files: [],
+                    },
+                    key_slots: [{
+                        id: 0,
+                        slot_type: 'password',
+                        kdf: 'argon2id',
+                        salt: Buffer.alloc(16).toString('base64'),
+                        wrapped_dek: Buffer.alloc(48).toString('base64'),
+                        nonce: Buffer.alloc(12).toString('base64'),
+                        argon2_params: {
+                            memory_kb: 65536,
+                            iterations: 3,
+                            parallelism: 4,
+                        },
+                    }],
+                });
+
+                const expectRejected = (mutate, expectedMessage) => {
+                    const config = baseConfig();
+                    mutate(config);
+                    try {
+                        context.validateSupportedPayloadFormat(config);
+                    } catch (error) {
+                        if (!String(error.message).includes(expectedMessage)) {
+                            throw new Error(`expected ${expectedMessage}, got: ${error.message}`);
+                        }
+                        return;
+                    }
+                    throw new Error(`dangerous metadata was accepted: ${expectedMessage}`);
+                };
+
+                context.validateSupportedPayloadFormat(baseConfig());
+                expectRejected(config => { config.key_slots = []; }, 'at least one key slot');
+                expectRejected(config => {
+                    config.key_slots[0].argon2_params.memory_kb = 0x7fffffff;
+                }, 'Unsupported archive key_slots.argon2_params.memory_kb');
+                expectRejected(config => {
+                    config.key_slots.push({ ...config.key_slots[0] });
+                }, 'Duplicate archive key slot id');
+                expectRejected(config => {
+                    config.payload.total_plaintext_size = 1;
+                }, 'expected 1 chunks');
+                expectRejected(config => {
+                    config.payload.chunk_count = 4097;
+                }, 'browser limit is 4096');
+                expectRejected(config => {
+                    config.payload.total_plaintext_size = 512 * 1024 * 1024 + 1;
+                }, 'Archive plaintext exceeds');
+                expectRejected(config => {
+                    config.payload.total_compressed_size = 640 * 1024 * 1024 + 1;
+                }, 'Archive ciphertext exceeds');
+                expectRejected(config => {
+                    config.payload.files = ['payload/../secret.bin'];
+                    config.payload.chunk_count = 1;
+                    config.payload.total_plaintext_size = 1;
+                    config.payload.total_compressed_size = 17;
+                }, 'Invalid payload file entry 0');
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_fflate_fallback_is_input_sliced_and_output_bounded() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const pushes = [];
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    Uint8Array,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                        DecompressionStream: class {
+                            constructor() { throw new Error('deflate-raw unsupported'); }
+                        },
+                        fflate: {
+                            Inflate: class {
+                                constructor(ondata) { this.ondata = ondata; }
+                                push(chunk, final) {
+                                    pushes.push({ length: chunk.byteLength, final });
+                                    this.ondata(new Uint8Array(1), final);
+                                }
+                            },
+                        },
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                const inflated = await context.decompressDeflate(
+                    new Uint8Array(40_000),
+                    100_000
+                );
+                if (inflated.byteLength !== 3) {
+                    throw new Error(`expected one output byte per input slice, got ${inflated.byteLength}`);
+                }
+                const expectedLengths = [16_384, 16_384, 7_232];
+                if (JSON.stringify(pushes.map(push => push.length)) !== JSON.stringify(expectedLengths)) {
+                    throw new Error(`expected bounded 16 KiB input slices, got ${JSON.stringify(pushes)}`);
+                }
+                if (pushes.slice(0, -1).some(push => push.final) || !pushes.at(-1).final) {
+                    throw new Error(`only the final fflate input slice may be final: ${JSON.stringify(pushes)}`);
+                }
+
+                let cumulativePushes = 0;
+                context.self.fflate.Inflate = class {
+                    constructor(ondata) { this.ondata = ondata; }
+                    push(_chunk, final) {
+                        cumulativePushes += 1;
+                        this.ondata(new Uint8Array(3), final);
+                    }
+                };
+                let rejected = false;
+                try {
+                    await context.decompressDeflate(new Uint8Array(40), 5);
+                } catch (error) {
+                    if (!String(error.message).includes('5-byte archive limit')) {
+                        throw new Error(`unexpected decompression-bound error: ${error.message}`);
+                    }
+                    rejected = true;
+                }
+                if (!rejected) {
+                    throw new Error('streaming inflater accepted expansion past declared chunk_size');
+                }
+                if (cumulativePushes !== 2) {
+                    throw new Error(`expected cumulative bound to stop after two pushes, got ${cumulativePushes}`);
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn unencrypted_database_stream_enforces_exact_bound_and_zeroizes_chunks() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('async function readResponseBytesExact(');
+                const end = source.indexOf('\nfunction getUnencryptedPayloadPath()', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted response reader');
+                }
+                const code = `
+                    const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
+                    ${source.slice(start, end)}
+                `;
+                const context = { Uint8Array };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                function responseFrom(chunks, headers = {}) {
+                    let offset = 0;
+                    let cancellations = 0;
+                    return {
+                        response: {
+                            headers: {
+                                get(name) { return headers[name.toLowerCase()] ?? null; },
+                            },
+                            body: {
+                                getReader() {
+                                    return {
+                                        async read() {
+                                            if (offset >= chunks.length) return { done: true };
+                                            return { done: false, value: chunks[offset++] };
+                                        },
+                                        async cancel() { cancellations += 1; },
+                                    };
+                                },
+                            },
+                        },
+                        cancellationCount() { return cancellations; },
+                    };
+                }
+
+                const first = new Uint8Array([1, 2]);
+                const second = new Uint8Array([3, 4]);
+                const exact = responseFrom([first, second], { 'content-length': '4' });
+                const bytes = await context.readResponseBytesExact(
+                    exact.response,
+                    4,
+                    'fixture database'
+                );
+                if (Buffer.from(bytes).toString('hex') !== '01020304') {
+                    throw new Error(`exact stream was reconstructed incorrectly: ${bytes}`);
+                }
+                if (first.some(Boolean) || second.some(Boolean)) {
+                    throw new Error('source response chunks were not zeroized after copying');
+                }
+
+                const oversizedChunk = new Uint8Array([9, 8, 7]);
+                const oversized = responseFrom([oversizedChunk]);
+                let oversizedRejected = false;
+                try {
+                    await context.readResponseBytesExact(
+                        oversized.response,
+                        2,
+                        'fixture database'
+                    );
+                } catch (error) {
+                    oversizedRejected = String(error.message).includes('declared 2-byte size');
+                }
+                if (!oversizedRejected || oversized.cancellationCount() !== 1) {
+                    throw new Error('oversized response did not reject and cancel its stream');
+                }
+                if (oversizedChunk.some(Boolean)) {
+                    throw new Error('rejected oversized response chunk was not zeroized');
+                }
+
+                const truncated = responseFrom([new Uint8Array([1, 2])]);
+                let truncatedRejected = false;
+                try {
+                    await context.readResponseBytesExact(
+                        truncated.response,
+                        3,
+                        'fixture database'
+                    );
+                } catch (error) {
+                    truncatedRejected = String(error.message).includes('received 2, expected 3');
+                }
+                if (!truncatedRejected) {
+                    throw new Error('truncated response did not fail its exact-size check');
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn unencrypted_database_rejects_partial_http_responses() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('async function loadUnencryptedDatabase(');
+                const end = source.indexOf('\nfunction getUnencryptedPayloadSize()', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted database loader');
+                }
+                const code = `
+                    const activeAppInitToken = 1;
+                    const ARCHIVE_SCOPE_URL = new URL('https://example.test/archive/');
+                    function getUnencryptedPayloadPath() { return './payload/data.db'; }
+                    function getUnencryptedPayloadSize() { return 4; }
+                    ${source.slice(start, end)}
+                `;
+                const context = {
+                    URL,
+                    fetch: async () => ({ ok: true, status: 206 }),
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                let rejected = false;
+                try {
+                    await context.loadUnencryptedDatabase(1);
+                } catch (error) {
+                    rejected = String(error.message).includes('206');
+                }
+                if (!rejected) {
+                    throw new Error('partial 206 database response was accepted as a complete archive');
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn unencrypted_payload_path_rejects_url_decoding_aliases() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('function normalizeUnencryptedPayloadPath(');
+                const end = source.indexOf('\n/**\n * Handle lock button click', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted payload path normalizer');
+                }
+                const context = {};
+                vm.createContext(context);
+                vm.runInContext(source.slice(start, end), context);
+
+                if (context.normalizeUnencryptedPayloadPath('payload/data.db') !== './payload/data.db') {
+                    throw new Error('ordinary generated payload path was rejected');
+                }
+                for (const encodedPath of [
+                    'payload/data%20copy.db',
+                    'payload/%64ata.db',
+                    'payload/%2e%2e/secret.db',
+                    'payload/data.db%3fignored',
+                ]) {
+                    let rejected = false;
+                    try {
+                        context.normalizeUnencryptedPayloadPath(encodedPath);
+                    } catch (error) {
+                        rejected = String(error.message).includes('invalid characters');
+                    }
+                    if (!rejected) {
+                        throw new Error(`URL-decoding alias was accepted: ${encodedPath}`);
+                    }
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn crypto_worker_zeroizes_replaced_and_superseded_keys() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const code = fs.readFileSync('./src/pages_assets/crypto_worker.js', 'utf8');
+                const context = {
+                    console,
+                    atob: globalThis.atob,
+                    btoa: globalThis.btoa,
+                    self: {
+                        location: { href: 'https://example.test/archive/' },
+                        postMessage() {},
+                    },
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+                vm.runInContext(`
+                    const first = new Uint8Array(32).fill(0x11);
+                    const firstGeneration = beginUnlockAttempt();
+                    commitUnlockResult(firstGeneration, first, 1);
+                    beginUnlockAttempt();
+                    if (first.some(byte => byte !== 0)) {
+                        throw new Error('beginning a subsequent unlock did not zero the prior DEK');
+                    }
+
+                    const stale = new Uint8Array(32).fill(0x22);
+                    const staleGeneration = activeUnlockGeneration;
+                    beginUnlockAttempt();
+                    let staleRejected = false;
+                    try {
+                        commitUnlockResult(staleGeneration, stale, 2);
+                    } catch (error) {
+                        staleRejected = String(error.message).includes('superseded');
+                    }
+                    if (!staleRejected || stale.some(byte => byte !== 0)) {
+                        throw new Error('superseded unlock result was retained or not zeroized');
+                    }
+
+                    const latest = new Uint8Array(32).fill(0x33);
+                    commitUnlockResult(activeUnlockGeneration, latest, 3);
+                    clearKeys();
+                    if (latest.some(byte => byte !== 0)) {
+                        throw new Error('CLEAR_KEYS did not zero the current DEK');
+                    }
+                    const decryptGeneration = beginDecryptAttempt();
+                    clearKeys();
+                    let decryptSuperseded = false;
+                    try {
+                        ensureCurrentDecryptAttempt(decryptGeneration);
+                    } catch (error) {
+                        decryptSuperseded = String(error.message).includes('superseded');
+                    }
+                    if (!decryptSuperseded) {
+                        throw new Error('CLEAR_KEYS did not invalidate an in-flight database decrypt');
+                    }
+                `, context);
+            "#,
+        )
+    }
+
+    #[test]
+    fn pages_runtime_uses_pinned_official_vendor_apis() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let deserialize_call = database_js
+            .find("sqliteApi.capi.sqlite3_deserialize(")
+            .expect("official sqlite3_deserialize call");
+        let ownership_transfer = database_js
+            .find("sqliteOwnsBytes = true;")
+            .expect("deserialize ownership transfer");
+        let result_check = database_js
+            .find("candidateDb.checkRc(resultCode);")
+            .expect("SQLite result check");
+        assert!(deserialize_call < ownership_transfer && ownership_transfer < result_check);
+        assert!(
+            database_js.contains("SQLITE_DESERIALIZE_FREEONCLOSE")
+                && database_js.contains("SQLITE_DESERIALIZE_READONLY")
+                && database_js.contains("const SQLITE_DESERIALIZE_PADDING = 20;")
+                && database_js.contains("const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;")
+                && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xffffffff;")
+                && database_js.contains("checkedDatabaseAllocationSize(dbBytes.byteLength)")
+                && database_js
+                    .contains("Ownership of a valid Uint8Array transfers to this function")
+                && database_js.contains("dbBytes.fill(0);")
+                && !database_js.contains("new Uint8Array(dbBytes)")
+                && database_js.contains("wasmHeap.fill(")
+                && database_js.contains("wasmOffset + allocationSize")
+                && database_js.contains("if (wasmPtr && !sqliteOwnsBytes)")
+                && database_js.contains("./vendor/sqlite3.mjs")
+                && database_js.contains("stmt.finalize();")
+                && database_js.contains("stmt.get({})")
+                && database_js.contains("stmt.get(0)")
+                && database_js.contains("sqlite3.wasm.heap8u()")
+                && !database_js.contains("new sqlite3.oo1.OpfsDb")
+                && !database_js.contains("writeBytesToOPFS")
+                && database_js.contains("decrypted database bytes remain memory-only")
+                && !database_js.contains("stmt.free()")
+                && !database_js.contains("getAsObject()")
+        );
+
+        let worker_js = include_str!("../src/pages_assets/crypto_worker.js");
+        assert!(
+            worker_js.contains("self.loadArgon2WasmBinary = async () =>")
+                && worker_js.contains("./vendor/argon2.wasm")
+                && worker_js.contains("./vendor/argon2-wasm.js")
+                && worker_js.contains("./vendor/argon2.js")
+                && worker_js.contains("./vendor/fflate.js")
+                && !worker_js.contains("./vendor/fflate.min.js")
+                && !worker_js.contains("./vendor/sqlite3.js")
+                && !worker_js.contains("async function initDatabase(")
+                && !worker_js.contains("let config = null;")
+                && worker_js.contains("Recovery secret must contain at least 24 bytes")
+                && worker_js.contains("MAX_BROWSER_ARCHIVE_CHUNKS = 4096")
+                && worker_js.contains("cannot be read safely without streaming response support")
+                && worker_js.contains("return concatenateAndZeroChunks(chunks);")
+                && worker_js.contains("const generation = beginDecryptAttempt();")
+                && worker_js.contains("ensureCurrentDecryptAttempt(generation);")
+                && worker_js.contains("invalidateDecryptAttempts();")
+                && worker_js.contains("encryptedChunk?.fill(0);")
+                && worker_js.contains("passwordBytes.fill(0);")
+                && worker_js.contains("result.hash.fill(0);")
+                && !worker_js.contains("await response.arrayBuffer()")
+                && worker_js.matches("await writer.abort(error);").count() == 1
+        );
+
+        for unlock_function in ["handleUnlockPassword", "handleUnlockRecovery"] {
+            let signature = format!("async function {unlock_function}");
+            let function_body = worker_js
+                .split_once(signature.as_str())
+                .unwrap_or_else(|| panic!("missing {unlock_function}"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("unbounded {unlock_function}"))
+                .0;
+            let derive_offset = function_body
+                .find("const kek = await deriveKekFrom")
+                .unwrap_or_else(|| panic!("missing KEK derivation in {unlock_function}"));
+            let unwrap_try_offset = function_body
+                .find("let unwrappedDek = null;\n      try {")
+                .unwrap_or_else(|| panic!("missing unwrap-only catch in {unlock_function}"));
+            assert!(
+                derive_offset < unwrap_try_offset
+                    && function_body.contains("if (error?.name !== \"OperationError\")"),
+                "{unlock_function} must not relabel KDF/runtime failures as bad credentials"
+            );
+        }
+
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains("const expectedSize = getUnencryptedPayloadSize();")
+                && auth_js.contains("if (response.status !== 200) {")
+                && auth_js.contains("response.body.getReader()")
+                && auth_js.contains("bytes = new Uint8Array(expectedSize);")
+                && auth_js.contains("nextLength > expectedSize")
+                && auth_js.contains("if (totalLength !== expectedSize)")
+                && auth_js.contains("dbBytes.fill(0);")
+                && auth_js.contains("dbBytes?.fill(0);")
+                && !auth_js.contains("isOpfsEnabled")
+                && !auth_js.contains("opfsEnabled")
+                && !auth_js.contains("new Uint8Array(await response.arrayBuffer())"),
+            "unencrypted database loading must stream within its declared size and zero temporary plaintext bytes"
+        );
+
+        let attrs = include_str!("../.gitattributes");
+        assert!(attrs.contains("src/pages_assets/vendor/sqlite3.mjs whitespace=-trailing-space"));
+        assert!(attrs.contains(
+            "src/pages_assets/vendor/sqlite3-opfs-async-proxy.js whitespace=-trailing-space"
+        ));
+
+        let sw_js = include_str!("../src/pages_assets/sw.js");
+        for vendor_asset in EXPECTED_VENDOR_ASSETS {
+            assert!(
+                sw_js.contains(&format!("\"./{vendor_asset}\"")),
+                "service worker must cache {vendor_asset}"
+            );
+        }
+        assert!(sw_js.contains("Promise.all(STATIC_ASSETS.map((asset) => cache.add(asset)))"));
     }
 }

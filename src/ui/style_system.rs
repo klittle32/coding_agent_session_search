@@ -3522,6 +3522,7 @@ mod tests {
             "opencode",
             "pi_agent",
             "prime_agent",
+            "omp",
             "unknown_agent",
         ];
         for agent in agents {

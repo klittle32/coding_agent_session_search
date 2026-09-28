@@ -1,27 +1,18 @@
 //! Two-tier progressive search for session search (bd-3dcw, bd-2fu7e).
 //!
 //! This module implements a progressive search strategy that:
-//! 1. Returns instant results using a fast embedding model (in-process)
-//! 2. Refines rankings in the background using a quality model (daemon)
+//! 1. Returns initial results using a fast embedding model (in-process)
+//! 2. Independently retrieves quality candidates on the next iterator step
+//! 3. Fuses both ranked candidate sets, allowing quality to recover fast misses
 //!
 //! **Delegates to frankensearch**: The vector storage and search are backed by
 //! `frankensearch_index::TwoTierIndex` (file-backed FSVI). This module adds
 //! cass-specific layers: synchronous `Iterator`-based search, `DocumentId`
 //! enum, `message_id` for SQLite, and `DaemonClient` integration.
 //!
-//! # Architecture
-//!
-//! ```text
-//! User Query
-//!     │
-//!     ├──→ [Fast Embedder] ──→ Results in ~1ms (display immediately)
-//!     │       (in-process)
-//!     │
-//!     └──→ [Quality Daemon] ──→ Refined scores in ~130ms
-//!              (warm UDS)           │
-//!                                   ▼
-//!                           Smooth re-rank
-//! ```
+//! Quality scoring scans fixed-size batches and retains only its candidate
+//! budget. It is exact O(N) scoring work, not a wall-clock-bounded ANN search.
+//! This adapter does not enable the separate manifest-backed reader capability.
 //!
 //! # Usage
 //!
@@ -46,10 +37,10 @@
 //! }
 //! ```
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use half::f16;
@@ -58,9 +49,72 @@ use tracing::{debug, warn};
 use super::daemon_client::{DaemonClient, DaemonError};
 use super::embedder::Embedder;
 
+mod retrieval;
+
 // Frankensearch types for vector storage and search delegation.
 use frankensearch::TwoTierConfig as FsTwoTierConfig;
-use frankensearch::{TwoTierIndex as FsTwoTierIndex, VectorHit as FsVectorHit};
+use frankensearch::index::{
+    VECTOR_ANN_FAST_FILENAME, VECTOR_ANN_QUALITY_FILENAME, VECTOR_INDEX_FAST_FILENAME,
+    VECTOR_INDEX_QUALITY_FILENAME,
+};
+use frankensearch::{
+    SearchError as FsSearchError, TwoTierIndex as FsTwoTierIndex,
+    TwoTierIndexPaths as FsTwoTierIndexPaths, VectorHit as FsVectorHit,
+};
+
+const FSVI_REOPEN_MAX_RETRIES: usize = 7;
+const FSVI_REOPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
+const FSVI_REOPEN_MAX_BACKOFF: Duration = Duration::from_millis(64);
+
+fn fs_index_artifact_path(dir: &Path, filename: &str) -> PathBuf {
+    dir.join(filename)
+}
+
+fn is_transient_fsvi_reader_lock(error: &FsSearchError) -> bool {
+    matches!(
+        error,
+        FsSearchError::InvalidConfig { field, reason, .. }
+            if field == "fsvi.map_lock"
+                && reason.contains("shared reader")
+                && reason.contains("operation would block")
+    )
+}
+
+/// Strictly reopen both tiers after the builder has already published them.
+///
+/// Frankensearch's discovered-path open deliberately degrades an unavailable
+/// quality tier to fast-only. That is correct for serving an existing index,
+/// but not for this build path: every non-empty CASS build just wrote both
+/// tiers and reports `IndexStatus::Complete`. Explicit paths preserve that
+/// invariant and let us retry only the transient reader-lock handoff observed
+/// on remote/shared filesystems immediately after the publisher drops its
+/// exclusive mapping.
+fn open_complete_fs_index_with_retry(
+    dir: &Path,
+    config: &FsTwoTierConfig,
+) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
+    let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(dir, VECTOR_INDEX_FAST_FILENAME))
+        .with_quality_index(fs_index_artifact_path(dir, VECTOR_INDEX_QUALITY_FILENAME))
+        .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
+        .with_quality_ann(fs_index_artifact_path(dir, VECTOR_ANN_QUALITY_FILENAME));
+    let mut retries = 0;
+    let mut backoff = FSVI_REOPEN_INITIAL_BACKOFF;
+    let clone_config = || config.clone();
+
+    loop {
+        match FsTwoTierIndex::open_with_paths(&paths, clone_config()) {
+            Ok(index) => return Ok((index, retries)),
+            Err(error)
+                if retries < FSVI_REOPEN_MAX_RETRIES && is_transient_fsvi_reader_lock(&error) =>
+            {
+                std::thread::sleep(backoff);
+                retries += 1;
+                backoff = backoff.saturating_mul(2).min(FSVI_REOPEN_MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Configuration for two-tier search.
 #[derive(Debug, Clone)]
@@ -69,9 +123,11 @@ pub struct TwoTierConfig {
     pub fast_dimension: usize,
     /// Dimension for quality embeddings (default: 384).
     pub quality_dimension: usize,
-    /// Weight for quality scores when blending (default: 0.7).
+    /// Quality contribution to weighted reciprocal-rank fusion (default: 0.7).
     pub quality_weight: f32,
-    /// Maximum documents to refine via daemon (default: 100).
+    /// Maximum independently retrieved quality candidates retained for fusion
+    /// (default: 100). Zero disables refinement. Fast candidates retain at most
+    /// max(requested page size, this budget); the displayed page stays bounded.
     pub max_refinement_docs: usize,
     /// Whether to skip quality refinement entirely.
     pub fast_only: bool,
@@ -111,6 +167,7 @@ impl TwoTierConfig {
 
         if let Ok(val) = dotenvy::var("CASS_TWO_TIER_QUALITY_WEIGHT")
             && let Ok(weight) = val.parse::<f32>()
+            && weight.is_finite()
         {
             cfg.quality_weight = weight.clamp(0.0, 1.0);
         }
@@ -331,9 +388,51 @@ impl TwoTierIndex {
                 .map_err(|e| anyhow::anyhow!("failed to add record {doc_id_str}: {e}"))?;
         }
 
-        let fs_index = builder
-            .finish()
-            .map_err(|e| anyhow::anyhow!("failed to finish fs index: {e}"))?;
+        let fs_index = match builder.finish() {
+            Ok(index) if index.has_quality_index() => index,
+            Ok(index) => {
+                // `TwoTierIndex::open` treats a discovered quality tier as
+                // optional and can therefore return fast-only when the
+                // just-published quality file has a transient map-lock. A
+                // completed CASS build wrote quality vectors for every row,
+                // so accepting that degraded result would make our metadata
+                // lie. Drop its fast-tier reader before the strict reopen.
+                drop(index);
+                let (index, retries) = open_complete_fs_index_with_retry(
+                    tmpdir.path(),
+                    &fs_config,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "frankensearch finished without the required quality tier and the strict reopen failed: {error}"
+                    )
+                })?;
+                warn!(
+                    retries,
+                    "reopened a completed two-tier index after its initial quality-tier open degraded"
+                );
+                index
+            }
+            Err(error) if is_transient_fsvi_reader_lock(&error) => {
+                let finish_error = error.to_string();
+                let (index, retries) = open_complete_fs_index_with_retry(
+                    tmpdir.path(),
+                    &fs_config,
+                )
+                .map_err(|reopen_error| {
+                    anyhow::anyhow!(
+                        "failed to finish fs index ({finish_error}); strict reopen of the published tiers also failed: {reopen_error}"
+                    )
+                })?;
+                warn!(
+                    retries,
+                    finish_error = %finish_error,
+                    "reopened a completed two-tier index after a transient publication lock handoff"
+                );
+                index
+            }
+            Err(error) => return Err(anyhow::anyhow!("failed to finish fs index: {error}")),
+        };
 
         // frankensearch persists records sorted by doc_id hash/doc_id, so hit indices
         // are in fast-index order rather than cass insertion order. Rebuild our side
@@ -391,79 +490,34 @@ impl TwoTierIndex {
         self.message_ids.get(idx).copied()
     }
 
-    /// Search using fast embeddings only.
-    ///
-    /// Delegates to frankensearch's `TwoTierIndex::search_fast()`.
+    /// Fast-search convenience API. Use `try_search_fast` to distinguish an
+    /// unavailable/invalid index from a successful search with no matches.
     pub fn search_fast(&self, query_vec: &[f32], k: usize) -> Vec<ScoredResult> {
-        if self.is_empty() || k == 0 {
-            return Vec::new();
-        }
-
-        let Some(fs_index) = &self.fs_index else {
-            return Vec::new();
-        };
-
-        match fs_index.search_fast(query_vec, k) {
-            Ok(hits) => self.hits_to_scored_results(hits),
-            Err(e) => {
-                warn!(error = %e, "frankensearch fast search failed");
+        match self.try_search_fast(query_vec, k) {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(error = %error, "frankensearch fast search failed");
                 Vec::new()
             }
         }
     }
 
-    /// Search using quality embeddings only.
-    ///
-    /// Delegates to frankensearch's quality search via `search_fast` on the
-    /// quality index. Since frankensearch's `TwoTierIndex` stores both tiers,
-    /// we use `quality_scores_for_hits` with all documents as candidates.
+    /// Quality-search convenience API using bounded exact candidate collection.
+    /// Use `try_search_quality` for error-preserving retrieval.
     pub fn search_quality(&self, query_vec: &[f32], k: usize) -> Vec<ScoredResult> {
-        if self.is_empty() || k == 0 {
-            return Vec::new();
-        }
-
-        let Some(fs_index) = &self.fs_index else {
-            return Vec::new();
-        };
-
-        // Build candidate hits for all docs to get quality scores
-        let all_hits: Vec<FsVectorHit> = (0..self.metadata.doc_count)
-            .map(|i| FsVectorHit {
-                index: i as u32,
-                score: 0.0,
-                doc_id: self.doc_ids[i].encode().into(),
-            })
-            .collect();
-
-        match fs_index.quality_scores_for_hits(query_vec, &all_hits) {
-            Ok(scores) => {
-                // Build scored results and sort by score descending.
-                // Documents without quality-tier vectors (None) are skipped.
-                let mut results: Vec<ScoredResult> = scores
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, score)| {
-                        let s = (*score)?;
-                        let message_id = *self.message_ids.get(idx)?;
-                        Some(ScoredResult {
-                            idx,
-                            message_id,
-                            score: s,
-                        })
-                    })
-                    .collect();
-                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-                results.truncate(k);
-                results
-            }
-            Err(e) => {
-                warn!(error = %e, "frankensearch quality search failed");
+        match self.try_search_quality(query_vec, k) {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(error = %error, "frankensearch quality search failed");
                 Vec::new()
             }
         }
     }
 
     /// Get quality scores for a set of document indices.
+    ///
+    /// Legacy compatibility API: missing/invalid scores use zero placeholders.
+    /// Progressive retrieval instead uses the checked independent quality path.
     pub fn quality_scores_for_indices(&self, query_vec: &[f32], indices: &[usize]) -> Vec<f32> {
         let Some(fs_index) = &self.fs_index else {
             return vec![0.0; indices.len()];
@@ -525,7 +579,7 @@ pub struct ScoredResult {
     pub idx: usize,
     /// Message ID for SQLite lookup.
     pub message_id: u64,
-    /// Similarity score.
+    /// Similarity score, or weighted reciprocal-rank score in a refined phase.
     pub score: f32,
 }
 
@@ -537,7 +591,7 @@ pub enum SearchPhase {
         results: Vec<ScoredResult>,
         latency_ms: u64,
     },
-    /// Refined results from quality embeddings (if daemon available).
+    /// Fused independent fast/quality rankings (quality-only mode uses quality scores).
     Refined {
         results: Vec<ScoredResult>,
         latency_ms: u64,
@@ -574,16 +628,20 @@ impl<'a, D: DaemonClient> TwoTierSearcher<'a, D> {
     ///
     /// Returns an iterator that yields search phases:
     /// 1. Initial results from fast embeddings
-    /// 2. Refined results from quality embeddings (if daemon available)
+    /// 2. Fused independent quality results, or an explicit refinement failure
     pub fn search(&self, query: &str, k: usize) -> impl Iterator<Item = SearchPhase> + '_ {
         TwoTierSearchIter::new(self, query.to_string(), k)
     }
 
     /// Perform fast-only search (no daemon refinement).
     pub fn search_fast_only(&self, query: &str, k: usize) -> Result<Vec<ScoredResult>> {
+        self.index.validate_side_tables()?;
+        if k == 0 || self.index.is_empty() {
+            return Ok(Vec::new());
+        }
         let start = Instant::now();
         let query_vec = self.fast_embedder.embed_sync(query)?;
-        let results = self.index.search_fast(&query_vec, k);
+        let results = self.index.try_search_fast(&query_vec, k)?;
         debug!(
             query_len = query.len(),
             k = k,
@@ -600,6 +658,10 @@ impl<'a, D: DaemonClient> TwoTierSearcher<'a, D> {
         query: &str,
         k: usize,
     ) -> Result<Vec<ScoredResult>, TwoTierError> {
+        self.index.validate_side_tables()?;
+        if k == 0 || self.index.is_empty() {
+            return Ok(Vec::new());
+        }
         let start = Instant::now();
 
         let daemon = self
@@ -618,7 +680,7 @@ impl<'a, D: DaemonClient> TwoTierSearcher<'a, D> {
             .embed(query, &request_id)
             .map_err(TwoTierError::DaemonError)?;
 
-        let results = self.index.search_quality(&query_vec, k);
+        let results = self.index.try_search_quality(&query_vec, k)?;
         debug!(
             query_len = query.len(),
             k = k,
@@ -647,140 +709,6 @@ impl<'a, D: DaemonClient> TwoTierSearchIter<'a, D> {
             k,
             phase: 0,
             fast_results: None,
-        }
-    }
-}
-
-impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
-    type Item = SearchPhase;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.phase {
-            0 => {
-                if self.searcher.config.quality_only {
-                    self.phase = 2;
-                    let start = Instant::now();
-                    return match self.searcher.search_quality_only(&self.query, self.k) {
-                        Ok(results) => Some(SearchPhase::Refined {
-                            results,
-                            latency_ms: start.elapsed().as_millis() as u64,
-                        }),
-                        Err(e) => Some(SearchPhase::RefinementFailed {
-                            error: e.to_string(),
-                        }),
-                    };
-                }
-
-                // Phase 1: Fast search
-                self.phase = 1;
-                let start = Instant::now();
-
-                match self.searcher.fast_embedder.embed_sync(&self.query) {
-                    Ok(query_vec) => {
-                        let results = self.searcher.index.search_fast(&query_vec, self.k);
-                        let latency_ms = start.elapsed().as_millis() as u64;
-                        self.fast_results = Some(results.clone());
-
-                        if self.searcher.config.fast_only {
-                            self.phase = 2;
-                        }
-
-                        Some(SearchPhase::Initial {
-                            results,
-                            latency_ms,
-                        })
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Fast embedding failed");
-                        self.phase = 2;
-                        Some(SearchPhase::RefinementFailed {
-                            error: format!("fast embedding failed: {e}"),
-                        })
-                    }
-                }
-            }
-            1 => {
-                // Phase 2: Quality refinement
-                self.phase = 2;
-
-                let daemon = match &self.searcher.daemon {
-                    Some(d) if d.is_available() => d,
-                    _ => {
-                        return Some(SearchPhase::RefinementFailed {
-                            error: "daemon unavailable".to_string(),
-                        });
-                    }
-                };
-
-                let start = Instant::now();
-                let request_id = format!("refine-{:016x}", rand::random::<u64>());
-
-                match daemon.embed(&self.query, &request_id) {
-                    Ok(query_vec) => {
-                        let results = if let Some(fast_results) = self.fast_results.as_ref() {
-                            let refine_cap = self.searcher.config.max_refinement_docs;
-                            let candidates: Vec<usize> = fast_results
-                                .iter()
-                                .take(refine_cap)
-                                .map(|sr| sr.idx)
-                                .collect();
-                            if candidates.is_empty() {
-                                fast_results.clone()
-                            } else {
-                                let quality_scores = self
-                                    .searcher
-                                    .index
-                                    .quality_scores_for_indices(&query_vec, &candidates);
-
-                                let weight = self.searcher.config.quality_weight;
-                                let fast_scores: Vec<f32> =
-                                    fast_results.iter().map(|sr| sr.score).collect();
-                                let fast_norm = normalize_scores(&fast_scores);
-                                let quality_norm = normalize_scores(&quality_scores);
-
-                                let mut blended: Vec<ScoredResult> =
-                                    Vec::with_capacity(fast_results.len());
-                                for (idx, fast) in fast_results.iter().enumerate() {
-                                    let fast_s = fast_norm.get(idx).copied().unwrap_or(0.0);
-                                    let score = if idx < quality_norm.len() {
-                                        let quality_s =
-                                            quality_norm.get(idx).copied().unwrap_or(0.0);
-                                        (1.0 - weight) * fast_s + weight * quality_s
-                                    } else {
-                                        // Unrefined documents get a penalized score that assumes 0.0 for quality
-                                        // to preserve their original ranking but place them appropriately below
-                                        // high-quality refined items.
-                                        fast_s * (1.0 - weight)
-                                    };
-                                    blended.push(ScoredResult {
-                                        idx: fast.idx,
-                                        message_id: fast.message_id,
-                                        score,
-                                    });
-                                }
-
-                                blended.sort_by(|a, b| {
-                                    b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal)
-                                });
-                                blended.truncate(self.k);
-                                blended
-                            }
-                        } else {
-                            self.searcher.index.search_quality(&query_vec, self.k)
-                        };
-
-                        let latency_ms = start.elapsed().as_millis() as u64;
-                        Some(SearchPhase::Refined {
-                            results,
-                            latency_ms,
-                        })
-                    }
-                    Err(e) => Some(SearchPhase::RefinementFailed {
-                        error: e.to_string(),
-                    }),
-                }
-            }
-            _ => None,
         }
     }
 }
@@ -984,6 +912,83 @@ mod tests {
             index.metadata.status,
             IndexStatus::Complete { .. }
         ));
+    }
+
+    #[test]
+    fn completed_index_reopen_retries_a_transient_writer_lock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let fast_path = fs_index_artifact_path(dir.path(), VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = fs_index_artifact_path(dir.path(), VECTOR_INDEX_QUALITY_FILENAME);
+
+        let mut fast_writer = frankensearch::VectorIndex::create(&fast_path, "fast", 2)?;
+        fast_writer.write_record("s:session-0", &[1.0, 0.0])?;
+        fast_writer.finish()?;
+
+        let mut quality_writer = frankensearch::VectorIndex::create(&quality_path, "quality", 2)?;
+        quality_writer.write_record("s:session-0", &[1.0, 0.0])?;
+        quality_writer.finish()?;
+
+        let live_writer = frankensearch::VectorIndex::open_writer(&fast_path)?;
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let release_start = Arc::clone(&start);
+        let releaser = std::thread::spawn(move || {
+            release_start.wait();
+            std::thread::sleep(Duration::from_millis(20));
+            drop(live_writer);
+        });
+        start.wait();
+
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let (index, retries) =
+            open_complete_fs_index_with_retry(dir.path(), &config.to_fs_config())?;
+        releaser
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer-release thread panicked"))?;
+
+        anyhow::ensure!(
+            retries > 0,
+            "the live writer should force at least one retry"
+        );
+        anyhow::ensure!(index.has_quality_index(), "quality tier must be present");
+        anyhow::ensure!(index.doc_count() == 1, "reopened index lost its document");
+        Ok(())
+    }
+
+    #[test]
+    fn transient_reader_lock_classification_is_narrow() -> Result<()> {
+        let transient = FsSearchError::InvalidConfig {
+            field: "fsvi.map_lock".to_string(),
+            value: "/tmp/vector.fast.idx".to_string(),
+            reason: "cannot acquire shared reader lock: operation would block".to_string(),
+        };
+        let live_reader = FsSearchError::InvalidConfig {
+            field: "fsvi.map_lock".to_string(),
+            value: "/tmp/vector.fast.idx".to_string(),
+            reason: "cannot acquire exclusive writer lock: operation would block".to_string(),
+        };
+        let malformed = FsSearchError::InvalidConfig {
+            field: "fsvi.header".to_string(),
+            value: "bad".to_string(),
+            reason: "operation would block".to_string(),
+        };
+
+        anyhow::ensure!(
+            is_transient_fsvi_reader_lock(&transient),
+            "shared-reader contention must be retryable"
+        );
+        anyhow::ensure!(
+            !is_transient_fsvi_reader_lock(&live_reader),
+            "exclusive-writer contention must not be retried"
+        );
+        anyhow::ensure!(
+            !is_transient_fsvi_reader_lock(&malformed),
+            "non-lock configuration failures must not be retried"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1322,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_refinement_scores_are_normalized() {
+    fn test_refinement_scores_are_normalized() -> Result<()> {
         let config = TwoTierConfig {
             fast_dimension: 8,
             quality_dimension: 8,
@@ -1338,7 +1343,7 @@ mod tests {
                 quality_embedding: vec![f16::from_f32(10.0 + i as f32); config.quality_dimension],
             })
             .collect();
-        let index = TwoTierIndex::build("fast-8", "quality-8", &config, entries).unwrap();
+        let index = TwoTierIndex::build("fast-8", "quality-8", &config, entries)?;
 
         let fast_embedder: Arc<dyn Embedder> = Arc::new(ConstantEmbedder {
             dim: config.fast_dimension,
@@ -1351,14 +1356,15 @@ mod tests {
         let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(daemon), config);
         let phases: Vec<SearchPhase> = searcher.search("query", 5).collect();
 
-        assert_eq!(phases.len(), 2);
-        let SearchPhase::Refined { results, .. } = &phases[1] else {
-            panic!("expected refined phase");
+        anyhow::ensure!(phases.len() == 2, "expected initial and refined phases");
+        let Some(SearchPhase::Refined { results, .. }) = phases.get(1) else {
+            anyhow::bail!("expected refined phase");
         };
-        assert!(
+        anyhow::ensure!(
             results.iter().all(|r| (0.0..=1.0).contains(&r.score)),
             "expected normalized refined scores, got {:?}",
             results.iter().map(|r| r.score).collect::<Vec<_>>()
         );
+        Ok(())
     }
 }

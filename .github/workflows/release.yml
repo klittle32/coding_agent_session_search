@@ -16,6 +16,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  LINUX_GLIBC_VERSION: "2.28"
+  # A manual dispatch names the immutable tag to build. Every checkout below
+  # must use that tag rather than the branch from which the dispatch was
+  # launched, or the release could publish branch bytes under an older tag.
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -60,14 +65,12 @@ jobs:
           # runtime-dispatched SIMD, so there is no AVX2 static-init hazard
           # and no separate `-baseline` artifact anymore (cass#256 is moot;
           # see bead coding_agent_session_search-tg5o9).
-          # Linux x86_64 - ubuntu-24.04 (glibc 2.39): CI builds target the
-          # newer kernel/glibc features used by the frankensqlite storage
-          # engine, so 22.04-era glibc is not supported for prebuilt binaries.
+          # Zig pins the Linux ABI to glibc 2.28 independently of runner glibc.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64 - same glibc constraint as x86_64.
+          # Linux ARM64 - same pinned glibc floor as x86_64.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
@@ -91,30 +94,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        shell: bash
-        run: |
-          # Path dependencies reference sibling directories (../repo).
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
@@ -154,8 +140,52 @@ jobs:
           brew install openssl@3
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
+      - name: Install pinned Linux cross toolchain
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) ZIG_ARCH=x86_64; ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c ;;
+            aarch64) ZIG_ARCH=aarch64; ZIG_SHA256=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b ;;
+            *) echo 'Unsupported Zig host architecture' >&2; exit 1 ;;
+          esac
+          ZIG_DIR="$(mktemp -d "$RUNNER_TEMP/cass-zig.XXXXXX")"
+          curl --fail --location --retry 3 "https://ziglang.org/download/0.14.1/zig-${ZIG_ARCH}-linux-0.14.1.tar.xz" -o "$ZIG_DIR/zig.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$ZIG_DIR/zig.tar.xz" | sha256sum --check --strict
+          tar -xJf "$ZIG_DIR/zig.tar.xz" -C "$ZIG_DIR"
+          echo "$ZIG_DIR/zig-${ZIG_ARCH}-linux-0.14.1" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Build Linux release at the installer ABI floor
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset CARGO_ENCODED_RUSTFLAGS CC CXX AR
+          unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+          unset CC_x86_64_unknown_linux_gnu CXX_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
+          unset CC_aarch64_unknown_linux_gnu CXX_aarch64_unknown_linux_gnu AR_aarch64_unknown_linux_gnu
+          # Override the repository's native -fuse-ld=lld; Zig owns the linker.
+          export RUSTFLAGS='-Z threads=4'
+          test "$(zig version)" = 0.14.1
+          test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
+          cargo zigbuild --locked --release --target "${{ matrix.target }}.${LINUX_GLIBC_VERSION}" --bin cass
+
+      - name: Verify Linux glibc requirement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          MAX_GLIBC="$(objdump -p "$BINARY" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
+          test -n "$MAX_GLIBC"
+          test "$(printf '%s\n' "${MAX_GLIBC#GLIBC_}" "$LINUX_GLIBC_VERSION" | sort -V | tail -1)" = "$LINUX_GLIBC_VERSION"
+          echo "Required glibc: $MAX_GLIBC; supported floor: $LINUX_GLIBC_VERSION"
+
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        if: runner.os != 'Linux'
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Smoke-test release binary (Unix)
         if: runner.os != 'Windows'
@@ -165,6 +195,10 @@ jobs:
           BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           "$BINARY" --version
           API_VERSION="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
+          if [[ "${API_VERSION}" != "1" ]]; then
+            echo "::error::Expected api_version 1 but got ${API_VERSION}"
+            exit 1
+          fi
           echo "api_version: ${API_VERSION}"
 
       - name: Smoke-test release binary (Windows)
@@ -174,6 +208,12 @@ jobs:
           $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           & $binary --version
           if ($LASTEXITCODE -ne 0) { throw "cass.exe --version failed: exit $LASTEXITCODE" }
+          $apiVersionJson = & $binary api-version --json
+          if ($LASTEXITCODE -ne 0) { throw "cass.exe api-version failed: exit $LASTEXITCODE" }
+          $apiVersion = $apiVersionJson | ConvertFrom-Json
+          if ($apiVersion.api_version -ne 1) {
+            throw "Expected api_version 1 but got $($apiVersion.api_version)"
+          }
 
       - name: Verify binary architecture (Unix)
         if: runner.os != 'Windows'
@@ -288,25 +328,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        shell: bash
-        run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -317,14 +340,26 @@ jobs:
       - name: Extract version from tag
         id: version
         shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           else
-            RAW_TAG="${{ inputs.tag }}"
+            RAW_TAG="${DISPATCH_TAG}"
           fi
           if [[ -z "${RAW_TAG}" ]]; then
             echo "Tag is required."
+            exit 1
+          fi
+          if [[ ! "${RAW_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must be a v-prefixed semantic version (for example, v0.7.0)."
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "${RAW_TAG}^{commit}")"
+          CHECKED_OUT_COMMIT="$(git rev-parse HEAD)"
+          if [[ "${CHECKED_OUT_COMMIT}" != "${TAG_COMMIT}" ]]; then
+            echo "Checked-out commit (${CHECKED_OUT_COMMIT}) does not match ${RAW_TAG} (${TAG_COMMIT})."
             exit 1
           fi
           VERSION="${RAW_TAG#v}"
@@ -500,51 +535,22 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
       - name: Check crates.io publish readiness
         id: publish_readiness
         shell: bash
         run: |
-          # NOTE (v0.6.10, post-v0.6.9 yank investigation): the previous
-          # check used `cargo package --locked --no-verify`. In CI, after
-          # the "Clone sibling dependencies" step warms cargo's git
-          # source cache, `--locked` triggers a "cannot update the lock
-          # file" error against the still-committed Cargo.lock — even
-          # though the manifest is registry-ready when checked locally
-          # (verified: v0.6.9 was published manually with the same
-          # manifest after the CI skip).
-          #
-          # The root cause is a cargo cache/lockfile coherence quirk
-          # specific to the sibling-clone pattern. Drop `--locked` from
-          # the pre-flight so cargo can refresh its internal git-source
-          # registry coherence; the lockfile on disk is still committed
-          # and used by downstream consumers. The actual `cargo publish`
-          # step below also drops `--locked` for the same reason — the
-          # crates.io package upload is bit-for-bit deterministic from
-          # the published Cargo.toml + Cargo.lock regardless.
+          # Registry publication can lag the binary release while the
+          # git-sourced dependency chain is not publishable under its crate
+          # names. Probe the exact tagged checkout and skip this optional
+          # channel truthfully when Cargo cannot assemble a registry package.
           set +e
-          cargo package --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
+          cargo package --locked --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
           status=$?
           set -e
           if [[ "$status" -eq 0 ]]; then
@@ -557,13 +563,41 @@ jobs:
           echo "::warning::Skipping crates.io publish because the manifest is not registry-ready with the currently published dependency set."
           cat "$RUNNER_TEMP/cargo-package.log"
 
+      - name: Check whether this crate version is already published
+        id: registry_version
+        if: ${{ steps.publish_readiness.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          crate_http_code="$(curl -sS \
+            -A 'cass-release-workflow/1.0 (https://github.com/Dicklesworthstone/coding_agent_session_search)' \
+            -o "$RUNNER_TEMP/crates-version.json" \
+            -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/coding-agent-search/${PACKAGE_VERSION}")"
+          case "${crate_http_code}" in
+            200)
+              echo "already_published=true" >> "$GITHUB_OUTPUT"
+              echo "coding-agent-search ${PACKAGE_VERSION} is already on crates.io; publication is idempotently skipped."
+              ;;
+            404)
+              echo "already_published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io version probe returned HTTP ${crate_http_code}."
+              cat "$RUNNER_TEMP/crates-version.json" || true
+              exit 1
+              ;;
+          esac
+
       - name: Publish to crates.io
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
-        # Drop `--locked` for the same reason as the pre-flight check
-        # above. Lockfile coherence is enforced by the committed
-        # Cargo.lock; the upload is bit-deterministic from the package
-        # contents regardless of whether the publish step used --locked.
-        run: cargo publish --all-features
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' && steps.registry_version.outputs.already_published != 'true' }}
+        # Publish only the dependency graph proven by the tagged Cargo.lock.
+        run: cargo publish --locked --all-features
+
+      - name: Report existing crates.io version
+        if: ${{ steps.registry_version.outputs.already_published == 'true' }}
+        run: echo "coding-agent-search ${{ needs.release.outputs.version }} was already published; no registry mutation was needed."
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}

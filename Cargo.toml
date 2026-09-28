@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.6.26-letta-prime.1"
+version = "0.9.0-letta-prime.1"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -12,6 +12,8 @@ include = [
     "/Cargo.toml",
     "/Cargo.lock",
     "/build.rs",
+    "/CHANGELOG.md",
+    "/CHANGELOG_RESEARCH.md",
     "/LICENSE",
     "/README.md",
     "/src/**/*.rs",
@@ -19,11 +21,13 @@ include = [
 ]
 
 [dependencies]
+# Resident-memory supervision reuses the sysinfo version already in Cargo.lock.
+sysinfo = { version = "*", default-features = false, features = ["system"] }
 anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.5", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.5.0", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -32,8 +36,13 @@ console = "0.16.3"
 colored = "3.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
-toon = { version = "0.2.2", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "5669b72a", package = "tru" }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+# reqwest 0.13 ships rustls without a crypto provider under `rustls-no-provider`;
+# cass installs `ring` (see `ensure_rustls_crypto_provider`) instead of letting
+# the default `rustls` feature pull aws-lc-sys and its cmake build into every
+# release target. The platform verifier supplies the trust roots.
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+toon = { version = "=0.2.4", package = "tru" }
 tempfile = "3.27.0"
 wait-timeout = "0.2.1"
 rmp-serde = "1.3.1"  # MessagePack for binary metadata serialization (Opt 3.1)
@@ -43,25 +52,47 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.3.1 (crates.io): the 0.3.0 asupersync-0.4.3 runtime migration and
-# bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
+# The exact registry release below retains the fsqlite 0.3.13 and 0.3.0
+# asupersync-0.4.3 runtime migration
+# and bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
 # FileIdentity re-derivation after file replacement — the cass#393
 # st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
 # cross-connection visibility) plus the 0.3.1 correctness wave: allocator
 # post-savepoint page-aliasing quarantine, committed-freelist resurrection
 # refusal, shared concurrent-writer EOF high-water, sidecar-less read-only
-# first-contact opens (GH#140), Darwin OFD locking. The engine API is async
-# (!Send futures); CASS's synchronous call shape is preserved by
-# src/franken_sync.rs, which drives every engine future on a private
-# current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.4", package = "fsqlite", features = ["fts5"] }
+# first-contact opens (GH#140), Darwin OFD locking; and the 0.3.9 Windows
+# sidecar-less read-only close fix (GH#438), without which CASS cannot reopen
+# its canonical archive during indexing on Windows. Revisions 22af0753 and
+# 027f62f2 admit FTS5's semantically read-only `integrity-check` command through
+# both the physically read-only pager and `PRAGMA query_only` guards while
+# retaining `ReadOnly` for every mutating FTS maintenance command. That exact
+# behavior is required by CASS's pre-mutation full-rebuild integrity gate on
+# Windows. 0.3.13 adds the
+# autoindex-vanish corruption-writer fixes (the cass#434 writer class).
+# 0.3.16 (adopted 2026-09-04) adds the GH#382 appended-WAL-tail fix
+# (8d012706a — the per-page WAL rescan that looped the owner-archive
+# writable open, bead g3zyo), the GH#405 FTS5 savepoint undo log
+# (savepoints no longer clone the whole table per statement), and the
+# GH#406 content-backed INSERT persisted as an incremental segment append.
+# 0.3.17 adds incremental WAL-tail folding, reserved lock-byte/freelist
+# repair (GH#410), FTS metadata and foreign-write visibility fixes (GH#408),
+# and prepared-read schema-retry transaction cleanup. 0.3.18 adds parameterized
+# rowid IN-list seeks (GH#415/cass#382), mutation-free read-only WAL readers,
+# reader-registration error propagation and I/O buffer lifetime fixes.
+# 0.4.1 adds GH#462's reserved-page WAL freelist repair and consumes the
+# Asupersync 0.5 runtime. The 0.4.2 candidate adds explicit derived WAL-index
+# recovery for read-only opens (GH#477). The published 0.4.4 family adds
+# durable pending-freelist repairs; all family packages use 0.4.4 and
+# build.rs checks each resolved package exactly.
+frankensqlite = { version = "=0.4.4", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.4", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
 fs2 = "0.4.3"
+libc = "*"
 same-file = "1.0.6"
 lru = "0.18"
 rustc-hash = "2.1.2"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
@@ -70,12 +101,12 @@ itoa = "1.0.18"  # Zero-allocation integer-to-string for hot paths (bead w32k6)
 smallvec = "1.15.1"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "1.12.3"
 portable-pty = "0.9.0"
-# FrankenTUI migration foundation (bead 2noh9.2.1).
-# Strategy: pin a Git revision for reproducible CI builds.
-ftui = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
-ftui-runtime = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
-ftui-extras = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+# FrankenTUI migration foundation (bead 2noh9.2.1), exact-pinned to the
+# crates.io 0.5.0 release for reproducible CI builds.
+ftui = { version = "=0.5.0" }
+ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { version = "=0.5.0" }
+ftui-extras = { version = "=0.5.0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "6.0.0"
 walkdir = "2.5.0"
 glob = "0.3.3"
@@ -88,7 +119,6 @@ semver = "1.0.28"
 tracing-appender = "0.2.5"
 strsim = "0.11.1"
 once_cell = "1.21.4"
-syntect = "5.3.0"
 itertools = "0.15.0"
 crc32fast = "1.5.0"
 unicode-normalization = "0.1.25"
@@ -97,33 +127,36 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
 # Semantic embedding + reranking are PURE-RUST via frankensearch's `native`
-# feature: the frankentorch all-MiniLM-L6-v2 sentence embedder (NativeEmbedder)
-# + the ms-marco cross-encoder reranker (NativeReranker). The old
+# feature: the frankentorch all-MiniLM-L6-v2 baseline plus the explicit
+# multilingual MiniLM-L12 sentence embedder (NativeEmbedder), and the ms-marco
+# cross-encoder reranker (NativeReranker). The old
 # `fastembed`/ONNX-Runtime stack was removed (cass #308): ort 2.0.0-rc.12 could
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "46a3aefce1aa658fa98f27f0b3676f073160e15c", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "0.1.12-letta-prime.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "0b04f8a2251ec775ecc23578793172976de15516", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+# Coordinated release candidate: 0.6.1 targets the Asupersync 0.5 family and
+# the native scalar exponential repair. Upstream publication and CASS runtime
+# qualification must complete before this candidate can be released.
+frankensearch = { version = "=0.6.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+# Native OpenClaw transcripts and legacy VS Code Copilot sessions require SQLite.
+# Keep both readers unconditional, including --no-default-features builds.
+# Git pin: crates.io 0.3.2 plus Letta Code, frozen at the fork revision below.
+franken-agent-detection = { version = "=0.3.3-letta.1", git = "https://github.com/klittle32/franken_agent_detection", rev = "87ee4b59dd5470582b89ed3b094c29c0795ff077", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot", "openclaw-sqlite", "copilot-vscdb", "codebuff"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
-hnsw_rs = "0.3.4"  # Opt 9: Approximate Nearest Neighbor with HNSW
-ouroboros = "0.18.5"  # Safe self-referential wrapper for HNSW loader lifetime
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
-# The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
-# majors: aes-gcm 0.10 uses digest 0.10, which is what sha2 0.10 / hmac 0.12 /
-# hkdf 0.12 export. Leaving these as wildcards lets cargo upgrade hkdf + hmac
-# to 0.13 (digest 0.11), which fails to satisfy aes-gcm's KeyInit bound and
-# breaks the encryption.rs build with ~29 trait-bound errors.
-aes-gcm = "0.10"
+# The aes-gcm + digest + hkdf + sha2 family must stay on compatible majors.
+# aes-gcm 0.11, sha2 0.11, and hkdf 0.13 share digest 0.11; mixing either side
+# with the former digest 0.10 family breaks the encryption trait bounds.
+aes-gcm = "0.11"
 ring = "0.17.14"
 url = "2.5.8"
 pbkdf2 = "0.13.0"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
 
 # SHA256 hashing for model verification
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4.3"
 
 # Interactive terminal prompts for setup wizard
@@ -132,7 +165,7 @@ dialoguer = "0.12.0"
 # SFTP fallback for sync when rsync is unavailable
 ssh2 = "0.9.5"
 argon2 = "0.5.3"
-hkdf = "0.12"  # Must match hmac 0.12 / sha2 0.10 / aes-gcm 0.10 digest family; see comment above.
+hkdf = "0.13"  # Must match sha2 0.11 / aes-gcm 0.11 (digest 0.11 family); see comment above.
 zeroize = { version = "1.8.2", features = ["derive"] }
 flate2 = "1.1.9"
 rand = "0.10"
@@ -182,6 +215,7 @@ strict-path-dep-validation = []
 cass-layer-b-conformance = []
 
 [build-dependencies]
+blake3 = "1.8.5"
 vergen = { version = "10.0.0", default-features = false, features = ["build", "cargo"] }
 toml = "1.1.2"
 
@@ -191,23 +225,24 @@ predicates = "3.1.4"
 insta = { version = "1.47.2", features = ["yaml", "json"] }
 criterion = "0.8.2"
 once_cell = "1.21.4"
-serial_test = "3.4.0"
+serial_test = "4.0.1"
 proptest = "1.11.0"
 arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
+# GH470 measures native model input tokens without padding or silent truncation.
+# Reuse the tokenizer and regex backend already resolved by native MiniLM.
+tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
-rusqlite = { version = "0.39.0", features = ["bundled", "modern_sqlite"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.4", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.4", package = "fsqlite-types" }
 
-# The fsqlite family now resolves from crates.io (0.3.1) for every direct and
-# transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.3.1 fsqlite family in the
-# lockfile, no patch reintroduction) as the dependency source contract.
+# The fsqlite family resolves from exact reviewed registry versions for every
+# direct and transitive consumer. build.rs rejects duplicates and mixed sources.
 
 [[bin]]
 name = "cass"
@@ -266,9 +301,10 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.5). Keep
-# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
+# The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
+# the frankensqlite and frankensearch registry pins aligned with the
+# franken-agent-detection git revision so Cargo.lock does not reintroduce an
+# older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
@@ -276,7 +312,7 @@ strip = false
 # fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
 # fail if any [patch] block pointing at sibling paths is committed:
 #
-# [patch.crates-io]
+# Add these entries to the committed [patch.crates-io] table above:
 # asupersync = { path = "../asupersync" }
 # franken-decision = { path = "../asupersync/franken_decision" }
 # franken-evidence = { path = "../asupersync/franken_evidence" }
@@ -291,7 +327,7 @@ strip = false
 # specific directory layout. See build.rs for validation details.
 #
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
-# — if you re-enable any of these [patch] blocks, that workflow will fail.
+# — if you re-enable any of these sibling-path [patch] blocks, that workflow will fail.
 #
 # [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }

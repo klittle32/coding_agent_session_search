@@ -40,6 +40,82 @@ fn install_sh_command(tmp_root: &tempfile::TempDir) -> Command {
 }
 
 #[test]
+fn install_sh_rejects_unknown_options() {
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--quiet")
+        .arg("--verison")
+        .arg("vtest")
+        .output()
+        .expect("run install.sh with a misspelled option");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown option: --verison"),
+        "installer should identify the invalid option, got: {stderr}"
+    );
+}
+
+#[test]
+fn install_sh_rejects_options_with_missing_values() {
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--version")
+        .arg("--quiet")
+        .output()
+        .expect("run install.sh with a missing option value");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--version requires a value"),
+        "installer should explain the missing value, got: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn install_sh_does_not_fallback_from_an_explicit_artifact_url() {
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .env("HOME", home.path())
+        .env(
+            "ARTIFACT_URL",
+            format!("file://{}/missing.tar.gz", tmp_root.path().display()),
+        )
+        .output()
+        .expect("run install.sh with a missing explicit artifact");
+
+    assert!(
+        !output.status.success(),
+        "an unavailable explicit artifact must fail the install"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Could not download explicitly requested artifact"),
+        "installer should identify the explicit artifact failure, got: {combined}"
+    );
+    assert!(
+        !combined.contains("Building from source"),
+        "installer must not substitute a source build for an explicit artifact"
+    );
+    assert!(!dest.path().join("cass").exists());
+}
+
+#[test]
 fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
     // cass#308 / bead tg5o9: the ONNX runtime is gone, so the installer must
     // never select a `-baseline` asset (they are not published anymore) and
@@ -71,6 +147,355 @@ fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
     Ok(())
 }
 
+/// The installer's glibc probe functions, extracted verbatim so they run under
+/// the same `set -euo pipefail` the installer uses.
+#[cfg(unix)]
+fn install_sh_glibc_probe_functions() -> String {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+    let mut out = String::new();
+    for name in ["last_major_minor_in_line", "host_glibc_version"] {
+        let header = format!("{name}() {{\n");
+        let start = script
+            .find(&header)
+            .unwrap_or_else(|| panic!("install.sh must define {name}()"));
+        let end = script[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset + "\n}\n".len())
+            .expect("function body must end with a bare closing brace");
+        out.push_str(&script[start..end]);
+    }
+    out
+}
+
+/// Run `host_glibc_version` under `set -euo pipefail` with `dir` first on PATH,
+/// returning `(exit_code, stdout)`.
+#[cfg(unix)]
+fn run_host_glibc_version(dir: &std::path::Path, iterations: usize) -> (i32, String) {
+    let functions = install_sh_glibc_probe_functions();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let script = format!(
+        "set -euo pipefail\n{functions}\nfor _ in $(seq 1 {iterations}); do\n  HOST=$(host_glibc_version)\n  printf '%s\\n' \"$HOST\"\ndone\n"
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", path)
+        .output()
+        .expect("run host_glibc_version");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn install_sh_glibc_probe_is_deterministic_under_pipefail() {
+    // GH #444: glibc's `ldd --version` prints its banner with several separate
+    // writes. The old `ldd | head -n 1 | ...` pipeline let `head` exit after
+    // the first line, `ldd` then died of SIGPIPE (141), and `set -o pipefail`
+    // turned that race into an installer failure. This fake ldd makes the race
+    // deterministic by pausing between writes; 40 runs must all succeed.
+    let bin = tempfile::TempDir::new().expect("fake bin dir");
+    make_executable_script(
+        &bin.path().join("ldd"),
+        "#!/usr/bin/env bash\n\
+         for line in 'ldd (Ubuntu GLIBC 2.39-0ubuntu8.4) 2.39' 'Copyright (C) 2024 Free Software Foundation, Inc.' 'This is free software; see the source for copying conditions.  There is NO' 'warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.' 'Written by Roland McGrath and Ulrich Drepper.'; do\n  printf '%s\\n' \"$line\" || exit 141\n  sleep 0.01\ndone\n",
+    );
+    let (code, stdout) = run_host_glibc_version(bin.path(), 40);
+    assert_eq!(
+        code, 0,
+        "glibc probe must never fail under pipefail: {stdout}"
+    );
+    let versions: Vec<&str> = stdout.lines().collect();
+    assert_eq!(versions.len(), 40, "one version per run: {stdout}");
+    assert!(
+        versions.iter().all(|version| *version == "2.39"),
+        "every run must parse the banner's trailing major.minor: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn install_sh_glibc_probe_yields_nothing_on_musl_and_falls_back_to_getconf() {
+    // musl's ldd prints usage to stderr and exits non-zero: the probe must
+    // print nothing and NOT fail the installer (the caller then skips the
+    // glibc floor check). When ldd is unusable but getconf knows the glibc
+    // version, that answer is used instead.
+    let musl = tempfile::TempDir::new().expect("fake musl bin dir");
+    make_executable_script(
+        &musl.path().join("ldd"),
+        "#!/usr/bin/env bash\nprintf 'musl libc (x86_64)\\nVersion 1.2.5\\nUsage: ldd [options] [--] pathname\\n' >&2\nexit 1\n",
+    );
+    // Shadow any real getconf so the musl case cannot borrow the host's glibc.
+    make_executable_script(
+        &musl.path().join("getconf"),
+        "#!/usr/bin/env bash\nexit 1\n",
+    );
+    let (code, stdout) = run_host_glibc_version(musl.path(), 3);
+    assert_eq!(code, 0, "musl-style ldd must not fail the probe: {stdout}");
+    assert_eq!(
+        stdout, "\n\n\n",
+        "musl-style ldd must yield an empty version"
+    );
+
+    let getconf = tempfile::TempDir::new().expect("fake getconf bin dir");
+    make_executable_script(
+        &getconf.path().join("ldd"),
+        "#!/usr/bin/env bash\necho 'ldd: unrecognized option' >&2\nexit 1\n",
+    );
+    make_executable_script(
+        &getconf.path().join("getconf"),
+        "#!/usr/bin/env bash\n[ \"$1\" = GNU_LIBC_VERSION ] && { echo 'glibc 2.31'; exit 0; }\nexit 1\n",
+    );
+    let (code, stdout) = run_host_glibc_version(getconf.path(), 2);
+    assert_eq!(code, 0, "getconf fallback must succeed: {stdout}");
+    assert_eq!(stdout, "2.31\n2.31\n");
+}
+
+#[test]
+fn source_installer_uses_the_checkout_pinned_toolchain() {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+
+    for required in [
+        "ensure_rust \"$TMP/src\"",
+        "rustup show active-toolchain",
+        "rustup toolchain install",
+        "--default-toolchain none",
+    ] {
+        assert!(
+            script.contains(required),
+            "source installer is missing pinned-toolchain behavior: {required}"
+        );
+    }
+
+    let clone_offset = script
+        .find("git clone --depth 1 --branch")
+        .expect("source installer must clone the requested release");
+    let bootstrap_offset = script
+        .find("ensure_rust \"$TMP/src\"")
+        .expect("source installer must bootstrap the checkout toolchain");
+    assert!(
+        clone_offset < bootstrap_offset,
+        "the checkout must exist before rustup reads rust-toolchain.toml"
+    );
+    assert!(
+        !script.contains("--default-toolchain stable"),
+        "source bootstrap must not download an unrelated stable toolchain"
+    );
+}
+
+#[test]
+fn install_sh_keeps_tmp_root_warnings_out_of_command_substitution() {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+    assert!(
+        script.contains(
+            "warn() { [ \"$QUIET\" -eq 1 ] && return 0; echo -e \"\\033[1;33m⚠\\033[0m $*\" >&2; }"
+        ),
+        "installer warnings must go to stderr"
+    );
+    assert!(
+        script.contains("TMP_ROOT=\"$(resolve_tmp_root)\""),
+        "test must remain coupled to the command-substitution risk"
+    );
+    assert!(
+        script.contains(
+            "warn \"Ignoring TMPDIR=${TMPDIR} because it is not an accessible directory\""
+        ),
+        "test must remain coupled to the invalid-TMPDIR warning path"
+    );
+}
+
+#[test]
+fn install_ps1_derives_sibling_urls_without_host_path_semantics() {
+    let script = fs::read_to_string("install.ps1").expect("read install.ps1");
+    assert!(
+        !script.contains("[System.IO.Path]::GetDirectoryName($path.TrimEnd('/'))"),
+        "URI directory derivation must not depend on Windows filesystem separators"
+    );
+    for required in [
+        "$trimmedPath = $path.TrimEnd('/')",
+        "$lastSlash = $trimmedPath.LastIndexOf('/')",
+        "$trimmedPath.Substring(0, $lastSlash) + \"/$SiblingName\"",
+    ] {
+        assert!(
+            script.contains(required),
+            "PowerShell sibling URL derivation is missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_pins_linux_glibc_to_installer_floor() {
+    let workflow: serde_yaml::Value = must(
+        serde_yaml::from_str(include_str!("../.github/workflows/release.yml")),
+        "parse release workflow",
+    );
+    let floor = workflow["env"]["LINUX_GLIBC_VERSION"]
+        .as_str()
+        .expect("explicit Linux ABI floor");
+    assert_eq!(floor, "2.28", "preserve the measured v0.8.0 ABI contract");
+    assert!(
+        include_str!("../install.sh")
+            .lines()
+            .any(|line| line == format!("MIN_GLIBC=\"{floor}\"")),
+        "installer admission must agree with the release ABI floor"
+    );
+    let matrix = workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("release platform matrix");
+    for (os, target) in [
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
+        ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+    ] {
+        assert!(
+            matrix.iter().any(|entry| {
+                entry["os"].as_str() == Some(os) && entry["target"].as_str() == Some(target)
+            }),
+            "retain plain target {target} for packaging and native smoke tests"
+        );
+    }
+    let steps = workflow["jobs"]["build"]["steps"]
+        .as_sequence()
+        .expect("release build steps");
+    let step = |name: &str| {
+        steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing release step: {name}"))
+    };
+    let linux = step("Build Linux release at the installer ABI floor");
+    let rust_toolchain: toml::Value = must(
+        toml::from_str(include_str!("../rust-toolchain.toml")),
+        "parse repository Rust toolchain",
+    );
+    assert_eq!(
+        step("Install repository Rust toolchain")["with"]["toolchain"].as_str(),
+        rust_toolchain["toolchain"]["channel"].as_str(),
+        "release must install the repository nightly for -Z threads"
+    );
+    assert_eq!(linux["if"].as_str(), Some("runner.os == 'Linux'"));
+    let build = linux["run"].as_str().expect("Linux build command");
+    for required in [
+        "cargo zigbuild --locked --release --target \"${{ matrix.target }}.${LINUX_GLIBC_VERSION}\" --bin cass",
+        "unset CARGO_ENCODED_RUSTFLAGS CC CXX AR",
+        "export RUSTFLAGS='-Z threads=4'",
+        "test \"$(zig version)\" = 0.14.1",
+        "test \"$(cargo-zigbuild --version)\" = 'cargo-zigbuild 0.23.0'",
+    ] {
+        assert!(build.contains(required), "missing Linux guard: {required}");
+    }
+    assert_eq!(
+        step("Build release")["if"].as_str(),
+        Some("runner.os != 'Linux'"),
+        "a subsequent native build must not overwrite the Zig artifact"
+    );
+    let setup = step("Install pinned Linux cross toolchain");
+    assert_eq!(setup["if"].as_str(), Some("runner.os == 'Linux'"));
+    let setup = setup["run"].as_str().expect("pinned toolchain setup");
+    assert!(setup.contains("cargo install cargo-zigbuild --version 0.23.0 --locked"));
+    assert!(setup.contains("https://ziglang.org/download/0.14.1/"));
+    assert!(setup.contains("sha256sum --check --strict"));
+    let verification = step("Verify Linux glibc requirement");
+    assert_eq!(verification["if"].as_str(), Some("runner.os == 'Linux'"));
+    let verification = verification["run"].as_str().expect("ELF verification");
+    assert!(verification.contains("objdump -p \"$BINARY\""));
+    assert!(
+        verification.contains("target/${{ matrix.target }}/release/${{ matrix.artifact_name }}")
+    );
+
+    // Execute the actual ceiling guard with measured-symbol inputs. Version
+    // ordering must be numeric, and missing metadata must fail closed.
+    #[cfg(target_os = "linux")]
+    {
+        let guard_start = verification
+            .find("test -n \"$MAX_GLIBC\"")
+            .expect("nonempty ABI guard");
+        let guard = &verification[guard_start..];
+        for (version, accepted) in [
+            ("GLIBC_2.9", true),
+            ("GLIBC_2.27", true),
+            ("GLIBC_2.28", true),
+            ("GLIBC_2.29", false),
+            ("GLIBC_2.39", false),
+            ("GLIBC_2.43", false),
+            ("", false),
+        ] {
+            let output = must(
+                Command::new("bash")
+                    .args(["-euc", guard])
+                    .env("MAX_GLIBC", version)
+                    .env("LINUX_GLIBC_VERSION", floor)
+                    .output(),
+                "run release ABI ceiling guard",
+            );
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "ABI input {version:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(), String> {
+    let workflow =
+        fs::read_to_string(".github/workflows/release.yml").map_err(|err| err.to_string())?;
+
+    let exact_ref_checkouts = workflow.matches("ref: ${{ env.RELEASE_REF }}").count();
+    if exact_ref_checkouts != 3 {
+        return Err(format!(
+            "build, release, and crates publish must all checkout RELEASE_REF; found {exact_ref_checkouts} exact-ref checkouts"
+        ));
+    }
+    for required in [
+        "RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}",
+        "DISPATCH_TAG: ${{ inputs.tag }}",
+        "git rev-parse --verify \"${RAW_TAG}^{commit}\"",
+        "Checked-out commit (${CHECKED_OUT_COMMIT}) does not match ${RAW_TAG} (${TAG_COMMIT}).",
+    ] {
+        if !workflow.contains(required) {
+            return Err(format!(
+                "release workflow is missing exact-tag integrity guard: {required}"
+            ));
+        }
+    }
+    if workflow.contains("Clone sibling dependencies") {
+        return Err(
+            "release workflow must not clone unused sibling repositories before Cargo builds"
+                .to_string(),
+        );
+    }
+    if !workflow.contains("cargo build --locked --release --target ${{ matrix.target }}") {
+        return Err("release binaries must be built from the tagged Cargo.lock".to_string());
+    }
+    for required in [
+        "if [[ \"${API_VERSION}\" != \"1\" ]]",
+        "$apiVersionJson = & $binary api-version --json",
+        "if ($apiVersion.api_version -ne 1)",
+        "id: registry_version",
+        "already_published=true",
+        "steps.registry_version.outputs.already_published != 'true'",
+    ] {
+        if !workflow.contains(required) {
+            return Err(format!(
+                "release binaries must prove the pinned robot API contract: {required}"
+            ));
+        }
+    }
+    if workflow.contains("dtolnay/rust-toolchain@stable") {
+        return Err("release workflow actions must be immutable-SHA pinned".to_string());
+    }
+
+    Ok(())
+}
+
 fn file_sha256_hex(path: &std::path::Path) -> String {
     let mut file = fs::File::open(path).expect("open file for sha256");
     let mut hasher = Sha256::new();
@@ -84,7 +509,7 @@ fn file_sha256_hex(path: &std::path::Path) -> String {
         hasher.update(&buffer[..read]);
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(unix)]
@@ -99,6 +524,109 @@ fn make_executable_script(path: &std::path::Path, body: &str) {
 #[cfg(not(unix))]
 fn make_executable_script(path: &std::path::Path, body: &str) {
     drop(fs::write(path, body));
+}
+
+#[test]
+#[serial]
+#[cfg(unix)]
+fn source_install_bootstraps_the_toolchain_after_clone() {
+    let harness = tempfile::TempDir::new().expect("source-install harness");
+    let fake_bin = harness.path().join("bin");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let event_log = harness.path().join("events.log");
+    let home = isolated_home();
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let tmp_root = isolated_install_tmp_root();
+
+    make_executable_script(
+        &fake_bin.join("git"),
+        r#"#!/bin/sh
+set -eu
+checkout=""
+for argument in "$@"; do checkout="$argument"; done
+printf 'git|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+mkdir -p "$checkout/target/release"
+printf '%s\n' '[toolchain]' 'channel = "nightly-test-date"' > "$checkout/rust-toolchain.toml"
+printf '%s\n' '#!/bin/sh' 'echo source-fixture' > "$checkout/target/release/cass"
+chmod 755 "$checkout/target/release/cass"
+"#,
+    );
+    make_executable_script(
+        &fake_bin.join("rustup"),
+        r#"#!/bin/sh
+set -eu
+printf 'rustup|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+test -z "${RUSTUP_TOOLCHAIN:-}"
+case "${1:-}:${2:-}" in
+  show:active-toolchain) exit 1 ;;
+  toolchain:install)
+    test -f rust-toolchain.toml
+    grep -q 'nightly-test-date' rust-toolchain.toml
+    : > .pinned-toolchain-installed
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    make_executable_script(
+        &fake_bin.join("cargo"),
+        r#"#!/bin/sh
+set -eu
+printf 'cargo|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+test -z "${RUSTUP_TOOLCHAIN:-}"
+test -f rust-toolchain.toml
+test -f .pinned-toolchain-installed
+test "${1:-}" = build
+"#,
+    );
+
+    let inherited_path = std::env::var("PATH").expect("PATH should be set");
+    let fake_path = format!("{}:{inherited_path}", fake_bin.display());
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .arg("--from-source")
+        .env("HOME", home.path())
+        .env("PATH", fake_path)
+        .env("FAKE_INSTALL_EVENT_LOG", &event_log)
+        .env("RUSTUP_TOOLCHAIN", "stable")
+        .env_remove("RUSTUP_INIT_SKIP")
+        .output()
+        .expect("run source installer with fake toolchain commands");
+
+    assert!(
+        output.status.success(),
+        "source install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dest.path().join("cass").is_file());
+
+    let events = fs::read_to_string(&event_log).expect("read source-install events");
+    let git_offset = events.find("git|").expect("git clone event");
+    let show_offset = events
+        .find("|show active-toolchain")
+        .expect("active toolchain probe event");
+    let install_offset = events
+        .find("|toolchain install")
+        .expect("pinned toolchain install event");
+    let cargo_offset = events.find("cargo|").expect("cargo build event");
+    assert!(
+        git_offset < show_offset && show_offset < install_offset && install_offset < cargo_offset,
+        "expected clone -> probe -> toolchain install -> build, got:\n{events}"
+    );
+    for event in events
+        .lines()
+        .filter(|line| line.starts_with("rustup|") || line.starts_with("cargo|"))
+    {
+        assert!(
+            event.contains("/src|"),
+            "toolchain commands must run from the cloned checkout: {event}"
+        );
+    }
 }
 
 struct HttpFixtureServer {
@@ -277,6 +805,67 @@ fn install_sh_rejects_archive_path_traversal_before_extracting() {
     assert!(
         !tmp_root.path().join("pwned").exists(),
         "path traversal member should not be extracted into the temp root"
+    );
+}
+
+#[test]
+#[serial]
+#[cfg(target_os = "linux")]
+fn install_sh_rejects_symlink_archive_members_before_extracting() {
+    let artifact_dir = tempfile::TempDir::new().expect("artifact directory");
+    let payload_dir = tempfile::TempDir::new().expect("payload directory");
+    let payload_cass = payload_dir.path().join("cass");
+    let link_status = Command::new("ln")
+        .arg("-s")
+        .arg("../outside-installer-tree")
+        .arg(&payload_cass)
+        .status()
+        .expect("create malicious symlink payload");
+    assert!(link_status.success(), "test symlink should be created");
+
+    let tar_path = artifact_dir.path().join("cass-linux-amd64.tar.gz");
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(payload_dir.path())
+        .arg("cass")
+        .status()
+        .expect("create symlink tarball");
+    assert!(tar_status.success(), "test tarball should be created");
+
+    let checksum = file_sha256_hex(&tar_path);
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .env("HOME", home.path())
+        .env("ARTIFACT_URL", format!("file://{}", tar_path.display()))
+        .env("CHECKSUM", checksum)
+        .output()
+        .expect("run install.sh with symlink archive");
+
+    assert!(
+        !output.status.success(),
+        "install.sh should reject symlink archive members"
+    );
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Archive contains unsupported entry type: l"),
+        "installer should explain the rejected entry type, got: {combined_output}"
+    );
+    assert!(
+        !dest.path().join("cass").exists(),
+        "cass binary should not be installed from a symlink archive"
     );
 }
 
@@ -974,4 +1563,108 @@ fn verify_flag_runs_self_test() {
         "verify should run the binary and show output, got: {}",
         stdout
     );
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn verify_flag_rejects_a_binary_whose_version_probe_fails() {
+    let artifact_dir = tempfile::TempDir::new().unwrap();
+    let payload_dir = tempfile::TempDir::new().unwrap();
+    let payload_cass = payload_dir.path().join("cass");
+    make_executable_script(&payload_cass, "#!/bin/sh\nexit 42\n");
+
+    let tar_path = artifact_dir.path().join("cass-linux-amd64.tar.gz");
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(payload_dir.path())
+        .arg("cass")
+        .status()
+        .expect("create failing-binary tarball");
+    assert!(tar_status.success(), "test tarball should be created");
+
+    let checksum = file_sha256_hex(&tar_path);
+    let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .arg("--verify")
+        .env("HOME", home.path())
+        .env("ARTIFACT_URL", format!("file://{}", tar_path.display()))
+        .env("CHECKSUM", checksum)
+        .output()
+        .expect("run install.sh with a failing version probe");
+
+    assert!(
+        !output.status.success(),
+        "--verify must fail when the installed binary exits non-zero"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Self-test failed"),
+        "verification failure should be explicit, got: {combined}"
+    );
+    assert!(
+        !combined.contains("Self-test complete"),
+        "installer must not claim a failed self-test completed"
+    );
+}
+
+#[test]
+fn powershell_verify_contract_fails_closed_on_native_command_errors() {
+    let script = fs::read_to_string("install.ps1").expect("read install.ps1");
+    for required in [
+        "$LASTEXITCODE = $null",
+        "$verifyExitCode = $LASTEXITCODE",
+        "if ($null -eq $verifyExitCode)",
+        "did not report an exit code",
+        "if ($verifyExitCode -ne 0)",
+        "exit $verifyExitCode",
+        "Self-test complete",
+    ] {
+        assert!(
+            script.contains(required),
+            "PowerShell verification is missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn installers_reject_link_and_special_archive_entries() {
+    let shell = fs::read_to_string("install.sh").expect("read install.sh");
+    for required in [
+        "tar -tvzf \"$archive\" > \"$metadata_list\"",
+        "Archive contains unsupported entry type",
+        "[ -f \"$BIN\" ] && [ -x \"$BIN\" ]",
+    ] {
+        assert!(
+            shell.contains(required),
+            "POSIX archive type validation is missing: {required}"
+        );
+    }
+
+    let powershell = fs::read_to_string("install.ps1").expect("read install.ps1");
+    for required in [
+        "function Test-ZipEntryHasSafeType",
+        "($Entry.ExternalAttributes -shr 16) -band 0xF000",
+        "$unixType -eq 0x8000",
+        "$unixType -eq 0x4000",
+        "Test-ZipEntryHasSafeType $Entry",
+    ] {
+        assert!(
+            powershell.contains(required),
+            "PowerShell archive type validation is missing: {required}"
+        );
+    }
 }

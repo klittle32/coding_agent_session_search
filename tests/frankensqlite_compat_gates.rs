@@ -40,24 +40,40 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
-/// The fsqlite engine family is a crates.io registry pin since 0.2.1 (the
-/// first published release carrying the complete formerly git-pinned line:
-/// existing-only schema opens, deferred-FTS5 validation, ns-lifecycle,
-/// GH#294 mutation-free opens). Freeze the complete source identity across
-/// the manifest, lockfile, build-time validator, and user-facing dependency
-/// contract so a partial bump cannot silently bifurcate the engine family.
+/// The fsqlite engine family resolves from exact published package versions
+/// for every direct and transitive consumer (registry-only since the 0.3.14
+/// pin, 5acc0dc6 — no git source, no patch redirect; build.rs rejects
+/// fsqlite-family registry patches and duplicate family resolution).
+/// Freeze the complete source identity across the manifest, lockfile,
+/// build-time validator, and dependency contract so a partial bump cannot
+/// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const VERSION: &str = "0.3.1";
-    const EXACT_REQUIREMENT: &str = "=0.3.1";
-    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const FACADE_REQUIREMENT: &str = "=0.4.4";
+    const TYPES_REQUIREMENT: &str = "=0.4.4";
+    const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
-    for (table_name, dependency_name, package_name) in [
-        ("dependencies", "frankensqlite", "fsqlite"),
-        ("dependencies", "fsqlite-types", "fsqlite-types"),
-        ("dev-dependencies", "fsqlite-types", "fsqlite-types"),
+    for (table_name, dependency_name, package_name, requirement) in [
+        (
+            "dependencies",
+            "frankensqlite",
+            "fsqlite",
+            FACADE_REQUIREMENT,
+        ),
+        (
+            "dependencies",
+            "fsqlite-types",
+            "fsqlite-types",
+            TYPES_REQUIREMENT,
+        ),
+        (
+            "dev-dependencies",
+            "fsqlite-types",
+            "fsqlite-types",
+            TYPES_REQUIREMENT,
+        ),
     ] {
         let dependency = manifest
             .get(table_name)
@@ -72,7 +88,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
         );
         assert_eq!(
             dependency.get("version").and_then(toml::Value::as_str),
-            Some(EXACT_REQUIREMENT),
+            Some(requirement),
             "{dependency_name} declared version drifted in [{table_name}]"
         );
         assert!(
@@ -81,26 +97,40 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
                 && dependency.get("path").is_none()
                 && dependency.get("branch").is_none()
                 && dependency.get("tag").is_none(),
-            "{dependency_name} in [{table_name}] must be a pure crates.io registry pin"
+            "{dependency_name} in [{table_name}] must resolve from the exact \
+             crates.io release, not a source override"
         );
     }
 
-    // The pre-0.2.1 [patch.crates-io] git override must not quietly return:
-    // a patch entry would bifurcate the engine family against the registry
-    // requirement of every transitive consumer.
-    if let Some(crates_io_patch) = manifest
-        .get("patch")
+    // The facade keeps its reviewed feature set.
+    let facade = manifest
+        .get("dependencies")
         .and_then(toml::Value::as_table)
-        .and_then(|patches| patches.get("crates-io"))
+        .and_then(|table| table.get("frankensqlite"))
         .and_then(toml::Value::as_table)
-    {
-        for dependency_name in crates_io_patch.keys() {
-            assert!(
-                dependency_name != "fsqlite" && !dependency_name.starts_with("fsqlite-"),
-                "[patch.crates-io].{dependency_name} reintroduces an fsqlite source override"
-            );
-        }
-    }
+        .expect("missing frankensqlite facade entry");
+    let features: Vec<&str> = facade
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        features, EXPECTED_FACADE_FEATURES,
+        "fsqlite facade feature set drifted"
+    );
+
+    // No [patch] section may redirect the fsqlite family (build.rs rejects
+    // fsqlite-family registry patches too).
+    assert!(
+        manifest.get("patch").is_none(),
+        "a [patch] section bifurcates the fsqlite family; the family must \
+         resolve from crates.io"
+    );
 
     let lockfile: toml::Value =
         toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
@@ -124,39 +154,38 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
+        let expected_version = "0.4.4";
         assert!(
             seen_names.insert(name.to_string()),
             "Cargo.lock resolves more than one version of {name}"
         );
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
-            Some(VERSION),
-            "{name} resolved at a different version than the pinned registry release"
+            Some(expected_version),
+            "{name} resolved at a different version than the published 0.4.4 family contract"
         );
+        let source = package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
         assert_eq!(
-            package.get("source").and_then(toml::Value::as_str),
-            Some(REGISTRY_SOURCE),
-            "{name} resolved from a non-registry source"
-        );
-        assert!(
-            package.get("checksum").is_some(),
-            "registry-resolved package {name} must carry a registry checksum"
+            source, "registry+https://github.com/rust-lang/crates.io-index",
+            "{name} resolved away from the pinned crates.io release"
         );
     }
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.3.1\"")
-            && build_contract.contains("fn validate_fsqlite_registry_pin"),
-        "build.rs must validate the exact FrankenSQLite registry identity"
+        build_contract.contains("expected_version: \"0.4.4\"")
+            && !build_contract.contains("expected_version: \"0.4.2\"")
+            && !build_contract.contains("expected_version: \"0.4.0\"")
+            && build_contract.contains("expected_features: &[\"fts5\", \"async-api\"]"),
+        "build.rs must validate the exact FrankenSQLite crates.io identity"
     );
     let readme = include_str!("../README.md");
     assert!(
-        readme.contains("=0.3.1")
-            && readme.contains("existing-only schema-open contract")
-            && readme.contains("registry archive lacks")
-            && readme.contains("[patch.crates-io]"),
-        "README must document the registry pin and why the old 0.1.19 archive was unusable"
+        readme.contains(FACADE_REQUIREMENT) && readme.contains(TYPES_REQUIREMENT),
+        "README must document both exact fsqlite facade and shared-types pins"
     );
 }
 
@@ -328,6 +357,301 @@ fn frankensqlite_existing_schema_only_reopens_large_archive_without_truncation()
         "existing-only large-archive reopen must not replace, truncate, or rewrite \
          the database's durable main/journal/WAL artifact bundle"
     );
+}
+
+/// GH462: an already-applied CASS v15 migration still commits a writable
+/// transaction. The reserved page must be repaired through that actual open
+/// path, without losing either canonical rows or legal freelist entries.
+#[test]
+fn cass_v15_open_repairs_sparse_wal_reserved_freelist_without_losing_rows() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
+    const PAGE_SIZE: u64 = 4096;
+    const RESERVED_PAGE: u32 = 262_145;
+    const PAGE_COUNT: u32 = RESERVED_PAGE + 1;
+    const LEAVES_PER_TRUNK: usize = 1022;
+    const ROW_QUERY: &str =
+        "SELECT m.id, m.conversation_id, m.idx, m.role, m.content, c.title, a.slug
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         JOIN agents a ON a.id = c.agent_id ORDER BY m.id";
+
+    fn read_freelist(path: &Path) -> Vec<u32> {
+        let mut file = std::fs::File::open(path).expect("open durable fixture");
+        let mut header = [0_u8; 100];
+        file.read_exact(&mut header).expect("read durable header");
+        let mut trunk = u32::from_be_bytes(header[32..36].try_into().expect("freelist head"));
+        let count = u32::from_be_bytes(header[36..40].try_into().expect("freelist count"));
+        let mut seen = std::collections::BTreeSet::new();
+        while trunk != 0 {
+            assert!((2..=PAGE_COUNT).contains(&trunk), "invalid trunk {trunk}");
+            assert!(seen.insert(trunk), "duplicate or cyclic trunk {trunk}");
+            let mut page = [0_u8; 4096];
+            file.seek(SeekFrom::Start(u64::from(trunk - 1) * PAGE_SIZE))
+                .expect("seek durable trunk");
+            file.read_exact(&mut page).expect("read durable trunk");
+            let leaves = u32::from_be_bytes(page[4..8].try_into().expect("leaf count"));
+            let leaves = usize::try_from(leaves).expect("leaf count fits usize");
+            assert!(leaves <= LEAVES_PER_TRUNK, "invalid trunk leaf count");
+            for index in 0..leaves {
+                let offset = 8 + index * 4;
+                let leaf = u32::from_be_bytes(
+                    page[offset..offset + 4]
+                        .try_into()
+                        .expect("leaf page number"),
+                );
+                assert!((2..=PAGE_COUNT).contains(&leaf), "invalid leaf {leaf}");
+                assert!(seen.insert(leaf), "duplicate free page {leaf}");
+            }
+            assert!(seen.len() <= usize::try_from(count).expect("count fits usize"));
+            trunk = u32::from_be_bytes(page[..4].try_into().expect("next trunk"));
+        }
+        assert_eq!(
+            seen.len(),
+            usize::try_from(count).expect("count fits usize")
+        );
+        seen.into_iter().collect()
+    }
+
+    for reserved_is_leaf in [false, true] {
+        let dir = tempfile::TempDir::new().expect("isolated sparse fixture");
+        let database_path = dir.path().join("cass-gh462.db");
+        let seed = FrankenStorage::open(&database_path).expect("create actual CASS schema");
+        seed.raw()
+            .execute_batch(
+                "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES (462, 'gh462', 'WAL regression', 'cli', 1, 1);
+                 INSERT INTO conversations(id, agent_id, title, source_path)
+                 VALUES (4621, 462, 'first archive conversation', 'fixture/first.jsonl'),
+                        (4622, 462, 'second archive conversation', 'fixture/second.jsonl');
+                 INSERT INTO messages(id, conversation_id, idx, role, content)
+                 VALUES (46211, 4621, 0, 'user', 'preserve first question'),
+                        (46212, 4621, 1, 'assistant', 'preserve first answer'),
+                        (46221, 4622, 0, 'user', 'preserve second question');",
+            )
+            .expect("seed canonical conversations and messages");
+        let expected_rows: Vec<_> = seed
+            .raw()
+            .query(ROW_QUERY)
+            .expect("read seeded canonical rows")
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        assert_eq!(expected_rows.len(), 3);
+        let migrations: Vec<_> = seed
+            .raw()
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version")
+            .expect("read seeded migrations")
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        assert!(migrations.iter().any(|row| {
+            row == &vec![
+                SqliteValue::Integer(15),
+                SqliteValue::Text("conversation_tail_state_cache".into()),
+            ]
+        }));
+        let checkpoint = seed
+            .raw()
+            .query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint seed before editing its closed file");
+        assert_eq!(checkpoint.len(), 1);
+        assert_eq!(checkpoint[0].get(0), Some(&SqliteValue::Integer(0)));
+        let journal = seed
+            .raw()
+            .query("PRAGMA journal_mode=DELETE")
+            .expect("retire the seed WAL through the engine before sparse extension");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].get(0), Some(&SqliteValue::Text("delete".into())));
+        seed.close().expect("close every seed storage handle");
+
+        let mut free = read_freelist(&database_path);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .expect("open isolated closed seed for sparse extension");
+        let mut header = [0_u8; 100];
+        file.read_exact(&mut header).expect("read seed header");
+        assert_eq!(&header[..16], b"SQLite format 3\0");
+        assert_eq!(u16::from_be_bytes([header[16], header[17]]), 4096);
+        let seed_pages = u32::from_be_bytes(header[28..32].try_into().expect("seed pages"));
+        assert!((2..RESERVED_PAGE).contains(&seed_pages));
+        assert!(free.iter().all(|page| *page <= seed_pages));
+        free.extend(seed_pages + 1..=PAGE_COUNT);
+        free.sort_unstable_by(|left, right| right.cmp(left));
+        if reserved_is_leaf {
+            let last = free.len() - 1;
+            assert_eq!(free[1], RESERVED_PAGE);
+            free.swap(1, last);
+        }
+        let trunk_count = free.len().div_ceil(LEAVES_PER_TRUNK + 1);
+        let trunks = &free[..trunk_count];
+        assert_eq!(trunks.contains(&RESERVED_PAGE), !reserved_is_leaf);
+        file.set_len(u64::from(PAGE_COUNT) * PAGE_SIZE)
+            .expect("extend only the synthetic fixture past the reserved page");
+        header[18] = 2;
+        header[19] = 2;
+        header[28..32].copy_from_slice(&PAGE_COUNT.to_be_bytes());
+        header[32..36].copy_from_slice(&trunks[0].to_be_bytes());
+        let free_count = u32::try_from(free.len()).expect("free count fits u32");
+        header[36..40].copy_from_slice(&free_count.to_be_bytes());
+        let counter = u32::from_be_bytes(header[24..28].try_into().expect("change counter"))
+            .checked_add(1)
+            .expect("fixture change counter does not overflow");
+        header[24..28].copy_from_slice(&counter.to_be_bytes());
+        header[92..96].copy_from_slice(&counter.to_be_bytes());
+        file.seek(SeekFrom::Start(0)).expect("seek fixture header");
+        file.write_all(&header).expect("write WAL fixture header");
+        let mut leaf_index = trunk_count;
+        for (index, trunk) in trunks.iter().enumerate() {
+            let next = trunks.get(index + 1).copied().unwrap_or(0);
+            let take = (free.len() - leaf_index).min(LEAVES_PER_TRUNK);
+            let mut page = [0_u8; 4096];
+            page[..4].copy_from_slice(&next.to_be_bytes());
+            page[4..8].copy_from_slice(&u32::try_from(take).expect("leaf count").to_be_bytes());
+            for offset in 0..take {
+                let start = 8 + offset * 4;
+                page[start..start + 4].copy_from_slice(&free[leaf_index + offset].to_be_bytes());
+            }
+            leaf_index += take;
+            file.seek(SeekFrom::Start(u64::from(*trunk - 1) * PAGE_SIZE))
+                .expect("seek synthetic trunk");
+            file.write_all(&page).expect("write synthetic trunk");
+        }
+        assert_eq!(leaf_index, free.len());
+        file.sync_all().expect("persist sparse fixture");
+        drop(file);
+        let damaged_free = read_freelist(&database_path);
+        assert!(damaged_free.contains(&RESERVED_PAGE));
+        let expected_free: Vec<_> = damaged_free
+            .into_iter()
+            .filter(|page| *page != RESERVED_PAGE)
+            .collect();
+
+        for reopen in 0..2 {
+            let storage = FrankenStorage::open(&database_path)
+                .expect("CASS v15 existing-archive open must publish WAL freelist repair");
+            if reopen == 0 {
+                let wal = database_path.with_file_name("cass-gh462.db-wal");
+                assert!(
+                    std::fs::metadata(wal).expect("real repair WAL").len() > 32,
+                    "the repair must publish through the real WAL path"
+                );
+            }
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let conn = storage.raw();
+            let actual_rows: Vec<_> = conn
+                .query(ROW_QUERY)
+                .expect("read canonical rows after CASS migration")
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            assert_eq!(
+                actual_rows, expected_rows,
+                "canonical rows changed on reopen {reopen}"
+            );
+            let actual_migrations: Vec<_> = conn
+                .query("SELECT version, name FROM _schema_migrations ORDER BY version")
+                .expect("read migration identities after reopen")
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            assert_eq!(
+                actual_migrations, migrations,
+                "already-applied v15 must stay idempotent"
+            );
+            let integrity = conn
+                .query("PRAGMA integrity_check")
+                .expect("full fixture integrity");
+            assert_eq!(integrity.len(), 1);
+            assert_eq!(integrity[0].get(0), Some(&SqliteValue::Text("ok".into())));
+            assert_eq!(
+                conn.query("PRAGMA journal_mode").unwrap()[0].get(0),
+                Some(&SqliteValue::Text("wal".into()))
+            );
+            storage
+                .close()
+                .expect("checkpoint and close repaired CASS archive");
+            assert_eq!(read_freelist(&database_path), expected_free);
+            assert_eq!(
+                std::fs::metadata(&database_path).unwrap().len(),
+                u64::from(PAGE_COUNT) * PAGE_SIZE,
+                "repair must not truncate the archive"
+            );
+        }
+    }
+}
+
+/// GH#415/cass#382: bound rowids must seek and retain exact hydration results.
+/// Include duplicate, missing, NULL and non-integral values so a fast plan
+/// cannot pass by returning a different set of messages.
+#[test]
+fn frankensqlite_parameterized_rowid_hydration_seeks_and_preserves_exact_rows() {
+    let conn = Connection::open(":memory:").expect("in-memory connection");
+    conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT NOT NULL)")
+        .expect("create hydration fixture");
+    // A stored row 2 makes truncating the bound 2.5 a visible wrong result.
+    conn.execute(
+        "INSERT INTO messages VALUES (2, 'must not match 2.5'), (3, 'three'), (7, 'seven'), (99, 'ninety-nine')",
+    )
+    .expect("insert hydration rows");
+    let params = [
+        SqliteValue::Integer(99),
+        SqliteValue::Integer(3),
+        SqliteValue::Integer(3),
+        SqliteValue::Null,
+        SqliteValue::Integer(100_000),
+        SqliteValue::Text("7".into()),
+        SqliteValue::Float(2.5),
+    ];
+    for key in ["id", "rowid"] {
+        let sql = format!(
+            "SELECT id, content FROM messages WHERE {key} IN (?1, ?2, ?3, ?4, ?5, ?6, ?7) ORDER BY id"
+        );
+        let plan = conn
+            .query_with_params(&format!("EXPLAIN QUERY PLAN {sql}"), &params)
+            .expect("explain parameterized hydration");
+        let details = plan
+            .iter()
+            .map(|row| row.get_typed::<String>(3).expect("query plan detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            details.contains("SEARCH")
+                && details.contains("INTEGER PRIMARY KEY")
+                && !details.contains("SCAN"),
+            "bound {key} hydration must seek instead of scanning: {details}"
+        );
+        let rows = conn
+            .query_with_params(&sql, &params)
+            .expect("execute parameterized hydration");
+        let actual = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get_typed::<i64>(0).expect("hydrated id"),
+                    row.get_typed::<String>(1).expect("hydrated content"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (3, "three".to_owned()),
+                (7, "seven".to_owned()),
+                (99, "ninety-nine".to_owned()),
+            ],
+            "bound {key} hydration must preserve exact ordered, unique rows"
+        );
+        let missing = vec![SqliteValue::Null; params.len()];
+        assert!(
+            conn.query_with_params(&sql, &missing)
+                .expect("hydrate all-NULL rowids")
+                .is_empty(),
+            "a new execution must not reuse the previous bound rowid set"
+        );
+    }
 }
 
 // ============================================================================
@@ -549,6 +873,8 @@ fn gate1_fts5_bm25_rank_function() {
             r0 <= r1,
             "GATE 1.8 FAIL: rank should be ordered (more negative first), got {r0} vs {r1}"
         );
+    } else {
+        panic!("GATE 1.8 FAIL: bm25() should return float scores, got {rank0:?} and {rank1:?}");
     }
 }
 
@@ -1186,14 +1512,16 @@ fn gate3_migration_transition_from_rusqlite_meta_to_schema_migrations() {
     );
 }
 
+// Previously verified against 0.3.18: keep this migration regression
+// in the default suite so schema/autoindex inconsistencies cannot regress silently.
 #[test]
-#[ignore = "Blocked by upstream frankensqlite sqlite_master/autoindex inconsistency on fresh migration path"]
 fn gate3_schema_parity_transitioned_db_matches_fresh_frankensqlite_db() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let db_a_path = dir.path().join("db_a_rusqlite_then_transition.db");
     let db_b_path = dir.path().join("db_b_fresh_frankensqlite.db");
 
-    // DB-A: create with rusqlite-backed cass storage, then transition via FrankenStorage.
+    // DB-A: create through CASS's established storage path, then reopen through
+    // FrankenStorage. Both paths now use FrankenSQLite; gate2 covers C-SQLite interop.
     {
         let storage = SqliteStorage::open(&db_a_path).expect("create db-a with SqliteStorage");
         assert_eq!(

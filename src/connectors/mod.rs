@@ -1,8 +1,8 @@
 //! Connectors for agent histories.
 //!
 //! Most connector implementations live in `franken_agent_detection`.
-//! This module provides re-export stubs plus the CASS-specific Codex enrichment
-//! wrapper used by every connector factory exposed to the indexer.
+//! This module provides re-export stubs plus the CASS-specific wrappers used by
+//! every connector factory exposed to the indexer.
 
 use std::fs;
 use std::io;
@@ -34,7 +34,6 @@ pub use franken_agent_detection::{
     estimate_tokens_from_content,
     extract_claude_code_tokens,
     extract_codex_tokens,
-    extract_tokens_for_agent,
     file_modified_since,
     flatten_content,
     franken_detection_for_connector,
@@ -42,6 +41,40 @@ pub use franken_agent_detection::{
     parse_timestamp,
     reindex_messages,
 };
+
+/// Extract token/model metadata for every CASS connector identity.
+///
+/// OMP and Pi Agent share the pi-family wire schema, so they intentionally use
+/// the same token-extraction branch while retaining distinct archive slugs.
+#[must_use]
+pub fn extract_tokens_for_agent(
+    agent_slug: &str,
+    extra: &serde_json::Value,
+    content: &str,
+    role: &str,
+) -> ExtractedTokenUsage {
+    let extraction_slug = if agent_slug == "omp" {
+        "pi_agent"
+    } else {
+        agent_slug
+    };
+    let mut usage =
+        franken_agent_detection::extract_tokens_for_agent(extraction_slug, extra, content, role);
+    if agent_slug == "omp"
+        && usage
+            .provider
+            .as_deref()
+            .is_none_or(|provider| provider == "unknown")
+        && let Some(provider) = usage
+            .model_name
+            .as_deref()
+            .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+            .filter(|provider| !provider.is_empty())
+    {
+        usage.provider = Some(provider.to_string());
+    }
+    usage
+}
 
 /// Result of a Codex scan-root preflight. The preflight replaces directory
 /// roots with explicit rollout files while preserving each root's provenance
@@ -218,6 +251,7 @@ pub mod hermes;
 pub mod kimi;
 pub mod letta_code;
 pub mod muse;
+pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod openhands;
@@ -229,109 +263,61 @@ pub mod vibe;
 /// Constructor function used by the runtime connector registry.
 pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
+fn claude_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(claude_code::ClaudeCodeConnector::new())
+}
+
 fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+fn omp_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(omp::OmpConnector::new())
+}
+
+fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(pi_agent::PiAgentConnector::new())
+}
+
+fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(grok::GrokBotConnector::new())
+}
+
+fn copilot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(copilot::CopilotConnector::new())
+}
+
+fn prime_agent_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(prime_agent::PrimeAgentConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
-/// Non-Codex factories remain exactly the upstream FAD factories. Codex must
-/// pass through CASS's enrichment wrapper so modern `function_call` arguments
-/// reach the production indexer instead of remaining placeholder-only content.
+/// Codex passes through CASS's enrichment wrapper so modern `function_call`
+/// arguments reach the production indexer. OMP passes through its profile
+/// provenance adapter, and Pi Agent passes through the OMP identity boundary
+/// that prevents broad explicit roots from indexing the same store twice.
+/// OpenClaw passes through its native-store WAL and state-directory adapter.
+/// Prime Agent passes through CASS workspace rewrite, searchable tool-call
+/// arguments, and `extra.cass.token_usage` stamping.
+/// Copilot passes through a detection widening that also recognises VS Code's
+/// native chat stores, which the upstream scanner reads but never detected.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     franken_agent_detection::get_connector_factories()
         .into_iter()
         .map(|(name, factory)| {
-            if name == "codex" {
-                (name, codex_connector_factory as ConnectorFactory)
-            } else {
-                (name, factory)
-            }
+            let factory = match name {
+                "claude" => claude_connector_factory as ConnectorFactory,
+                "codex" => codex_connector_factory as ConnectorFactory,
+                "omp" => omp_connector_factory as ConnectorFactory,
+                "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
+                "prime_agent" => prime_agent_connector_factory as ConnectorFactory,
+                "grok_bot" => grok_bot_connector_factory as ConnectorFactory,
+                "copilot" => copilot_connector_factory as ConnectorFactory,
+                _ => factory,
+            };
+            (name, openclaw::with_wal_freshness(name, factory))
         })
         .collect()
-}
-
-/// gh373 third variant (bead oeu5a): ambient work-liveness sink for
-/// connector-internal parse loops.
-///
-/// The #332 activity tick fires only once per COMPLETED conversation, so a
-/// connector spending minutes inside the line loop of one giant source file
-/// (observed: 60-90MB codex rollouts, ~40k lines) starves the stall
-/// watchdog's counters and draws a spurious exit(70). Connector code has no
-/// `IndexingProgress` handle — `ScanContext` lives in the pinned external
-/// `franken_agent_detection` crate — so the indexer registers a tick closure
-/// here for the duration of a run and deep parse loops call
-/// [`scan_activity::tick`] every N lines.
-///
-/// Multiple concurrent registrations are supported (in-process tests):
-/// `tick` fans out to every live sink — an extra tick can only delay a false
-/// stall report, never corrupt state. Registration is cheap; `tick` takes a
-/// mutex only once per stride (default: caller ticks every ~1024 lines).
-pub mod scan_activity {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Registered liveness sinks: `(registration id, tick callback)`.
-    type SinkRegistry = Vec<(u64, Box<dyn Fn() + Send + Sync>)>;
-
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    static SINKS: Mutex<SinkRegistry> = Mutex::new(Vec::new());
-
-    /// Unregisters its sink on drop. Hold for the duration of an index run.
-    pub struct ScanActivityGuard {
-        id: u64,
-    }
-
-    pub fn register(tick: Box<dyn Fn() + Send + Sync>) -> ScanActivityGuard {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut sinks) = SINKS.lock() {
-            sinks.push((id, tick));
-        }
-        ScanActivityGuard { id }
-    }
-
-    impl Drop for ScanActivityGuard {
-        fn drop(&mut self) {
-            if let Ok(mut sinks) = SINKS.lock() {
-                sinks.retain(|(id, _)| *id != self.id);
-            }
-        }
-    }
-
-    /// Record connector-internal parse liveness. No-op when no index run has
-    /// registered a sink (e.g. connector unit tests).
-    pub fn tick() {
-        if let Ok(sinks) = SINKS.lock() {
-            for (_, sink) in sinks.iter() {
-                sink();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicUsize;
-
-        #[test]
-        fn tick_reaches_registered_sink_and_stops_after_guard_drop() {
-            let count = Arc::new(AtomicUsize::new(0));
-            let sink_count = Arc::clone(&count);
-            let guard = register(Box::new(move || {
-                sink_count.fetch_add(1, Ordering::Relaxed);
-            }));
-            tick();
-            tick();
-            assert_eq!(count.load(Ordering::Relaxed), 2);
-            drop(guard);
-            tick();
-            assert_eq!(
-                count.load(Ordering::Relaxed),
-                2,
-                "a dropped guard's sink must not receive further ticks"
-            );
-        }
-    }
 }

@@ -68,6 +68,9 @@
 //! }
 //! ```
 
+#[cfg(unix)]
+mod child_output;
+
 pub mod config;
 pub(crate) mod config_validation;
 pub mod index;
@@ -78,12 +81,19 @@ pub mod provenance;
 pub mod setup;
 pub mod sync;
 
+#[cfg(not(unix))]
 use std::io::Read as IoRead;
-use std::process::{Child, Command, Output};
+use std::io::{Seek, Write};
+use std::process::{Child, Command, Output, Stdio};
+#[cfg(not(unix))]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+#[cfg(not(unix))]
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(unix))]
+use std::time::Instant;
 
+#[cfg(not(unix))]
 use wait_timeout::ChildExt;
 
 /// Canonical SSH stderr marker for host-key verification failures.
@@ -142,24 +152,52 @@ fn shell_quote_ssh_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+pub(crate) fn file_backed_child_stdin(contents: &[u8]) -> std::io::Result<Stdio> {
+    let mut file = tempfile::tempfile()?;
+    file.write_all(contents)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    Ok(Stdio::from(file))
+}
+
+#[cfg(not(unix))]
 struct ChildPipeReader {
     receiver: Receiver<std::io::Result<Vec<u8>>>,
     handle: JoinHandle<()>,
 }
 
-fn drain_child_pipe<R>(mut pipe: R) -> ChildPipeReader
+#[cfg(not(unix))]
+fn drain_child_pipe<R>(mut pipe: R, max_bytes: Option<usize>) -> ChildPipeReader
 where
     R: IoRead + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut output = Vec::new();
-        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let result = (|| {
+            if let Some(limit) = max_bytes {
+                pipe.by_ref()
+                    .take((limit as u64).saturating_add(1))
+                    .read_to_end(&mut output)?;
+                if output.len() > limit {
+                    // Keep draining so a writer cannot deadlock on a full pipe.
+                    // The caller's deadline still terminates a non-exiting child.
+                    std::io::copy(&mut pipe, &mut std::io::sink())?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "child output exceeded the configured byte limit",
+                    ));
+                }
+            } else {
+                pipe.read_to_end(&mut output)?;
+            }
+            Ok(output)
+        })();
         let _ = sender.send(result);
     });
     ChildPipeReader { receiver, handle }
 }
 
+#[cfg(not(unix))]
 fn finish_child_pipe(
     pipe_reader: Option<ChildPipeReader>,
     deadline: Instant,
@@ -204,14 +242,19 @@ pub(crate) fn configure_child_process_group(cmd: &mut Command) {
 pub(crate) fn configure_child_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_child_process_group(pid: u32) {
-    let process_group = format!("-{pid}");
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", &process_group])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: a strictly positive owned child PID is negated to address only
+    // its process group, never PID 0 or -1. The Unix collector retains that
+    // child unreaped until cleanup; kill takes no pointers. Avoid spawning
+    // another process during timeout/error cleanup.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
 }
 
 #[cfg(not(unix))]
@@ -225,8 +268,32 @@ fn kill_child_process_group(_pid: u32) {}
 /// child can be killed but shell grandchildren may keep inherited pipe FDs open
 /// until they exit naturally.
 pub(crate) fn wait_for_child_output_with_timeout(
+    child: Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    wait_for_child_output_with_limit(child, timeout, None)
+}
+
+/// Limit each captured stream while retaining the same process deadline.
+/// Unix capture owns nonblocking pipes directly: overflow stops immediately,
+/// and cancellation cannot leave background reader threads behind. Process
+/// teardown/reaping itself can exceed the budget if the OS stalls.
+#[cfg(unix)]
+pub(crate) fn wait_for_child_output_with_limit(
+    child: Child,
+    timeout: Duration,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Option<Output>> {
+    child_output::wait(child, timeout, max_bytes)
+}
+
+// Retain the existing non-Unix pipe implementation until native pipe
+// cancellation is available there; do not claim Unix ownership guarantees.
+#[cfg(not(unix))]
+pub(crate) fn wait_for_child_output_with_limit(
     mut child: Child,
     timeout: Duration,
+    max_bytes: Option<usize>,
 ) -> std::io::Result<Option<Output>> {
     let timeout = if timeout.is_zero() {
         Duration::from_secs(1)
@@ -236,30 +303,46 @@ pub(crate) fn wait_for_child_output_with_timeout(
     let start = Instant::now();
     let deadline = start.checked_add(timeout).unwrap_or(start);
     let child_pid = child.id();
-    let stdout_reader = child.stdout.take().map(drain_child_pipe);
-    let stderr_reader = child.stderr.take().map(drain_child_pipe);
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|pipe| drain_child_pipe(pipe, max_bytes));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| drain_child_pipe(pipe, max_bytes));
 
-    match child.wait_timeout(timeout)? {
-        Some(status) => {
-            let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+    match child.wait_timeout(timeout) {
+        Ok(Some(status)) => {
+            let result = (|| {
+                let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+                    return Ok(None);
+                };
+                let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                }))
+            })();
+            if !matches!(&result, Ok(Some(_))) {
                 kill_child_process_group(child_pid);
-                return Ok(None);
-            };
-            let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
-                kill_child_process_group(child_pid);
-                return Ok(None);
-            };
-            Ok(Some(Output {
-                status,
-                stdout,
-                stderr,
-            }))
+            }
+            result
         }
-        None => {
+        Ok(None) => {
             kill_child_process_group(child_pid);
             let _ = child.kill();
             let _ = child.wait();
             Ok(None)
+        }
+        Err(error) => {
+            kill_child_process_group(child_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
         }
     }
 }
@@ -385,5 +468,84 @@ mod tests {
 
         assert!(!tokens.contains(&"-F".to_string()));
         assert!(!command.contains(" -F "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_output_preserves_small_output_and_rejects_overflow() {
+        for (script, overflow) in [
+            ("printf 1234; printf abcd >&2", false),
+            ("printf 12345", true),
+            ("printf 12345 >&2", true),
+        ] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_child_process_group(&mut command);
+            let result = wait_for_child_output_with_limit(
+                command.spawn().unwrap(),
+                Duration::from_secs(5),
+                Some(4),
+            );
+            if overflow {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            } else {
+                let output = result.unwrap().unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"1234");
+                assert_eq!(output.stderr, b"abcd");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_output_stops_immediately_after_overflow() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf 12345; sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_process_group(&mut command);
+        let started = std::time::Instant::now();
+        let error = wait_for_child_output_with_limit(
+            command.spawn().unwrap(),
+            Duration::from_secs(30),
+            Some(4),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_child_stdin_delivers_exact_bytes() -> anyhow::Result<()> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("cat")
+            .stdin(file_backed_child_stdin(b"probe payload\n")?)
+            .stdout(std::process::Stdio::piped())
+            .output()?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"probe payload\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_child_stdin_survives_child_exit_without_reading() -> anyhow::Result<()> {
+        let payload = vec![b'x'; 1_048_576];
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("exit 23")
+            .stdin(file_backed_child_stdin(&payload)?)
+            .status()?;
+
+        assert_eq!(status.code(), Some(23));
+        Ok(())
     }
 }

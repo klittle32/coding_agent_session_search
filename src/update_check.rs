@@ -7,6 +7,7 @@
 //! - Hourly check cadence (configurable)
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -47,33 +48,22 @@ fn updates_disabled() -> bool {
 
 /// Persistent state for update checker
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UpdateState {
+struct UpdateState {
     /// Unix timestamp of last successful check
-    pub last_check_ts: i64,
+    last_check_ts: i64,
     /// Version string that user chose to skip (e.g., "0.2.0")
-    pub skipped_version: Option<String>,
+    skipped_version: Option<String>,
 }
 
 impl UpdateState {
     /// Load state from disk (synchronous)
-    pub fn load() -> Self {
+    fn load() -> Self {
         let path = state_path();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => {
-                let legacy = legacy_state_path();
-                if legacy != path
-                    && let Ok(content) = std::fs::read_to_string(&legacy)
-                {
-                    return serde_json::from_str(&content).unwrap_or_default();
-                }
-                Self::default()
-            }
-        }
+        load_update_state_from_paths(&path, &legacy_state_path())
     }
 
     /// Load state from disk (asynchronous)
-    pub async fn load_async() -> Self {
+    async fn load_async() -> Self {
         let path = state_path();
         match asupersync::fs::read_to_string(&path).await {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
@@ -90,39 +80,30 @@ impl UpdateState {
     }
 
     /// Save state to disk (synchronous)
-    pub fn save(&self) -> Result<()> {
-        let path = state_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating update state directory {}", parent.display()))?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        let temp_path = write_update_state_temp_file(&path, json.as_bytes())
-            .with_context(|| format!("writing temporary update state for {}", path.display()))?;
-        replace_update_state_file_from_temp(&temp_path, &path)
-            .with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+    #[cfg(test)]
+    fn save(&self, path: &Path) -> Result<()> {
+        save_update_state_to_path(self, path)
     }
 
     /// Save state to disk (asynchronous)
-    pub async fn save_async(&self) -> Result<()> {
-        let path = state_path();
+    #[cfg(test)]
+    async fn save_async(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             asupersync::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing update state")?;
-        let temp_path = write_update_state_temp_file_async(&path, json.as_bytes())
+        let temp_path = write_update_state_temp_file_async(path, json.as_bytes())
             .await
             .with_context(|| format!("writing temporary update state for {}", path.display()))?;
-        replace_update_state_file_from_temp(&temp_path, &path)
+        replace_update_state_file_from_temp(&temp_path, path)
             .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
 
     /// Check if enough time has passed since last check
-    pub fn should_check(&self) -> bool {
+    fn should_check(&self) -> bool {
         let now = now_unix();
         if self.last_check_ts <= 0 || self.last_check_ts > now {
             return true;
@@ -131,22 +112,23 @@ impl UpdateState {
     }
 
     /// Mark that we just checked
-    pub fn mark_checked(&mut self) {
+    fn mark_checked(&mut self) {
         self.last_check_ts = now_unix();
     }
 
     /// Skip a specific version
-    pub fn skip_version(&mut self, version: &str) {
+    fn skip_version(&mut self, version: &str) {
         self.skipped_version = Some(version.to_string());
     }
 
     /// Check if a version is skipped
-    pub fn is_skipped(&self, version: &str) -> bool {
+    fn is_skipped(&self, version: &str) -> bool {
         self.skipped_version.as_deref() == Some(version)
     }
 
     /// Clear skip preference (on upgrade or manual clear)
-    pub fn clear_skip(&mut self) {
+    #[cfg(test)]
+    fn clear_skip(&mut self) {
         self.skipped_version = None;
     }
 }
@@ -198,7 +180,7 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         return None;
     }
 
-    let mut state = UpdateState::load_async().await;
+    let state = UpdateState::load_async().await;
 
     // Respect check interval
     if !force && !state.should_check() {
@@ -214,19 +196,25 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
-
     // Persist cadence after any *successful fetch* — including when the
     // release metadata is unusable (non-semver tag, untrusted URL) — so a
     // bad upstream release cannot bypass the hourly throttle and turn every
     // startup into a fresh network request. Transient network errors above
     // still skip persistence so they do not suppress future checks.
-    state.mark_checked();
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to save state: {e}");
-    }
+    let current_state = match asupersync::runtime::spawn_blocking(mark_update_check_complete).await
+    {
+        Ok(current_state) => current_state,
+        Err(e) => {
+            warn!("update check: failed to save state: {e}");
+            // The state loaded before the network request may now be stale
+            // (for example, the user may have skipped this version while
+            // the request was in flight). Even when cadence persistence
+            // fails, use the freshest readable preference for the banner.
+            UpdateState::load_async().await
+        }
+    };
 
-    info
+    build_update_info(current_version, release, &current_state)
 }
 
 /// Force a check regardless of interval (for manual refresh)
@@ -236,9 +224,8 @@ pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
 
 /// Skip the specified version
 pub fn skip_version(version: &str) -> Result<()> {
-    let mut state = UpdateState::load();
-    state.skip_version(version);
-    state.save()
+    mutate_persisted_update_state(|state| state.skip_version(version))?;
+    Ok(())
 }
 
 /// Open a URL in the system's default browser
@@ -468,6 +455,66 @@ try {
 "#
 }
 
+/// Encode `& { <script> } '<arg>' ...` for `powershell -EncodedCommand`.
+///
+/// `powershell -Command <script> <arg>...` does not bind the trailing tokens
+/// to `$args`: PowerShell joins every token after `-Command` into the command
+/// text, so the script saw `$InstallUrl = $null` and the URL itself was run as
+/// a command (GH #381). A script block receives its arguments as `$args`, the
+/// arguments are single-quoted literals (every PowerShell single-quote
+/// character doubled, including the typographic ones it also accepts), and
+/// the whole command travels as base64 UTF-16LE, so no Windows command-line
+/// quoting can alter the script or split an argument.
+#[cfg(any(test, target_os = "windows"))]
+fn encode_powershell_script_invocation(script: &str, args: &[&str]) -> String {
+    use base64::prelude::*;
+    let mut command = String::with_capacity(script.len() + 16);
+    command.push_str("& {");
+    command.push_str(script);
+    command.push('}');
+    for arg in args {
+        command.push_str(" '");
+        for ch in arg.chars() {
+            if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                command.push(ch);
+            }
+            command.push(ch);
+        }
+        command.push('\'');
+    }
+    let utf16le: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    BASE64_STANDARD.encode(utf16le)
+}
+
+/// The complete `powershell.exe` argument vector for a Windows self-update.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_powershell_args(version: &str) -> Vec<String> {
+    let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
+    let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
+    let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
+    let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
+    let encoded = encode_powershell_script_invocation(
+        windows_self_update_script(),
+        &[
+            &install_url,
+            &checksums_url,
+            version,
+            &checksums_alt_url,
+            &install_checksum_url,
+        ],
+    );
+    [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoProfile",
+        "-EncodedCommand",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(std::iter::once(encoded))
+    .collect()
+}
+
 /// Run the self-update installer script interactively.
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
@@ -506,33 +553,25 @@ pub fn run_self_update(version: &str) -> ! {
 
     #[cfg(target_os = "windows")]
     {
-        let install_url = release_asset_url(version, WINDOWS_INSTALL_ASSET);
-        let checksums_url = release_asset_url(version, CHECKSUMS_ASSET);
-        let checksums_alt_url = release_asset_url(version, CHECKSUMS_ASSET_ALT);
-        let install_checksum_url = release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET);
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
-            .args([
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NoProfile",
-                "-Command",
-                windows_self_update_script(),
-                &install_url,
-                &checksums_url,
-                version,
-                &checksums_alt_url,
-                &install_checksum_url,
-            ])
+            .args(windows_self_update_powershell_args(version))
             .status();
         match status {
-            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+            Ok(s) => std::process::exit(installer_process_exit_code(s)),
             Err(e) => {
                 eprintln!("Failed to run installer: {}", e);
                 std::process::exit(1);
             }
         }
     }
+}
+
+/// Preserve a normal installer exit code, but fail closed when the child was
+/// terminated without one (for example by a signal or Windows job teardown).
+#[cfg(any(test, target_os = "windows"))]
+fn installer_process_exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
 }
 
 /// Get the base URL for release API. Overridable for testing via the
@@ -600,6 +639,30 @@ fn legacy_state_path() -> PathBuf {
     )
 }
 
+fn load_update_state_from_paths(path: &Path, legacy_path: &Path) -> UpdateState {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) if legacy_path != path => std::fs::read_to_string(legacy_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default(),
+        Err(_) => UpdateState::default(),
+    }
+}
+
+fn save_update_state_to_path(state: &UpdateState, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating update state directory {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state).context("serializing update state")?;
+    let temp_path = write_update_state_temp_file(path, json.as_bytes())
+        .with_context(|| format!("writing temporary update state for {}", path.display()))?;
+    replace_update_state_file_from_temp(&temp_path, path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 fn write_update_state_temp_file(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
     for _ in 0..100 {
         let temp_path = unique_update_state_temp_path(path);
@@ -630,6 +693,7 @@ fn write_update_state_temp_file_at(path: &Path, contents: &[u8]) -> std::io::Res
     file.sync_all()
 }
 
+#[cfg(test)]
 async fn write_update_state_temp_file_async(
     path: &Path,
     contents: &[u8],
@@ -652,6 +716,7 @@ async fn write_update_state_temp_file_async(
     ))
 }
 
+#[cfg(test)]
 async fn write_update_state_temp_file_at_async(
     path: &Path,
     contents: &[u8],
@@ -784,6 +849,54 @@ fn unique_update_state_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     ))
 }
 
+fn update_state_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("update_state.json");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+/// Serialize the complete read-modify-write operation so a background update
+/// check cannot overwrite a concurrently persisted skip choice (and a skip
+/// write cannot regress the check cadence timestamp).
+fn mutate_persisted_update_state(mutate: impl FnOnce(&mut UpdateState)) -> Result<UpdateState> {
+    let path = state_path();
+    mutate_persisted_update_state_at(&path, &legacy_state_path(), mutate)
+}
+
+fn mutate_persisted_update_state_at(
+    path: &Path,
+    legacy_path: &Path,
+    mutate: impl FnOnce(&mut UpdateState),
+) -> Result<UpdateState> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating update state directory {}", parent.display()))?;
+    }
+
+    let lock_path = update_state_lock_path(path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening update state lock {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking update state {}", lock_path.display()))?;
+
+    let mut state = load_update_state_from_paths(path, legacy_path);
+    mutate(&mut state);
+    save_update_state_to_path(&state, path)?;
+    Ok(state)
+}
+
+fn mark_update_check_complete() -> Result<UpdateState> {
+    mutate_persisted_update_state(UpdateState::mark_checked)
+}
+
 /// Current unix timestamp
 fn now_unix() -> i64 {
     i64::try_from(
@@ -806,7 +919,7 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         return None;
     }
 
-    let mut state = UpdateState::load();
+    let state = UpdateState::load();
 
     // Respect check interval
     if !state.should_check() {
@@ -823,19 +936,22 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
-
     // Persist cadence after any *successful fetch* — including when the
     // release metadata is unusable (non-semver tag, untrusted URL) — so a
     // bad upstream release cannot bypass the hourly throttle and turn every
     // startup into a fresh network request. Transient network errors above
     // still skip persistence so they do not suppress future checks.
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
-    }
+    let current_state = match mark_update_check_complete() {
+        Ok(current_state) => current_state,
+        Err(e) => {
+            warn!("update check: failed to save state: {e}");
+            // Preserve any preference written while the request was in flight,
+            // even though this check could not persist its cadence timestamp.
+            UpdateState::load()
+        }
+    };
 
-    info
+    build_update_info(current_version, release, &current_state)
 }
 
 fn build_update_info(
@@ -883,6 +999,7 @@ async fn fetch_latest_release() -> Result<GitHubRelease> {
 /// Fetch latest release using a short-timeout blocking HTTP client.
 fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
     let url = format!("{}/releases/latest", release_api_base_url());
+    crate::ensure_rustls_crypto_provider();
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -925,6 +1042,17 @@ pub fn spawn_update_check(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_status_without_an_exit_code_fails_closed() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .expect("run signalled child process");
+        assert_eq!(status.code(), None);
+        assert_eq!(installer_process_exit_code(status), 1);
+    }
 
     #[test]
     fn test_release_asset_url_uses_immutable_release_downloads() {
@@ -1057,6 +1185,120 @@ mod tests {
         let script = windows_self_update_script();
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("@($ChecksumsUrl, $args[3], $args[4])"));
+    }
+
+    fn decode_powershell_encoded_command(encoded: &str) -> String {
+        use base64::prelude::*;
+        let bytes = BASE64_STANDARD.decode(encoded).expect("valid base64");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload has whole code units");
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        String::from_utf16(&units).expect("valid UTF-16")
+    }
+
+    /// GH #381: `powershell -Command <script> <url>...` never binds the URLs
+    /// to `$args` (PowerShell folds them into the command text), so every
+    /// Windows self-update ran with `$InstallUrl = $null`. No release URL may
+    /// appear as its own process argument; they must reach the script block.
+    #[test]
+    fn test_windows_self_update_passes_urls_to_the_script_block_not_the_command_line() {
+        let version = "v1.2.3";
+        let args = windows_self_update_powershell_args(version);
+        assert_eq!(
+            args[..4],
+            [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-NoProfile",
+                "-EncodedCommand"
+            ]
+        );
+        assert_eq!(args.len(), 5, "only the encoded command follows: {args:?}");
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "-Command" || arg.starts_with("https://")),
+            "no URL or -Command token may reach powershell's own argv: {args:?}"
+        );
+
+        let command = decode_powershell_encoded_command(&args[4]);
+        let expected_args = [
+            release_asset_url(version, WINDOWS_INSTALL_ASSET),
+            release_asset_url(version, CHECKSUMS_ASSET),
+            version.to_string(),
+            release_asset_url(version, CHECKSUMS_ASSET_ALT),
+            release_asset_url(version, WINDOWS_INSTALL_CHECKSUM_ASSET),
+        ];
+        let suffix: String = expected_args
+            .iter()
+            .map(|arg| format!(" '{arg}'"))
+            .collect();
+        assert_eq!(
+            command,
+            format!("& {{{}}}{suffix}", windows_self_update_script()),
+            "the script must run as a script block whose $args are, in order, \
+             install URL, checksums URL, version, alternate checksums, standalone checksum"
+        );
+    }
+
+    #[test]
+    fn test_powershell_invocation_doubles_every_single_quote_form() {
+        let encoded = encode_powershell_script_invocation(
+            "Write-Output $args[0]",
+            &[
+                "it's",
+                "typographic \u{2018}a\u{2019} \u{201A}b\u{201B}",
+                "",
+            ],
+        );
+        assert_eq!(
+            decode_powershell_encoded_command(&encoded),
+            "& {Write-Output $args[0]} 'it''s' \
+             'typographic \u{2018}\u{2018}a\u{2019}\u{2019} \u{201A}\u{201A}b\u{201B}\u{201B}' ''"
+        );
+    }
+
+    /// Executes the encoding through a real PowerShell when one is installed
+    /// (Windows CI, or pwsh on Unix); skipped otherwise.
+    #[test]
+    fn test_powershell_invocation_binds_arguments_in_a_real_shell() {
+        // A fixed allowlist of interpreters, each named by a literal.
+        let interpreters: [fn() -> std::process::Command; 2] = [
+            || std::process::Command::new("pwsh"),
+            || std::process::Command::new("powershell"),
+        ];
+        let Some(shell) = interpreters.into_iter().find(|shell| {
+            shell()
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        }) else {
+            eprintln!("skipping: no PowerShell on PATH");
+            return;
+        };
+        let args = [
+            "https://example.invalid/a?x=1&y=2",
+            "it's; Write-Output injected",
+            "v1.2.3",
+        ];
+        let output = shell()
+            .args([
+                "-NoProfile",
+                "-EncodedCommand",
+                &encode_powershell_script_invocation("Write-Output ($args -join '|')", &args),
+            ])
+            .output()
+            .expect("run PowerShell");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            args.join("|"),
+            "arguments must arrive verbatim and unexecuted"
+        );
     }
 
     #[test]
@@ -1289,6 +1531,30 @@ mod tests {
             "successive sidecar names should differ",
         );
         Ok(())
+    }
+
+    #[test]
+    fn locked_state_mutations_preserve_independent_fields() {
+        let temp_dir = tempfile::TempDir::new().expect("temporary update state directory");
+        let path = temp_dir.path().join("update_state.json");
+
+        let initial = UpdateState {
+            last_check_ts: 17,
+            skipped_version: Some("1.2.3".to_string()),
+        };
+        save_update_state_to_path(&initial, &path).expect("seed update state");
+
+        let checked = mutate_persisted_update_state_at(&path, &path, UpdateState::mark_checked)
+            .expect("persist check cadence");
+        assert!(checked.last_check_ts > 17);
+        assert_eq!(checked.skipped_version.as_deref(), Some("1.2.3"));
+
+        let check_timestamp = checked.last_check_ts;
+        mutate_persisted_update_state_at(&path, &path, |state| state.skip_version("2.0.0"))
+            .expect("persist skipped version");
+        let skipped = load_update_state_from_paths(&path, &path);
+        assert_eq!(skipped.last_check_ts, check_timestamp);
+        assert_eq!(skipped.skipped_version.as_deref(), Some("2.0.0"));
     }
 
     #[test]
@@ -1576,36 +1842,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 42,
             skipped_version: Some("0.2.0".to_string()),
         };
-        state.save().unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        state
+            .save(&temp_dir.path().join("update_state.json"))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 42);
     }
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_async_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 43,
             skipped_version: Some("0.2.0".to_string()),
@@ -1613,11 +1867,9 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build test runtime");
-        runtime.block_on(state.save_async()).unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        runtime
+            .block_on(state.save_async(&temp_dir.path().join("update_state.json")))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 43);
     }
 
@@ -2082,34 +2334,40 @@ mod tests {
     #[test]
     #[serial]
     fn integration_force_check_bypasses_cadence_even_when_state_save_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp_dir = tempfile::TempDir::new().unwrap();
         let state_file = temp_dir.path().join("update_state.json");
         let state = UpdateState {
             last_check_ts: now_unix(),
             skipped_version: None,
         };
-        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+        let seeded_bytes = serde_json::to_vec_pretty(&state).unwrap();
+        std::fs::write(&state_file, &seeded_bytes).unwrap();
+        assert!(!state.should_check(), "seeded state must enforce cadence");
+
+        // A directory cannot be opened as the writable lock file, even by root.
+        let lock_path = update_state_lock_path(&state_file);
+        std::fs::create_dir(&lock_path).unwrap();
+        let before_error =
+            mutate_persisted_update_state_at(&state_file, &state_file, UpdateState::mark_checked)
+                .expect_err("the lock directory must prevent state persistence");
+        assert_eq!(
+            before_error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory),
+            "expected an actual lock-path directory error: {before_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            seeded_bytes,
+            "failed persistence must preserve the seeded cadence and preferences"
+        );
 
         let release_json = r#"{
             "tag_name": "v9.9.9",
             "html_url": "https://github.com/klittle32/coding_agent_session_search/releases/tag/v9.9.9"
         }"#;
         let (addr, handle) = start_test_server(release_json, 200);
-
-        let dir_metadata = std::fs::metadata(temp_dir.path()).unwrap();
-        let file_metadata = std::fs::metadata(&state_file).unwrap();
-        let dir_mode = dir_metadata.permissions().mode();
-        let file_mode = file_metadata.permissions().mode();
-
-        let mut readonly_dir = dir_metadata.permissions();
-        readonly_dir.set_mode(0o555);
-        std::fs::set_permissions(temp_dir.path(), readonly_dir).unwrap();
-
-        let mut readonly_file = file_metadata.permissions();
-        readonly_file.set_mode(0o444);
-        std::fs::set_permissions(&state_file, readonly_file).unwrap();
 
         unsafe {
             std::env::set_var("CASS_DATA_DIR", temp_dir.path());
@@ -2124,14 +2382,7 @@ mod tests {
             .build()
             .expect("build test runtime");
         let result = runtime.block_on(force_check("0.1.0"));
-
-        let mut restore_file = std::fs::metadata(&state_file).unwrap().permissions();
-        restore_file.set_mode(file_mode);
-        std::fs::set_permissions(&state_file, restore_file).unwrap();
-
-        let mut restore_dir = std::fs::metadata(temp_dir.path()).unwrap().permissions();
-        restore_dir.set_mode(dir_mode);
-        std::fs::set_permissions(temp_dir.path(), restore_dir).unwrap();
+        let after_save = mark_update_check_complete();
 
         unsafe {
             std::env::remove_var("CASS_UPDATE_API_BASE_URL");
@@ -2140,6 +2391,20 @@ mod tests {
 
         handle.join().expect("server thread");
 
+        let after_error =
+            after_save.expect_err("the real update-check writer must still fail after force_check");
+        assert_eq!(
+            after_error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory),
+            "expected the same lock-path directory error after force_check: {after_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&state_file).unwrap(),
+            seeded_bytes,
+            "force_check must preserve the seeded state when persistence fails"
+        );
         let info = result.expect("force check should bypass cadence and succeed");
         assert_eq!(info.latest_version, "9.9.9");
         assert!(info.is_newer);

@@ -6,7 +6,9 @@ mod tests {
     use coding_agent_search::pages::export::{
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
-    use std::path::Path;
+    use coding_agent_search::pages::profiles::ShareProfile;
+    use coding_agent_search::pages::verify::verify_bundle;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn setup_source_db(path: &Path) -> Result<()> {
@@ -81,7 +83,59 @@ mod tests {
              VALUES (2, 0, 'user', 'rust code', 1700000000000)",
         )?;
 
+        // 019i2: a snippet carrying an exact local code-file path sentinel.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT NOT NULL
+            );
+            "#,
+        )?;
+        conn.execute(
+            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+             VALUES (1, '/home/user/proj1/src/secret_module_sentinel.rs', 1, 3, 'rust', 'fn main() {}')",
+        )?;
+
         Ok(())
+    }
+
+    /// Every cell of every user table in the export, cast to text and
+    /// concatenated — the haystack for "no exact path survives anywhere".
+    fn all_text_cells(conn: &Connection) -> Result<String> {
+        let tables: Vec<String> = conn.query_map_collect(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        let mut haystack = String::new();
+        for table in tables {
+            if table.contains("_fts") {
+                continue;
+            }
+            let columns: Vec<String> = conn.query_map_collect(
+                &format!("PRAGMA table_info(\"{table}\")"),
+                &[],
+                |row: &FrankenRow| row.get_typed(1),
+            )?;
+            for column in columns {
+                let cells: Vec<Option<String>> = conn.query_map_collect(
+                    &format!("SELECT CAST(\"{column}\" AS TEXT) FROM \"{table}\""),
+                    &[],
+                    |row: &FrankenRow| row.get_typed(0),
+                )?;
+                for cell in cells.into_iter().flatten() {
+                    haystack.push_str(&cell);
+                    haystack.push('\n');
+                }
+            }
+        }
+        Ok(haystack)
     }
 
     fn open_franken_db(path: &Path) -> Result<Connection> {
@@ -336,6 +390,114 @@ mod tests {
         assert_eq!(path.len(), 16); // 16 chars hex
         assert_ne!(path, "/home/user/proj1/.claude/1.json");
 
+        Ok(())
+    }
+
+    /// 019i2: `hide_metadata` (= `PathMode::Hash`) must hide EVERY exported
+    /// path-bearing field — workspace and snippet file paths, not only
+    /// `conversations.source_path` — while keeping workspace joins stable.
+    #[test]
+    fn hash_mode_hides_workspace_and_snippet_paths_everywhere() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        let output_path = temp_dir.path().join("export.db");
+        setup_source_db(&source_path)?;
+
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Hash,
+        };
+        ExportEngine::new(&source_path, &output_path, filter).execute(|_, _| {}, None)?;
+
+        let conn = open_franken_db(&output_path)?;
+        let haystack = all_text_cells(&conn)?;
+        for sentinel in [
+            "/home/user/proj1",
+            "/home/user/proj2",
+            "secret_module_sentinel",
+            ".claude/1.json",
+            ".codex/session.json",
+        ] {
+            assert!(
+                !haystack.contains(sentinel),
+                "exact path fragment {sentinel:?} survived a hash-mode export:\n{haystack}"
+            );
+        }
+        let workspace = query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?;
+        assert_eq!(workspace.len(), 16, "workspace should be a 16-hex digest");
+        let snippet_path =
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?;
+        assert_eq!(
+            snippet_path.len(),
+            16,
+            "snippet file_path should be a 16-hex digest"
+        );
+        let policy = query_string(&conn, "SELECT value FROM export_meta WHERE key='path_mode'")?;
+        assert_eq!(policy, "hash");
+        Ok(())
+    }
+
+    /// The explicit modes keep their documented behaviour: `Full` leaves
+    /// workspace and snippet paths verbatim; `Relative` strips the workspace
+    /// prefix from snippet paths but keeps the workspace itself.
+    #[test]
+    fn explicit_path_modes_keep_workspace_and_snippet_semantics() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_source_db(&source_path)?;
+
+        let full_out = temp_dir.path().join("full.db");
+        ExportEngine::new(
+            &source_path,
+            &full_out,
+            ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Full,
+            },
+        )
+        .execute(|_, _| {}, None)?;
+        let conn = open_franken_db(&full_out)?;
+        assert_eq!(
+            query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?,
+            "/home/user/proj1"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?,
+            "/home/user/proj1/src/secret_module_sentinel.rs"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT value FROM export_meta WHERE key='path_mode'")?,
+            "full"
+        );
+
+        let rel_out = temp_dir.path().join("relative.db");
+        ExportEngine::new(
+            &source_path,
+            &rel_out,
+            ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Relative,
+            },
+        )
+        .execute(|_, _| {}, None)?;
+        let conn = open_franken_db(&rel_out)?;
+        assert_eq!(
+            query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?,
+            "/home/user/proj1"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?,
+            "src/secret_module_sentinel.rs"
+        );
         Ok(())
     }
 
@@ -747,6 +909,7 @@ mod tests {
             Some("not-a-time".to_string()),
             None,
             PathMode::Relative,
+            ShareProfile::Public,
             false,
         )
         .expect_err("invalid --since should fail");
@@ -771,11 +934,328 @@ mod tests {
             Some("2025-01-02".to_string()),
             Some("2025-01-01".to_string()),
             PathMode::Relative,
+            ShareProfile::Public,
             false,
         )
         .expect_err("reversed time range should fail");
 
         assert!(err.to_string().contains("Invalid time range"));
         Ok(())
+    }
+
+    /// A source archive whose workspace, title, source path, metadata,
+    /// message body and snippet carry the running user's real home path, an
+    /// email address and an internal hostname — the values share profiles
+    /// exist to strip (2l1b0.60).
+    fn setup_share_profile_source(path: &Path, home: &str) -> Result<()> {
+        let conn = open_franken_db(path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+            CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                message_count INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT NOT NULL
+            );
+            "#,
+        )?;
+        let project = format!("{home}/share-profile-project");
+        let metadata = serde_json::json!({ "cwd": project, "owner": "alice@example.com" });
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (1, ?1)",
+            fparams![project.as_str()],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count, metadata_json)
+             VALUES (1, 1, 1, ?1, ?2, 1700000000000, 1, ?3)",
+            fparams![
+                format!("Deploy notes from {project}"),
+                format!("{project}/.claude/session.jsonl"),
+                metadata.to_string()
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
+             VALUES (1, 1, 0, 'user', ?1, 1700000000000)",
+            fparams![format!(
+                "ssh to https://build.internal.example:8443/ci as alice@example.com, then edit {project}/src/main.rs"
+            )],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+             VALUES (1, ?1, 1, 1, 'rust', '// ask alice@example.com')",
+            fparams![format!("{project}/src/main.rs")],
+        )?;
+        Ok(())
+    }
+
+    /// Every exported text, including both FTS indexes' stored content.
+    fn exported_text(conn: &Connection) -> Result<String> {
+        let mut haystack = all_text_cells(conn)?;
+        for table in ["messages_fts", "messages_code_fts"] {
+            let rows: Vec<String> = conn.query_map_collect(
+                &format!("SELECT content FROM {table}"),
+                &[],
+                |row: &FrankenRow| row.get_typed(0),
+            )?;
+            for row in rows {
+                haystack.push_str(&row);
+                haystack.push('\n');
+            }
+        }
+        Ok(haystack)
+    }
+
+    /// 2l1b0.60: each share profile removes exactly its preset's values from
+    /// every exported surface, and export_meta records the profile with
+    /// per-kind counts but no raw value. Negative control: before profiles
+    /// were wired into the export, the public bundle kept the home path,
+    /// the email address and the hostname verbatim.
+    #[test]
+    fn share_profiles_redact_every_exported_surface_by_preset() -> Result<()> {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("no home directory"))?;
+        assert!(home.len() > 1, "the fixture needs a real home path: {home}");
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_share_profile_source(&source_path, &home)?;
+
+        // (profile, home path removed, email removed, hostname removed)
+        for (profile, strips_home, strips_email, strips_host) in [
+            (ShareProfile::Public, true, true, true),
+            (ShareProfile::Team, true, true, false),
+            (ShareProfile::Personal, false, false, false),
+        ] {
+            let output_path = temp_dir.path().join(format!("{}.db", profile.label()));
+            let filter = ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Full,
+            };
+            let stats = ExportEngine::new(&source_path, &output_path, filter)
+                .with_share_profile(profile)
+                .execute(|_, _| {}, None)?;
+            assert_eq!(stats.messages_processed, 1);
+
+            let conn = open_franken_db(&output_path)?;
+            let text = exported_text(&conn)?;
+            let label = profile.label();
+            assert_eq!(
+                !text.contains(&format!("{home}/share-profile-project")),
+                strips_home,
+                "{label}: home path"
+            );
+            assert_eq!(
+                !text.contains("alice@example.com"),
+                strips_email,
+                "{label}: email"
+            );
+            assert_eq!(
+                !text.contains("build.internal.example"),
+                strips_host,
+                "{label}: hostname"
+            );
+
+            assert_eq!(
+                query_string(
+                    &conn,
+                    "SELECT value FROM export_meta WHERE key='share_profile'"
+                )?,
+                label
+            );
+            let counts: serde_json::Value = serde_json::from_str(&query_string(
+                &conn,
+                "SELECT value FROM export_meta WHERE key='share_redactions'",
+            )?)?;
+            for (kind, expected) in [
+                ("home_path", strips_home),
+                ("email", strips_email),
+                ("hostname", strips_host),
+            ] {
+                assert_eq!(
+                    counts
+                        .get(kind)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                        > 0,
+                    expected,
+                    "{label}: share_redactions.{kind} in {counts}"
+                );
+            }
+            let meta = query_string(&conn, "SELECT group_concat(value, ' ') FROM export_meta")?;
+            assert!(
+                !meta.contains(&home) && !meta.contains("alice@"),
+                "{label}: export_meta must hold counts, not values: {meta}"
+            );
+            // Metadata stays valid JSON after its string values are redacted.
+            let metadata: serde_json::Value = serde_json::from_str(&query_string(
+                &conn,
+                "SELECT metadata_json FROM conversations WHERE id=1",
+            )?)?;
+            assert!(metadata["cwd"].is_string(), "{label}: {metadata}");
+        }
+        Ok(())
+    }
+
+    /// Export `source` under `profile` into a plaintext site directory that
+    /// carries just the config and payload the share-profile check reads.
+    fn plaintext_site(source: &Path, root: &Path, profile: ShareProfile) -> Result<PathBuf> {
+        let site = root.join(format!("{}-site", profile.label()));
+        std::fs::create_dir_all(site.join("payload"))?;
+        let payload = site.join("payload/data.db");
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Full,
+        };
+        ExportEngine::new(source, &payload, filter)
+            .with_share_profile(profile)
+            .execute(|_, _| {}, None)?;
+        let config = serde_json::json!({
+            "encrypted": false,
+            "version": "1.0.0",
+            "payload": {
+                "path": "payload/data.db",
+                "format": "sqlite",
+                "size_bytes": std::fs::metadata(&payload)?.len(),
+            },
+        });
+        std::fs::write(site.join("config.json"), config.to_string())?;
+        Ok(site)
+    }
+
+    /// Write straight into the exported payload, as a hand edit would.
+    fn tamper(site: &Path, sql: &str) -> Result<()> {
+        let conn = open_franken_db(&site.join("payload/data.db"))?;
+        conn.execute(sql)?;
+        conn.close()?;
+        Ok(())
+    }
+
+    /// 2l1b0.60: `cass pages --verify` reports the profile a plaintext archive
+    /// declares and fails when a value that profile removes is present, on any
+    /// surface including the FTS index. Negative controls: before this check,
+    /// verification never opened the payload, so every tampered bundle below
+    /// passed; and a value the declared profile keeps (a hostname under
+    /// team) must not fail it.
+    #[test]
+    fn verify_rescans_a_plaintext_bundle_with_its_declared_share_profile() -> Result<()> {
+        let home = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("no home directory"))?;
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_share_profile_source(&source_path, &home)?;
+
+        let public = plaintext_site(&source_path, temp_dir.path(), ShareProfile::Public)?;
+        let clean = verify_bundle(&public, false)?;
+        assert!(
+            clean.checks.share_profile.passed,
+            "{:?}",
+            clean.checks.share_profile
+        );
+        assert_eq!(clean.share_profile.declared.as_deref(), Some("public"));
+        assert!(clean.share_profile.rescanned);
+        assert!(clean.share_profile.residual.is_empty());
+
+        tamper(
+            &public,
+            "UPDATE messages SET content = content || ' cc alice@example.com'",
+        )?;
+        tamper(
+            &public,
+            "INSERT INTO messages_code_fts (content) VALUES ('curl https://build.internal.example/x')",
+        )?;
+        let leaked = verify_bundle(&public, false)?;
+        assert!(!leaked.checks.share_profile.passed);
+        assert_eq!(
+            leaked.share_profile.residual.keys().collect::<Vec<_>>(),
+            ["messages.content", "messages_code_fts.content"],
+            "{:?}",
+            leaked.share_profile
+        );
+        let details = leaked.checks.share_profile.details.unwrap_or_default();
+        assert!(
+            details.contains("'public'") && !details.contains("alice@"),
+            "the failure names surfaces and counts, never values: {details}"
+        );
+
+        // Team keeps hostnames but removes email addresses.
+        let team = plaintext_site(&source_path, temp_dir.path(), ShareProfile::Team)?;
+        tamper(
+            &team,
+            "UPDATE messages SET content = content || ' via https://build.internal.example'",
+        )?;
+        let kept = verify_bundle(&team, false)?;
+        assert!(kept.checks.share_profile.passed, "{:?}", kept.share_profile);
+        tamper(
+            &team,
+            "UPDATE conversations SET title = title || ' (alice@example.com)'",
+        )?;
+        let removed = verify_bundle(&team, false)?;
+        assert_eq!(
+            removed.share_profile.residual.keys().collect::<Vec<_>>(),
+            ["conversations.title"]
+        );
+
+        // A profile verification cannot check fails; no profile only warns.
+        tamper(
+            &team,
+            "UPDATE export_meta SET value = 'custom' WHERE key = 'share_profile'",
+        )?;
+        let unknown = verify_bundle(&team, false)?;
+        assert!(!unknown.checks.share_profile.passed);
+        assert!(!unknown.share_profile.rescanned);
+        tamper(&team, "DELETE FROM export_meta WHERE key = 'share_profile'")?;
+        let undeclared = verify_bundle(&team, false)?;
+        assert!(undeclared.checks.share_profile.passed);
+        assert_eq!(undeclared.share_profile.declared, None);
+        assert!(
+            undeclared
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("records no share profile")),
+            "{:?}",
+            undeclared.warnings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unchosen_share_profile_defaults_to_strictest_for_plaintext() {
+        assert_eq!(ShareProfile::default_for(false), ShareProfile::Public);
+        assert_eq!(ShareProfile::default_for(true), ShareProfile::Team);
     }
 }

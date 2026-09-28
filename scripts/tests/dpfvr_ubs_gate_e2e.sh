@@ -9,6 +9,210 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# These cases exercise the production batched-gate parsers directly. Inputs are
+# terminal-output fixtures, not substitute cargo/ubs executables or live proof.
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ]; then
+    proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
+    gate="$PROJECT_ROOT/scripts/gate.sh"
+    pass=0
+    fail=0
+    check_exit() {
+        local label="$1" expected="$2" actual=0
+        shift 2
+        "$@" > "$proof_dir/$label.log" 2>&1 || actual=$?
+        if [ "$actual" -eq "$expected" ]; then
+            echo "PASS $label"
+            pass=$((pass + 1))
+        else
+            echo "FAIL $label expected=$expected actual=$actual"
+            cat "$proof_dir/$label.log"
+            fail=$((fail + 1))
+        fi
+    }
+    if [ "${1:-}" = --formatter-only ]; then
+        # Use real cargo-fmt and rustfmt for both format outcomes. Then inject
+        # process failures through cargo-fmt's RUSTFMT override: the waiting
+        # shell must preserve a normal error, SIGABRT, and silent SIGKILL.
+        # No project source is formatted in place and all fixtures are retained.
+        ulimit -c 0
+        export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | cut -d' ' -f1)}"
+        export CASS_TEST_REAL_RUSTFMT="$(rustup which rustfmt)"
+        mkdir -p "$proof_dir/crate/src"
+        cat > "$proof_dir/crate/Cargo.toml" <<'TOML'
+[package]
+name = "cass-format-gate-probe"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+TOML
+        printf 'fn main() {}\n' > "$proof_dir/crate/src/main.rs"
+        cd "$proof_dir/crate" || exit 1
+        check_exit formatter-clean 0 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
+        printf 'fn main(){ }\n' > src/main.rs
+        check_exit formatter-diff 1 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
+        cat > "$proof_dir/formatter-process-failure" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+    exec "${CASS_TEST_REAL_RUSTFMT:?}" "$@"
+fi
+case "${CASS_TEST_FORMATTER_FAILURE:?}" in
+    error) exit 42 ;;
+    abort) kill -ABRT "$$" ;;
+    kill) kill -KILL "$$" ;;
+    *) exit 99 ;;
+esac
+SH
+        chmod +x "$proof_dir/formatter-process-failure"
+        check_exit formatter-error 42 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=error bash "$gate" --verify-fmt
+        check_exit formatter-abort 134 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=abort bash "$gate" --verify-fmt
+        check_exit formatter-killed 137 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=kill bash "$gate" --verify-fmt
+        echo "Formatter gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
+    receipt="$proof_dir/complete.txt"
+    cat > "$receipt" <<'RECEIPT'
+STAGE=source-identity EXIT=0
+STAGE=source-freshness EXIT=0
+STAGE=fmt EXIT=0
+STAGE=clippy EXIT=0
+STAGE=ubs EXIT=0
+TEST_COUNT=lib-tests PASSED=4 BINARIES=1
+STAGE=lib-tests EXIT=0
+TEST_COUNT=test-e2e_lexical_fail_open PASSED=1 BINARIES=1
+STAGE=test-e2e_lexical_fail_open EXIT=0
+TEST_COUNT=goldens PASSED=20 BINARIES=2
+STAGE=goldens EXIT=0
+STAGE=job-complete EXIT=0
+RECEIPT
+    expected=(source-identity source-freshness fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete)
+    check_exit digits-and-positive-counts 0 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}"
+    check_exit transport-refusal 1 bash "$gate" --verify-receipt "$receipt" 103 "${expected[@]}"
+    check_exit transport-timeout 1 bash "$gate" --verify-receipt "$receipt" 124 "${expected[@]}"
+    for stage in source-identity source-freshness fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete; do
+        awk -v stage="$stage" '$0 != "STAGE=" stage " EXIT=0"' "$receipt" > "$proof_dir/missing-$stage.txt"
+        check_exit "missing-$stage" 1 bash "$gate" --verify-receipt "$proof_dir/missing-$stage.txt" 0 "${expected[@]}"
+        awk -v stage="$stage" '{if ($0 == "STAGE=" stage " EXIT=0") print "STAGE=" stage " EXIT=1"; else print}' \
+            "$receipt" > "$proof_dir/failing-$stage.txt"
+        check_exit "failing-$stage" 1 bash "$gate" --verify-receipt "$proof_dir/failing-$stage.txt" 0 "${expected[@]}"
+    done
+    awk '!/^TEST_COUNT=/' "$receipt" > "$proof_dir/no-counts.txt"
+    check_exit no-test-counts 1 bash "$gate" --verify-receipt "$proof_dir/no-counts.txt" 0 "${expected[@]}"
+    cat "$receipt" "$receipt" > "$proof_dir/duplicate.txt"
+    check_exit duplicate-stage 1 bash "$gate" --verify-receipt "$proof_dir/duplicate.txt" 0 "${expected[@]}"
+    { cat "$receipt"; echo 'STAGE=unexpected-after-completion EXIT=0'; } > "$proof_dir/not-terminal.txt"
+    check_exit nonterminal-job-complete 1 bash "$gate" --verify-receipt "$proof_dir/not-terminal.txt" 0 "${expected[@]}"
+    check_exit stale-docs-binary 1 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}" docs-build docs-binary-identity docs-truth
+
+    printf 'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
+    printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
+    printf 'running 3 tests\n' > "$proof_dir/tests-truncated.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-empty.txt" > "$proof_dir/tests-mixed.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-positive.txt" > "$proof_dir/tests-two-binaries.txt"
+    check_exit positive-tests 0 bash "$gate" --verify-test-log "$proof_dir/tests-positive.txt"
+    check_exit two-positive-binaries 0 bash "$gate" --verify-test-log "$proof_dir/tests-two-binaries.txt"
+    check_exit zero-selected-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-empty.txt"
+    check_exit truncated-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-truncated.txt"
+    check_exit positive-and-empty-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-mixed.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-truncated.txt" > "$proof_dir/tests-tail-truncated.txt"
+    check_exit positive-and-truncated-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-tail-truncated.txt"
+    printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-missing-start.txt"
+    check_exit missing-test-start 1 bash "$gate" --verify-test-log "$proof_dir/tests-missing-start.txt"
+    { cat "$proof_dir/tests-positive.txt"; echo 'test result: FAILED. 1 passed; 1 failed;'; } > "$proof_dir/tests-failed.txt"
+    check_exit positive-and-failed-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-failed.txt"
+
+    # A real lib test self-spawns with inherited output: its one-test summary
+    # appears between the outer run start and its final 45-test summary.
+    # Accept balanced nesting without inflating the top-level assertion count.
+    cat > "$proof_dir/tests-child.txt" <<'TESTS'
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7073 filtered out
+TESTS
+    {
+        echo 'running 45 tests'
+        cat "$proof_dir/tests-child.txt"
+        echo 'test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 7029 filtered out'
+    } > "$proof_dir/tests-nested.txt"
+    check_exit nested-child-tests 0 bash "$gate" --verify-test-log "$proof_dir/tests-nested.txt"
+    check_exit nested-child-counted-once 0 rg -x -F 'PASSED=45 BINARIES=1' "$proof_dir/nested-child-tests.log"
+    {
+        echo 'running 2 tests'
+        cat "$proof_dir/tests-nested.txt"
+        echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+        cat "$proof_dir/tests-positive.txt"
+    } > "$proof_dir/tests-deep-nested.txt"
+    check_exit deep-nesting-and-next-binary 0 bash "$gate" --verify-test-log "$proof_dir/tests-deep-nested.txt"
+    check_exit deep-nesting-counted-once 0 rg -x -F 'PASSED=5 BINARIES=2' "$proof_dir/deep-nesting-and-next-binary.log"
+    { echo 'running 45 tests'; cat "$proof_dir/tests-child.txt"; } > "$proof_dir/tests-parent-truncated.txt"
+    check_exit completed-child-missing-parent 1 bash "$gate" --verify-test-log "$proof_dir/tests-parent-truncated.txt"
+    {
+        echo 'running 45 tests'
+        echo 'running 1 test'
+        echo 'test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-truncated.txt"
+    check_exit parent-cannot-close-missing-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-truncated.txt"
+    {
+        echo 'running 3 tests'
+        cat "$proof_dir/tests-empty.txt"
+        echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-empty.txt"
+    check_exit nested-empty-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-empty.txt"
+    {
+        echo 'running 3 tests'
+        echo 'running 1 test'
+        echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'
+        echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-failed.txt"
+    check_exit nested-failed-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-failed.txt"
+    printf 'running 3 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' > "$proof_dir/tests-count-mismatch.txt"
+    check_exit mismatched-test-count 1 bash "$gate" --verify-test-log "$proof_dir/tests-count-mismatch.txt"
+    printf 'running 3 tests\ntest result: ok. 1 passed; 0 failed; 1 ignored; 1 measured; 0 filtered out\n' > "$proof_dir/tests-accounted.txt"
+    check_exit ignored-and-measured-accounted 0 bash "$gate" --verify-test-log "$proof_dir/tests-accounted.txt"
+    printf 'running 3 tests\ntest result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n' > "$proof_dir/tests-false-ok.txt"
+    check_exit nonzero-failures-in-ok-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-false-ok.txt"
+    { cat "$proof_dir/tests-positive.txt"; echo 'test result: ok. 1 passed;'; } > "$proof_dir/tests-malformed-summary.txt"
+    check_exit malformed-terminal-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-malformed-summary.txt"
+    check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
+
+    # Exercise actual source admission and filesystem timestamps, without
+    # invoking or substituting Cargo. An old build-script fingerprint must
+    # become older than its verified input while the input bytes stay exact.
+    mkdir -p "$proof_dir/inputs/src with spaces"
+    printf 'fn main() {}\n' > "$proof_dir/inputs/build.rs"
+    printf 'pub fn value() -> u8 { 1 }\n' > "$proof_dir/inputs/src with spaces/lib.rs"
+    input_paths="$(printf '%s\0' "$proof_dir/inputs/build.rs" \
+        "$proof_dir/inputs/src with spaces/lib.rs" | gzip -c | base64 -w0)"
+    input_digest="$(printf '%s' "$input_paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)"
+    touch -t 200001010000 "$proof_dir/inputs/build.rs" "$proof_dir/inputs/src with spaces/lib.rs"
+    printf 'retained Cargo fingerprint\n' > "$proof_dir/old-fingerprint"
+    touch -t 200001020000 "$proof_dir/old-fingerprint"
+    check_exit old-inputs-refreshed 0 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit build-script-newer-than-cache 0 test "$proof_dir/inputs/build.rs" -nt "$proof_dir/old-fingerprint"
+    check_exit spaced-input-newer-than-cache 0 test "$proof_dir/inputs/src with spaces/lib.rs" -nt "$proof_dir/old-fingerprint"
+    refreshed_digest="$(printf '%s' "$input_paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)"
+    check_exit refreshed-input-bytes-unchanged 0 test "$refreshed_digest" = "$input_digest"
+
+    printf 'fn main() { panic!("drift"); }\n' > "$proof_dir/inputs/build.rs"
+    touch -t 200001010000 "$proof_dir/inputs/build.rs"
+    check_exit changed-input-refused 1 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit changed-input-not-refreshed 0 test "$proof_dir/old-fingerprint" -nt "$proof_dir/inputs/build.rs"
+    check_exit changed-input-never-admitted 1 grep -q '^STAGE=source-freshness ' "$proof_dir/changed-input-refused.log"
+
+    # Preserve the fixture under another name; admission must not recreate it.
+    mv "$proof_dir/inputs/build.rs" "$proof_dir/inputs/build.rs.retained"
+    check_exit missing-input-refused 1 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit missing-input-not-created 1 test -e "$proof_dir/inputs/build.rs"
+    check_exit missing-input-never-admitted 1 grep -q '^STAGE=source-freshness ' "$proof_dir/missing-input-refused.log"
+    empty_digest="$(printf '' | sha256sum | cut -d' ' -f1)"
+    check_exit malformed-input-list-refused 1 bash "$gate" --verify-compile-inputs 'not-base64!' "$empty_digest"
+    echo "Batched gate parser: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+    [ "$fail" -eq 0 ]
+    exit $?
+fi
+
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/cass-dpfvr-target}"
 LOG="$RCH_TARGET_DIR/dpfvr-e2e.log"
 mkdir -p "$RCH_TARGET_DIR"
@@ -87,7 +291,7 @@ fi
 TMP_DIR="$(mktemp -d)"
 git -C "$PROJECT_ROOT" worktree add "$TMP_DIR" HEAD >/dev/null 2>&1 || true
 if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
-    cd "$TMP_DIR"
+    cd "$TMP_DIR" || exit 1
     mkdir -p tests/fixtures
     echo '{}' > tests/fixtures/synthetic.json
     git add tests/fixtures/synthetic.json 2>/dev/null || true
@@ -96,7 +300,7 @@ if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
     # The fixture .json should NOT match — UBS only filters extensions in the gate's list.
     file_count=$([ -z "$files" ] && echo 0 || echo "$files" | wc -l)
     expect_eq "scenario=fixture_only_change skips invocation" "$file_count" "0"
-    cd "$PROJECT_ROOT"
+    cd "$PROJECT_ROOT" || exit 1
     git -C "$PROJECT_ROOT" worktree remove --force "$TMP_DIR" >/dev/null 2>&1 || rm -rf "$TMP_DIR"
 fi
 

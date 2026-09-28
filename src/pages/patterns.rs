@@ -7,6 +7,12 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::indexer::redact_secrets::{
+    ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
+    AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
+    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, OPENAI_API_KEY_PATTERN,
+    SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+};
 use crate::pages::redact::CustomPattern;
 
 /// Categories of sensitive patterns for organizational clarity.
@@ -25,6 +31,18 @@ pub enum PatternCategory {
 }
 
 impl PatternCategory {
+    /// Credentials, as opposed to identity or personal data. A Pages export
+    /// leaves these to the staged secret scan, which rejects the export,
+    /// instead of publishing a silently rewritten secret.
+    pub fn is_credential(self) -> bool {
+        matches!(
+            self,
+            PatternCategory::ApiKeys
+                | PatternCategory::PrivateKeys
+                | PatternCategory::ConnectionStrings
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             PatternCategory::ApiKeys => "API Keys & Tokens",
@@ -55,8 +73,8 @@ pub static AWS_ACCESS_KEY: PatternDef = PatternDef {
     id: "aws_access_key",
     name: "AWS Access Key ID",
     category: PatternCategory::ApiKeys,
-    description: "AWS access key identifiers (AKIA...)",
-    pattern: r"\bAKIA[0-9A-Z]{16}\b",
+    description: "AWS long-lived and temporary access key identifiers (AKIA... / ASIA...)",
+    pattern: AWS_ACCESS_KEY_PATTERN,
     replacement: "[AWS_KEY_REDACTED]",
 };
 
@@ -65,16 +83,25 @@ pub static AWS_SECRET_KEY: PatternDef = PatternDef {
     name: "AWS Secret Key",
     category: PatternCategory::ApiKeys,
     description: "AWS secret access keys in configuration contexts",
-    pattern: r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
+    pattern: AWS_SECRET_KEY_PATTERN,
     replacement: "[AWS_SECRET_REDACTED]",
+};
+
+pub static AWS_SESSION_TOKEN: PatternDef = PatternDef {
+    id: "aws_session_token",
+    name: "AWS Session Token",
+    category: PatternCategory::ApiKeys,
+    description: "AWS STS session/security tokens in configuration contexts",
+    pattern: AWS_SESSION_TOKEN_PATTERN,
+    replacement: "[AWS_SESSION_TOKEN_REDACTED]",
 };
 
 pub static OPENAI_KEY: PatternDef = PatternDef {
     id: "openai_key",
     name: "OpenAI API Key",
     category: PatternCategory::ApiKeys,
-    description: "OpenAI API keys (sk-...)",
-    pattern: r"\bsk-[A-Za-z0-9]{20,}\b",
+    description: "OpenAI legacy, project, and admin API keys",
+    pattern: OPENAI_API_KEY_PATTERN,
     replacement: "[OPENAI_KEY_REDACTED]",
 };
 
@@ -82,8 +109,8 @@ pub static ANTHROPIC_KEY: PatternDef = PatternDef {
     id: "anthropic_key",
     name: "Anthropic API Key",
     category: PatternCategory::ApiKeys,
-    description: "Anthropic API keys (sk-ant-...)",
-    pattern: r"\bsk-ant-[A-Za-z0-9\-]{20,}\b",
+    description: "Anthropic API keys, including segmented apiNN keys",
+    pattern: ANTHROPIC_API_KEY_PATTERN,
     replacement: "[ANTHROPIC_KEY_REDACTED]",
 };
 
@@ -91,8 +118,8 @@ pub static GITHUB_TOKEN: PatternDef = PatternDef {
     id: "github_token",
     name: "GitHub Token",
     category: PatternCategory::ApiKeys,
-    description: "GitHub personal access tokens and app tokens",
-    pattern: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+    description: "GitHub classic, fine-grained personal access, and app tokens",
+    pattern: GITHUB_TOKEN_PATTERN,
     replacement: "[GITHUB_TOKEN_REDACTED]",
 };
 
@@ -101,7 +128,7 @@ pub static GENERIC_API_KEY: PatternDef = PatternDef {
     name: "Generic API Key",
     category: PatternCategory::ApiKeys,
     description: "Generic API keys, tokens, and secrets in assignment contexts",
-    pattern: r#"(?i)(api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token|secret[_-]?key)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?"#,
+    pattern: GENERIC_SECRET_ASSIGNMENT_PATTERN,
     replacement: "[API_KEY_REDACTED]",
 };
 
@@ -110,20 +137,57 @@ pub static BEARER_TOKEN: PatternDef = PatternDef {
     name: "Bearer Token",
     category: PatternCategory::ApiKeys,
     description: "Bearer authorization tokens in headers",
-    pattern: r"(?i)Bearer\s+[A-Za-z0-9\-_.~+/]+=*",
+    pattern: BEARER_TOKEN_PATTERN,
     replacement: "Bearer [TOKEN_REDACTED]",
+};
+
+pub static SLACK_TOKEN: PatternDef = PatternDef {
+    id: "slack_token",
+    name: "Slack Token",
+    category: PatternCategory::ApiKeys,
+    description: "Slack xox-family service and user tokens",
+    pattern: SLACK_TOKEN_PATTERN,
+    replacement: "[SLACK_TOKEN_REDACTED]",
+};
+
+pub static STRIPE_KEY: PatternDef = PatternDef {
+    id: "stripe_key",
+    name: "Stripe Live Key",
+    category: PatternCategory::ApiKeys,
+    description: "Stripe live secret, publishable, and restricted keys",
+    pattern: STRIPE_KEY_PATTERN,
+    replacement: "[STRIPE_KEY_REDACTED]",
 };
 
 // ============================================================================
 // Private Keys
 // ============================================================================
 
+const SSH_PRIVATE_KEY_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN EC PRIVATE KEY-----.*?(?:-----END EC PRIVATE KEY-----|\z)|",
+    r"-----BEGIN DSA PRIVATE KEY-----.*?(?:-----END DSA PRIVATE KEY-----|\z)|",
+    r"-----BEGIN OPENSSH PRIVATE KEY-----.*?(?:-----END OPENSSH PRIVATE KEY-----|\z)",
+    r")",
+);
+
+const PEM_PRIVATE_KEY_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN PRIVATE KEY-----.*?(?:-----END PRIVATE KEY-----|\z)|",
+    r"-----BEGIN ENCRYPTED PRIVATE KEY-----.*?(?:-----END ENCRYPTED PRIVATE KEY-----|\z)",
+    r")",
+);
+
+const PGP_PRIVATE_KEY_PATTERN: &str =
+    r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)";
+
 pub static SSH_PRIVATE_KEY: PatternDef = PatternDef {
     id: "ssh_private_key",
     name: "SSH Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "SSH and OpenSSH private key headers",
-    pattern: r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+    description: "Complete or truncated SSH and OpenSSH private key blocks",
+    pattern: SSH_PRIVATE_KEY_PATTERN,
     replacement: "[PRIVATE_KEY_REDACTED]",
 };
 
@@ -131,8 +195,8 @@ pub static PEM_PRIVATE_KEY: PatternDef = PatternDef {
     id: "pem_private_key",
     name: "PEM Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "PEM-encoded private keys",
-    pattern: r"-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----",
+    description: "Complete or truncated PKCS#8 private key blocks",
+    pattern: PEM_PRIVATE_KEY_PATTERN,
     replacement: "[PRIVATE_KEY_REDACTED]",
 };
 
@@ -140,8 +204,8 @@ pub static PGP_PRIVATE_KEY: PatternDef = PatternDef {
     id: "pgp_private_key",
     name: "PGP Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "PGP/GPG private key blocks",
-    pattern: r"-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    description: "Complete or truncated PGP/GPG private key blocks",
+    pattern: PGP_PRIVATE_KEY_PATTERN,
     replacement: "[PGP_KEY_REDACTED]",
 };
 
@@ -154,7 +218,7 @@ pub static DATABASE_URL: PatternDef = PatternDef {
     name: "Database URL",
     category: PatternCategory::ConnectionStrings,
     description: "PostgreSQL, MySQL, MongoDB, and Redis connection strings",
-    pattern: r#"(?i)\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'""]+"#,
+    pattern: DATABASE_URL_PATTERN,
     replacement: "[DATABASE_URL_REDACTED]",
 };
 
@@ -266,11 +330,14 @@ pub static ALL_PATTERNS: Lazy<Vec<&'static PatternDef>> = Lazy::new(|| {
         // API Keys
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
         &GENERIC_API_KEY,
         &BEARER_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // Private Keys
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -313,11 +380,14 @@ pub fn patterns_for_public() -> Vec<CustomPattern> {
         // All API keys and tokens
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
         &GENERIC_API_KEY,
         &BEARER_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // All private keys
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -352,9 +422,12 @@ pub fn patterns_for_team() -> Vec<CustomPattern> {
         // External API keys only
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         &OPENAI_KEY,
         &ANTHROPIC_KEY,
         &GITHUB_TOKEN,
+        &SLACK_TOKEN,
+        &STRIPE_KEY,
         // Private keys (always sensitive)
         &SSH_PRIVATE_KEY,
         &PEM_PRIVATE_KEY,
@@ -386,6 +459,7 @@ pub fn patterns_for_personal() -> Vec<CustomPattern> {
         // Cloud provider keys
         &AWS_ACCESS_KEY,
         &AWS_SECRET_KEY,
+        &AWS_SESSION_TOKEN,
         // Database credentials with passwords
         &DATABASE_PASSWORD,
     ];
@@ -394,6 +468,14 @@ pub fn patterns_for_personal() -> Vec<CustomPattern> {
         .iter()
         .filter_map(|p| p.to_custom_pattern())
         .collect()
+}
+
+/// Whether a custom pattern named `name` is one of [`ALL_PATTERNS`]'
+/// credential patterns (pattern names are unique).
+pub fn is_credential_pattern(name: &str) -> bool {
+    ALL_PATTERNS
+        .iter()
+        .any(|pattern| pattern.name == name && pattern.category.is_credential())
 }
 
 /// Get patterns by category.
@@ -464,17 +546,83 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_matches_aws_key() {
-        let pattern = Regex::new(AWS_ACCESS_KEY.pattern).unwrap();
-        assert!(pattern.is_match("Found key AKIAIOSFODNN7EXAMPLE in config"));
-        assert!(!pattern.is_match("Not a key"));
+    fn test_pattern_matches_aws_key() -> Result<(), String> {
+        let pattern = Regex::new(AWS_ACCESS_KEY.pattern).map_err(|error| error.to_string())?;
+        let cases = [
+            ("Found key AKIAIOSFODNN7EXAMPLE in config", true),
+            ("Temporary key ASIAIOSFODNN7EXAMPLE in config", true),
+            ("ASIAIOSFODNN7EXAMPL", false),
+            ("asiaiosfodnn7example", false),
+            ("Not a key", false),
+        ];
+        match cases
+            .into_iter()
+            .find(|(input, expected)| pattern.is_match(input) != *expected)
+        {
+            Some((input, expected)) => Err(format!(
+                "AWS access-key matcher returned {} for {input:?}, expected {expected}",
+                pattern.is_match(input)
+            )),
+            None => Ok(()),
+        }
     }
 
     #[test]
     fn test_pattern_matches_openai_key() {
         let pattern = Regex::new(OPENAI_KEY.pattern).unwrap();
         assert!(pattern.is_match("Using sk-abc123def456ghi789jkl012mno345pqr678"));
+        assert!(pattern.is_match("sk-proj-AbCdEf_0123456789-xYz987654321"));
+        assert!(pattern.is_match("sk-admin-AbCdEf_0123456789-xYz987654321"));
         assert!(!pattern.is_match("sk-short")); // Too short
+        assert!(!pattern.is_match("sk-project-AbCdEf_0123456789-xYz987654321"));
+    }
+
+    #[test]
+    fn current_provider_and_assignment_patterns_are_covered() {
+        let stripe_key = format!("{}_{}", "sk_live", "ABCdef0123456789AAAAbbbb0007");
+        let cases = [
+            (
+                &ANTHROPIC_KEY,
+                "sk-ant-api03-AbCdEf_0123456789-xYz987654321",
+            ),
+            (&GITHUB_TOKEN, "github_pat_AbCdEf_0123456789_xYz987654321"),
+            (
+                &AWS_SESSION_TOKEN,
+                "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
+            ),
+            (&SLACK_TOKEN, "xoxo-1234567890-abcdefghij"),
+            (&STRIPE_KEY, stripe_key.as_str()),
+            (
+                &GENERIC_API_KEY,
+                "password=\"correct horse battery staple!\"",
+            ),
+            (&GENERIC_API_KEY, "api_key:'abc.def$ghi'"),
+            (&BEARER_TOKEN, "Bearer ab/cd+ef=gh~ij"),
+        ];
+
+        for (definition, input) in cases {
+            let pattern = Regex::new(definition.pattern).unwrap();
+            assert!(
+                pattern.is_match(input),
+                "{} did not match {input:?}",
+                definition.id
+            );
+        }
+
+        for (definition, near_miss) in [
+            (&ANTHROPIC_KEY, "sk-ant-api03-short"),
+            (&GITHUB_TOKEN, "github_pat_short"),
+            (&AWS_SESSION_TOKEN, "AWS_SESSION_TOKEN=short"),
+            (&GENERIC_API_KEY, "password=short"),
+            (&BEARER_TOKEN, "Bearer short"),
+        ] {
+            let pattern = Regex::new(definition.pattern).unwrap();
+            assert!(
+                !pattern.is_match(near_miss),
+                "{} overmatched {near_miss:?}",
+                definition.id
+            );
+        }
     }
 
     #[test]
@@ -499,14 +647,54 @@ mod tests {
         let pattern = Regex::new(DATABASE_URL.pattern).unwrap();
         assert!(pattern.is_match("postgres://user:pass@host:5432/db"));
         assert!(pattern.is_match("mongodb+srv://user:pass@cluster.mongodb.net/db"));
+        assert!(pattern.is_match("amqp://user:pass@broker.internal/vhost"));
         assert!(pattern.is_match("redis://localhost:6379"));
     }
 
     #[test]
-    fn test_pattern_matches_private_key() {
-        let pattern = Regex::new(SSH_PRIVATE_KEY.pattern).unwrap();
-        assert!(pattern.is_match("-----BEGIN RSA PRIVATE KEY-----"));
-        assert!(pattern.is_match("-----BEGIN OPENSSH PRIVATE KEY-----"));
-        assert!(pattern.is_match("-----BEGIN PRIVATE KEY-----"));
+    fn test_private_key_patterns_redact_entire_block() -> Result<(), String> {
+        let cases = [
+            (
+                &SSH_PRIVATE_KEY,
+                "before\n-----BEGIN RSA PRIVATE KEY-----\nFIRST_SECRET\n-----END EC PRIVATE KEY-----\nSECOND_SECRET\n-----END RSA PRIVATE KEY-----\nafter", // ubs:ignore — synthetic malformed-key fixture verifies fail-closed redaction.
+                "before\n[PRIVATE_KEY_REDACTED]\nafter",
+            ),
+            (
+                &SSH_PRIVATE_KEY,
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nTRUNCATED_SECRET",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PEM_PRIVATE_KEY,
+                "-----BEGIN PRIVATE KEY-----\nPKCS8_SECRET\n-----END PRIVATE KEY-----",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PEM_PRIVATE_KEY,
+                "-----BEGIN ENCRYPTED PRIVATE KEY-----\nTRUNCATED_SECRET",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PGP_PRIVATE_KEY,
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\nPGP_SECRET\n-----END PGP PRIVATE KEY BLOCK-----",
+                "[PGP_KEY_REDACTED]",
+            ),
+        ];
+
+        for (definition, input, expected) in cases {
+            let pattern = definition
+                .to_custom_pattern()
+                .ok_or_else(|| format!("{} pattern did not compile", definition.name))?;
+            let actual = pattern
+                .pattern
+                .replace_all(input, pattern.replacement.as_str());
+            if actual != expected {
+                return Err(format!(
+                    "{} left private-key bytes visible: {actual}",
+                    definition.name
+                ));
+            }
+        }
+        Ok(())
     }
 }

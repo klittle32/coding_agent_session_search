@@ -47,18 +47,41 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensqlite",
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
-        // crates.io-only exact pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.1, which carries the asupersync
-        // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
-        // cass#393 namespace-sidecar st_dev repair, and the 0.3.1
-        // allocator/freelist/concurrent-writer correctness wave).
-        // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to require a bare `=0.3.1` registry pin. Whole-family registry
-        // convergence is enforced by `validate_fsqlite_registry_pin`.
+        // Exact upstream source pin (established with the fsqlite 0.2.1
+        // migration, bead bo000; now at 0.4.4. 0.3.15 was evaluated on
+        // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
+        // writable open still looped on a large archive with a large WAL
+        // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
+        // 0.3.16 carries that fix — frankensqlite 8d012706a, index the
+        // appended WAL tail once per stable tail instead of rescanning it
+        // per page — plus the GH#405 FTS5 undo log (savepoints no longer
+        // clone the whole table), the GH#406 content-backed INSERT as an
+        // incremental segment append, lazy contentless FTS5 on the ordinary
+        // open path, prefix-BM25 scoring parity, and the 0.3.15 line (FTS5
+        // 'optimize', origin-poison self-heal, macOS clippy gate). Adopted
+        // 2026-09-04 by owner instruction. The 0.3.13 semantics CASS relies
+        // on (asupersync 0.4.3 runtime migration, GH#333/GH#334, the
+        // cass#393 namespace-sidecar repair, the GH#438 Windows sidecar-less
+        // read-only close, integrity-check through read-only guards, and
+        // the cass#434 autoindex-vanish fixes) all carry forward.
+        // 0.3.17 adds incremental WAL-tail folding, reserved lock-byte and
+        // freelist repair (GH#410), FTS metadata/visibility fixes (GH#408),
+        // and prepared-read schema-retry cleanup. 0.3.18 adds parameterized
+        // rowid seeks (GH#415/cass#382), read-only WAL preservation, reader
+        // registration error propagation and I/O lifetime fixes. The 0.4.1
+        // release preserves the facade API and requires asupersync 0.5.0.
+        // It includes the GH#462 reserved-page WAL repair and GH#411 shared
+        // WAL-index publication fixes; CASS archive acceptance is separate.
+        // 0.4.2 adds explicit derived WAL-index recovery for read-only
+        // connections, including the dedicated async owner (GH#477).
+        // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.4",
-        expected_features: &["fts5"],
+        expected_version: "0.4.4",
+        // `async-api` exposes frankensqlite::AsyncConnection, which
+        // src/search/query.rs uses (as SearchSqliteConnection) for the
+        // no-hit alternate-agent suggestions without a full storage open.
+        expected_features: &["fts5", "async-api"],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
         manifest_rel: "crates/fsqlite/Cargo.toml",
@@ -72,10 +95,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical registry release as the facade.
+        // The 0.4.4 release publishes the entire family at one version.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.4",
+        expected_version: "0.4.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -90,10 +113,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical registry release as the facade.
+        // Match the production shared types from the published family.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.4",
+        expected_version: "0.4.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -108,17 +131,26 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
+        // Fork pin on top of upstream 0.3.2. Letta Code is not on crates.io.
         expected_git: "https://github.com/klittle32/franken_agent_detection",
-        expected_rev: "0b04f8a2251ec775ecc23578793172976de15516",
-        expected_version: "0.1.12-letta-prime.1",
+        expected_rev: "87ee4b59dd5470582b89ed3b094c29c0795ff077",
+        expected_version: "0.3.3-letta.1",
+        // Match the always-on SQLite transcript readers in Cargo.toml. Their
+        // features are required even for --no-default-features CASS builds.
         expected_features: &[
             "chatgpt",
+            "codebuff",
             "connectors",
+            "copilot-vscdb",
             "crush",
             "cursor",
+            "devin",
             "goose",
+            "grok-bot",
             "hermes",
+            "openclaw-sqlite",
             "opencode",
+            "shelley",
         ],
         expected_default_features: None,
         repo_rel: "../franken_agent_detection",
@@ -135,14 +167,14 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
-        // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
-        // whose public API names asupersync 0.4.x types; 0.4.4 additionally
-        // preserves typed task results across cancellation acknowledgement.
+        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.6.1 use
+        // asupersync 0.5.x native contexts; mixing the old runtime would
+        // split caller context, cancellation and capability identity.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.5",
+        expected_version: "0.5.0",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -157,14 +189,15 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Pins the frankensearch rev carrying the pure-Rust `native` feature
-        // and the explicit `cass-compat` -> `lexical-tantivy` foreign-index
-        // surface. The latter keeps CASS schema-v8 access independent from
-        // FrankenSearch's swappable generic lexical backend (cass #308,
-        // bd-8nqz.5).
-        expected_rev: "46a3aefce1aa658fa98f27f0b3676f073160e15c",
-        expected_version: "0.3.2",
+        // Coordinated registry candidate with asupersync 0.5.0. Preserve
+        // explicit native MiniLM, Quill and cass-compat lexical behavior.
+        // The producer's 0.6.1 publication and CASS qualification must finish
+        // before release; a manifest pin alone is not runtime acceptance.
+        // Empty `expected_git` signals `validate_manifest_dependency_spec`
+        // to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.6.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
@@ -189,9 +222,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "ftui",
         crate_package_name: "ftui",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "5f78cfa0",
-        expected_version: "0.3.4",
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.5.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -206,9 +239,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "ftui-runtime",
         crate_package_name: "ftui-runtime",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "5f78cfa0",
-        expected_version: "0.3.4",
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.5.0",
         expected_features: &["crossterm-compat", "native-backend"],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -223,9 +256,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "ftui-tty",
         crate_package_name: "ftui-tty",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "5f78cfa0",
-        expected_version: "0.3.4",
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.5.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankentui",
@@ -240,9 +273,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "ftui-extras",
         crate_package_name: "ftui-extras",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "5f78cfa0",
-        expected_version: "0.3.4",
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.5.0",
         expected_features: &[
             "canvas",
             "charts",
@@ -270,9 +303,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "toon",
         crate_package_name: "tru",
         manifest_package_field: Some("tru"),
-        expected_git: "https://github.com/Dicklesworthstone/toon_rust",
-        expected_rev: "5669b72a",
-        expected_version: "0.2.2",
+        // GH#416: registry pin. crates.io 0.2.4 differs from the previously
+        // pinned git rev d7185c78 by exactly one TEST assertion line
+        // (src/decode/event_builder.rs); production sources are
+        // byte-identical (verified by tree diff, not the version field).
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.2.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../toon_rust",
@@ -287,6 +324,15 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
+
+    // MSVC reserves only 1 MiB for an executable's main thread by default.
+    // CASS's clap command graph and startup state exceed that in debug builds,
+    // causing even `cass --version` to abort before argument dispatch. Reserve
+    // virtual address space here for the actual binary; thread stacks remain
+    // independently bounded by their structured spawn sites.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-arg-bin=cass=/STACK:8388608");
+    }
 
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(value) => PathBuf::from(value),
@@ -311,6 +357,86 @@ fn main() {
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
     emit_build_commit_metadata(&manifest_dir);
+    emit_source_ingest_contract(&manifest_dir);
+}
+
+/// A completed source is reusable only by the parser/normalizer that read it.
+/// Hash build inputs rather than Git HEAD: release tarballs have no Git metadata,
+/// and two dirty builds at the same commit can contain different parser fixes.
+fn emit_source_ingest_contract(manifest_dir: &Path) {
+    // Cargo pins registry/git source bytes, but a local path dependency can
+    // change its parser without changing this crate's manifest or lockfile.
+    // Such development builds must reparse instead of reusing an unproven
+    // completion. In particular, hashing only a sibling's version is unsafe.
+    let lock_text = fs::read_to_string(manifest_dir.join("Cargo.lock"))
+        .unwrap_or_else(|error| fatal(format!("cannot read ingest dependency lock: {error}")));
+    let lock: Value = toml::from_str(&lock_text)
+        .unwrap_or_else(|error| fatal(format!("cannot parse ingest dependency lock: {error}")));
+    let crate_name = env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let pinned_dependencies =
+        lock.get("package")
+            .and_then(Value::as_array)
+            .is_some_and(|packages| {
+                !packages.is_empty()
+                    && packages.iter().all(|package| {
+                        package.get("source").and_then(Value::as_str).is_some()
+                            || (package.get("name").and_then(Value::as_str)
+                                == Some(crate_name.as_str())
+                                && package.get("version").and_then(Value::as_str)
+                                    == Some(crate_version.as_str()))
+                    })
+            });
+    println!("cargo:rustc-env=CASS_SOURCE_INGEST_REUSE={pinned_dependencies}");
+    let mut inputs = BTreeSet::from([
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("Cargo.lock"),
+        PathBuf::from("build.rs"),
+    ]);
+    let mut directories = vec![PathBuf::from("src")];
+    while let Some(directory) = directories.pop() {
+        println!("cargo:rerun-if-changed={}", directory.display());
+        let entries = fs::read_dir(manifest_dir.join(&directory))
+            .unwrap_or_else(|error| fatal(format!("cannot read ingest inputs: {error}")));
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|error| fatal(format!("cannot inspect ingest input: {error}")));
+            let path = directory.join(entry.file_name());
+            let kind = entry.file_type().unwrap_or_else(|error| {
+                fatal(format!("cannot inspect ingest input type: {error}"))
+            });
+            if kind.is_dir() {
+                directories.push(path);
+            } else {
+                inputs.insert(path);
+            }
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass-source-ingest-contract-v1\0");
+    for input in inputs {
+        println!("cargo:rerun-if-changed={}", input.display());
+        let name = input.to_string_lossy().replace('\\', "/");
+        let bytes = fs::read(manifest_dir.join(&input))
+            .unwrap_or_else(|error| fatal(format!("cannot read ingest input {name}: {error}")));
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    let features: BTreeSet<_> = env::vars()
+        .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
+        .collect();
+    for (name, value) in features {
+        hasher.update(name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    println!(
+        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
+        hasher.finalize()
+    );
 }
 
 /// Embed the build commit at compile time (GH #399).
@@ -385,7 +511,7 @@ fn validate_path_dependency_contracts(
     packaged_manifest: bool,
 ) {
     let strict_enabled = strict_path_dep_validation_enabled();
-    validate_fsqlite_registry_pin(manifest_dir, manifest, packaged_manifest);
+    validate_fsqlite_source_pin(manifest_dir, manifest, packaged_manifest);
 
     for contract in CONTRACTS {
         validate_manifest_dependency_spec(manifest, contract, packaged_manifest);
@@ -400,32 +526,33 @@ fn validate_path_dependency_contracts(
     }
 }
 
-fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
-    // The fsqlite engine family must resolve exclusively from crates.io at the
-    // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
-    // override contract while keeping its purpose: no silent engine drift.
-    const EXPECTED_VERSION: &str = "0.3.4";
-    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
+    // The fsqlite engine family must resolve exclusively from crates.io at
+    // the uniform published 0.4.4 version, including the shared types.
+    // One source per package remains load-bearing for read-only integrity.
+    const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
-    // 1. The former git source override must not quietly come back: no
-    //    [patch.crates-io] entry may target the fsqlite family.
-    if let Some(patch_tables) = manifest.get("patch").and_then(Value::as_table)
+    // 1. With the family on crates.io (e926644f), a `[patch]` table is no
+    //    longer required — but if one exists, it must not silently redirect
+    //    any fsqlite family member back to a shadow source.
+    if !packaged_manifest
+        && let Some(patch_tables) = manifest.get("patch")
         && let Some(crates_io) = patch_tables.get("crates-io").and_then(Value::as_table)
     {
         for dependency in crates_io.keys() {
             if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
                 fatal(format!(
                     "dependency source contract violation for {dependency}: the fsqlite \
-                     family is a crates.io {EXPECTED_VERSION} registry pin; remove the \
-                     [patch.crates-io].{dependency} override (or update this contract \
-                     in build.rs with the new expected identity)"
+                     family resolves from the pinned crates.io package versions; a \
+                     [patch.crates-io] redirect would reintroduce an unreviewed shadow \
+                     source"
                 ));
             }
         }
     }
 
     // 2. Lockfile convergence: every resolved fsqlite-family package must be
-    //    the pinned registry release, with exactly one version per crate.
+    //    its pinned registry version, with exactly one version per crate.
     //    Cargo resolves the lockfile before running build scripts, so the
     //    lockfile is authoritative here. Packaged manifests (`cargo package`
     //    verification builds) re-resolve into a fresh lockfile that inherits
@@ -457,39 +584,67 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
         .unwrap_or_else(|| {
             fatal("dependency source contract: Cargo.lock has no [[package]] entries")
         });
+    // Collect EVERY off-pin family member before failing, and print the
+    // exact remediation for each (GH#417): reporting only the first
+    // mismatch made a multi-member drift a whack-a-mole loop, and only 2 of
+    // the ~20 family members are direct dependencies, so a bare
+    // `cargo update` can float any transitive member off-pin.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut violations: Vec<String> = Vec::new();
+    let mut remediations: Vec<String> = Vec::new();
     for package in packages {
         let name = package.get("name").and_then(Value::as_str).unwrap_or("");
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
+        let expected_version = "0.4.4";
+        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves more than one \
-                 version of `{name}`; the fsqlite family must converge on a single \
-                 registry release"
+            violations.push(format!(
+                "`{name}` resolves more than once; the fsqlite family must converge on \
+                 a single registry version per package"
             ));
         }
-        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
-        if version != EXPECTED_VERSION {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves `{name}` at \
-                 version `{version}`, expected `{EXPECTED_VERSION}`"
+        if version != expected_version {
+            violations.push(format!(
+                "`{name}` resolves at `{version}`, expected `{expected_version}`"
+            ));
+            remediations.push(format!(
+                "cargo update -p {name}@{version} --precise {expected_version}"
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");
-        if source != REGISTRY_SOURCE {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves `{name}` from \
-                 `{source}`, expected the crates.io registry (`{REGISTRY_SOURCE}`)"
+        if source != EXPECTED_REGISTRY_SOURCE {
+            violations.push(format!(
+                "`{name}` resolves from `{source}`, expected the crates.io registry \
+                 (`{EXPECTED_REGISTRY_SOURCE}`)"
             ));
         }
     }
     if !seen.contains("fsqlite") {
-        fatal(
-            "dependency source contract violation: Cargo.lock does not resolve `fsqlite`; \
-             the engine dependency is missing",
+        violations.push(
+            "Cargo.lock does not resolve `fsqlite`; the engine dependency is missing".to_owned(),
         );
+    }
+    if !violations.is_empty() {
+        let mut message = format!(
+            "dependency source contract violation: {} fsqlite-family problem(s) in Cargo.lock:\n",
+            violations.len()
+        );
+        for violation in &violations {
+            message.push_str("  - ");
+            message.push_str(violation);
+            message.push('\n');
+        }
+        if !remediations.is_empty() {
+            message.push_str("remediate every off-pin member, then rebuild:\n");
+            for remediation in &remediations {
+                message.push_str("  ");
+                message.push_str(remediation);
+                message.push('\n');
+            }
+        }
+        fatal(message);
     }
 }
 
@@ -504,10 +659,11 @@ fn validate_manifest_dependency_spec(
         contract.dep_table,
     );
 
+    validate_manifest_dependency_version(spec, contract, packaged_manifest);
+
     if contract.expected_git.is_empty() {
         // Pure crates.io dependency: lock in the registry version, which is the
         // only source identity crates.io gives us.
-        validate_manifest_dependency_version(spec, contract, packaged_manifest);
         if spec.contains_key("git") || spec.contains_key("rev") {
             contract_error(
                 contract,
@@ -522,7 +678,6 @@ fn validate_manifest_dependency_spec(
         // generated package manifest used by `cargo publish` verification.
         // Validate that rewritten shape against the version we expect instead
         // of requiring `git`/`rev` keys that no longer exist there.
-        validate_manifest_dependency_version(spec, contract, packaged_manifest);
     } else {
         let actual_git = string_value(spec, "git", contract.dep_key);
         if actual_git != contract.expected_git {
@@ -620,11 +775,7 @@ fn validate_manifest_dependency_version(
 }
 
 fn expected_manifest_version_requirement(contract: &DependencyContract) -> String {
-    if contract.expected_git.is_empty() {
-        format!("={}", contract.expected_version)
-    } else {
-        contract.expected_version.to_string()
-    }
+    format!("={}", contract.expected_version)
 }
 
 fn validate_patch_path(manifest: &Value, contract: &DependencyContract) {

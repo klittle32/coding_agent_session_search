@@ -9,7 +9,10 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
+use util::e2e_log::PhaseTracker;
 use walkdir::WalkDir;
+
+mod util;
 
 fn test_canonical_json_value(value: Value) -> Value {
     match value {
@@ -78,6 +81,18 @@ fn test_error_kind(payload: &Value) -> Option<&str> {
         .or_else(|| payload.pointer("/err/kind"))
         .or_else(|| payload.get("kind"))
         .and_then(Value::as_str)
+}
+
+fn doctor_error_json(stderr: &[u8]) -> Value {
+    let text = std::str::from_utf8(stderr).expect("UTF-8 doctor diagnostic");
+    // Nested doctor commands are normalized to flags. The CLI documents one
+    // teaching note per correction before its otherwise complete JSON error.
+    let json = text
+        .lines()
+        .skip_while(|line| line.starts_with("note: auto-corrected: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&json).expect("JSON error after documented correction notes")
 }
 
 fn write_raw_mirror_fixture(
@@ -644,6 +659,725 @@ fn doctor_json_fails_when_full_integrity_check_finds_archive_corruption() {
     assert_eq!(payload["needs_rebuild"].as_bool(), Some(true));
 }
 
+/// SQLite page-1 header: first freelist trunk page and total freelist pages,
+/// both big-endian u32 (SQLite file format §1.3).
+const SQLITE_HEADER_FREELIST_TRUNK_OFFSET: u64 = 32;
+const SQLITE_HEADER_FREELIST_COUNT_OFFSET: u64 = 36;
+
+fn read_be_u32_at(path: &Path, offset: u64) -> u32 {
+    let mut file = fs::File::open(path).expect("open db for header read");
+    file.seek(SeekFrom::Start(offset)).expect("seek header");
+    let mut bytes = [0_u8; 4];
+    file.read_exact(&mut bytes).expect("read header u32");
+    u32::from_be_bytes(bytes)
+}
+
+fn write_be_u32_at(path: &Path, offset: u64, value: u32) {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open db for raw write");
+    file.seek(SeekFrom::Start(offset)).expect("seek raw write");
+    file.write_all(&value.to_be_bytes()).expect("raw write");
+    file.sync_all().expect("sync raw write");
+}
+
+/// The engine's own integrity verdict, or the error that kept the engine
+/// from opening the file at all (damage can fail the open itself).
+fn engine_integrity_check(db_path: &Path) -> String {
+    match FrankenConnection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => conn
+            .query_row_map(
+                "PRAGMA integrity_check;",
+                &[],
+                |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+            )
+            .unwrap_or_else(|err| format!("integrity_check error: {err}")),
+        Err(err) => format!("open error: {err}"),
+    }
+}
+
+/// Fill then empty a scratch table so its pages land on the durable freelist,
+/// fold the WAL into the main file, and return (page_size, root page of the
+/// canonical `conversations` table, freelist trunk, freelist count).
+fn seed_durable_freelist(db_path: &Path) -> (u64, u32, u32, u32) {
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+        .expect("open db for freelist fixture");
+    conn.execute_compat(
+        "CREATE TABLE leak_probe(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+        coding_agent_search::franken_sync::params![],
+    )
+    .expect("create leak probe table");
+    for id in 1_i64..=24 {
+        let payload = format!("{id:04}{}", "leak probe payload ".repeat(180));
+        conn.execute_compat(
+            "INSERT INTO leak_probe(id, payload) VALUES (?1, ?2)",
+            coding_agent_search::franken_sync::params![id, payload.as_str()],
+        )
+        .expect("insert leak probe row");
+    }
+    conn.execute_compat(
+        "DELETE FROM leak_probe",
+        coding_agent_search::franken_sync::params![],
+    )
+    .expect("empty leak probe table");
+    let conversations_root: i64 = conn
+        .query_row_map(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'conversations'",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
+        .expect("conversations root page");
+    let page_size: i64 = conn
+        .query_row_map(
+            "PRAGMA page_size;",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
+        .expect("page size");
+    conn.query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint freelist fixture");
+    drop(conn);
+    let trunk = read_be_u32_at(db_path, SQLITE_HEADER_FREELIST_TRUNK_OFFSET);
+    let count = read_be_u32_at(db_path, SQLITE_HEADER_FREELIST_COUNT_OFFSET);
+    assert!(
+        trunk > 1 && count >= 8,
+        "fixture needs a durable freelist on disk: trunk={trunk} count={count}"
+    );
+    (
+        u64::try_from(page_size).expect("page size"),
+        u32::try_from(conversations_root).expect("root page"),
+        trunk,
+        count,
+    )
+}
+
+/// Model the owner's archive (2l1b0.73): pages that left the freelist without
+/// entering a tree. Detaching the whole freelist from the header leaves every
+/// formerly free page unowned. Returns the number of leaked pages.
+fn leak_freelist_pages(db_path: &Path) -> u32 {
+    let (_, _, _, count) = seed_durable_freelist(db_path);
+    write_be_u32_at(db_path, SQLITE_HEADER_FREELIST_TRUNK_OFFSET, 0);
+    write_be_u32_at(db_path, SQLITE_HEADER_FREELIST_COUNT_OFFSET, 0);
+    let integrity = engine_integrity_check(db_path);
+    assert!(
+        integrity.ends_with("is never used"),
+        "fixture must leave only leaked pages: {integrity}"
+    );
+    count
+}
+
+/// The bead's negative case: a page owned twice. Point the first freelist
+/// leaf at the live `conversations` root, so the freelist and a table b-tree
+/// both claim it.
+fn double_reference_a_table_root(db_path: &Path) {
+    let (page_size, conversations_root, trunk, _) = seed_durable_freelist(db_path);
+    let trunk_offset = (u64::from(trunk) - 1) * page_size;
+    let leaf_count = read_be_u32_at(db_path, trunk_offset + 4);
+    assert!(leaf_count >= 1, "fixture needs a freelist leaf to redirect");
+    write_be_u32_at(db_path, trunk_offset + 8, conversations_root);
+    let integrity = engine_integrity_check(db_path);
+    assert!(
+        integrity != "ok" && !integrity.contains("is never used"),
+        "fixture must fail integrity_check with a non-leak error: {integrity}"
+    );
+}
+
+fn run_repair_leaked_pages(test_home: &Path, data_dir: &Path, mode: &str) -> std::process::Output {
+    cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--repair-leaked-pages",
+            mode,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --repair-leaked-pages")
+}
+
+fn doctor_check_payload(test_home: &Path, data_dir: &Path) -> Value {
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    serde_json::from_slice(&out.stdout).expect("doctor json")
+}
+
+fn doctor_database_check(payload: &Value) -> Value {
+    payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("database"))
+        .expect("database check")
+        .clone()
+}
+
+#[test]
+fn doctor_repair_leaked_pages_frees_only_leaked_pages_behind_a_restorable_backup() {
+    let tracker = PhaseTracker::new(
+        "cli_doctor",
+        "doctor_repair_leaked_pages_frees_only_leaked_pages_behind_a_restorable_backup",
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let db_path = data_dir.join("agent_search.db");
+    let leaked = tracker.phase(
+        "fixture",
+        "seed an archive, then detach its durable freelist so every free page leaks",
+        || {
+            seed_healthy_empty_index(test_home, &data_dir);
+            leak_freelist_pages(&db_path)
+        },
+    );
+    let leaked_db_blake3 = test_file_blake3(&db_path);
+
+    // Read-only doctor names the in-place repair, not the generic planner.
+    let phase = tracker.start(
+        "doctor_check",
+        Some("read-only doctor routes to the repair"),
+    );
+    let check = doctor_check_payload(test_home, &data_dir);
+    let database = doctor_database_check(&check);
+    assert_eq!(database["status"].as_str(), Some("fail"), "{database:#}");
+    assert!(
+        database["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--repair-leaked-pages")),
+        "{database:#}"
+    );
+    assert_eq!(
+        check["operation_outcome"]["next_command"].as_str(),
+        Some("cass doctor --repair-leaked-pages --dry-run --json"),
+        "{:#}",
+        check["operation_outcome"]
+    );
+    tracker.end(
+        "doctor_check",
+        Some("read-only doctor routes to the repair"),
+        phase,
+    );
+
+    // Dry-run classifies without touching the archive.
+    let phase = tracker.start("dry_run", Some("classify leak-only damage read-only"));
+    let dry = run_repair_leaked_pages(test_home, &data_dir, "--dry-run");
+    assert!(
+        dry.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry: Value = serde_json::from_slice(&dry.stdout).expect("dry-run json");
+    assert_eq!(dry["inspection"]["status"].as_str(), Some("leaked_pages"));
+    assert_eq!(
+        dry["planned_action"].as_str(),
+        Some("free_leaked_pages_in_place")
+    );
+    assert_eq!(dry["inspection"]["freelist_count"].as_i64(), Some(0));
+    assert_eq!(test_file_blake3(&db_path), leaked_db_blake3);
+    tracker.end(
+        "dry_run",
+        Some("classify leak-only damage read-only"),
+        phase,
+    );
+
+    // Mutation without --yes is refused with an advertised pair.
+    let phase = tracker.start("refuse_without_yes", Some("mutation requires --yes"));
+    let refused = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--repair-leaked-pages",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run repair without --yes");
+    assert_eq!(refused.status.code(), Some(4));
+    let refused = doctor_error_json(&refused.stderr);
+    assert_eq!(test_error_kind(&refused), Some("refused-unsafe"));
+    assert_eq!(test_file_blake3(&db_path), leaked_db_blake3);
+    tracker.end("refuse_without_yes", Some("mutation requires --yes"), phase);
+
+    let phase = tracker.start("apply", Some("free leaked pages behind a backup"));
+    let applied = run_repair_leaked_pages(test_home, &data_dir, "--yes");
+    assert!(
+        applied.status.success(),
+        "repair failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: Value = serde_json::from_slice(&applied.stdout).expect("repair json");
+    assert_eq!(applied["status"].as_str(), Some("repaired"), "{applied:#}");
+    assert_eq!(
+        applied["freed_pages"].as_u64(),
+        Some(u64::from(leaked)),
+        "exactly the detached freelist pages are freed: {applied:#}"
+    );
+    assert_eq!(
+        applied["inspection_after"]["status"].as_str(),
+        Some("clean")
+    );
+    for count in ["conversations", "messages"] {
+        assert_eq!(
+            applied["inspection_after"][count], applied["inspection_before"][count],
+            "{count} must be unchanged: {applied:#}"
+        );
+    }
+    tracker.end("apply", Some("free leaked pages behind a backup"), phase);
+
+    // Independent of the command's own report: the engine now passes and the
+    // freed pages sit on the freelist.
+    let phase = tracker.start(
+        "independent_verify",
+        Some("engine integrity_check, freelist_count and doctor check after repair"),
+    );
+    assert_eq!(engine_integrity_check(&db_path), "ok");
+    let freelist_after: i64 = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+        .expect("open repaired db")
+        .query_row_map(
+            "PRAGMA freelist_count;",
+            &[],
+            |row: &coding_agent_search::franken_sync::Row| row.get_typed(0),
+        )
+        .expect("freelist_count");
+    assert_eq!(freelist_after, i64::from(leaked));
+    let database = doctor_database_check(&doctor_check_payload(test_home, &data_dir));
+    assert_eq!(database["status"].as_str(), Some("pass"), "{database:#}");
+    tracker.end(
+        "independent_verify",
+        Some("engine integrity_check, freelist_count and doctor check after repair"),
+        phase,
+    );
+
+    // The pre-repair bundle is a verified, restorable doctor backup.
+    let phase = tracker.start(
+        "backup_rollback",
+        Some("verify the backup, rehearse and apply the restore"),
+    );
+    let backup_id = applied["backup_id"]
+        .as_str()
+        .expect("backup id")
+        .to_string();
+    let verify = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "backups",
+            "verify",
+            backup_id.as_str(),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run backups verify");
+    assert!(
+        verify.status.success(),
+        "verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let verify: Value = serde_json::from_slice(&verify.stdout).expect("verify json");
+    assert_eq!(
+        verify["backup_verification"]["status"].as_str(),
+        Some("verified"),
+        "{verify:#}"
+    );
+    assert_eq!(
+        verify["backup_verification"]["backup_kind"].as_str(),
+        Some("leaked-pages-repair")
+    );
+    assert_eq!(
+        verify["backup_verification"]["prior_live_db_blake3"].as_str(),
+        Some(leaked_db_blake3.as_str())
+    );
+
+    let rehearsal = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "backups",
+            "restore",
+            backup_id.as_str(),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run restore rehearsal");
+    assert!(
+        rehearsal.status.success(),
+        "rehearsal failed: {}",
+        String::from_utf8_lossy(&rehearsal.stderr)
+    );
+    let rehearsal: Value = serde_json::from_slice(&rehearsal.stdout).expect("rehearsal json");
+    let fingerprint = rehearsal["restore_plan"]["plan_fingerprint"]
+        .as_str()
+        .expect("restore fingerprint")
+        .to_string();
+    let restored = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "backups",
+            "restore",
+            backup_id.as_str(),
+            "--yes",
+            "--plan-fingerprint",
+            fingerprint.as_str(),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run restore apply");
+    assert!(
+        restored.status.success(),
+        "restore apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(test_file_blake3(&db_path), leaked_db_blake3);
+    assert!(engine_integrity_check(&db_path).ends_with("is never used"));
+    tracker.end(
+        "backup_rollback",
+        Some("verify the backup, rehearse and apply the restore"),
+        phase,
+    );
+    tracker.complete();
+}
+
+#[test]
+fn doctor_repair_leaked_pages_refuses_a_doubled_reference() {
+    let tracker = PhaseTracker::new(
+        "cli_doctor",
+        "doctor_repair_leaked_pages_refuses_a_doubled_reference",
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let db_path = data_dir.join("agent_search.db");
+    tracker.phase(
+        "fixture",
+        "seed an archive, then point a freelist leaf at a live table root",
+        || {
+            seed_healthy_empty_index(test_home, &data_dir);
+            double_reference_a_table_root(&db_path);
+        },
+    );
+    let damaged_blake3 = test_file_blake3(&db_path);
+
+    let phase = tracker.start(
+        "refusal",
+        Some("doctor, dry-run and --yes all refuse the leak repair"),
+    );
+    let check = doctor_check_payload(test_home, &data_dir);
+    assert_eq!(
+        doctor_database_check(&check)["status"].as_str(),
+        Some("fail")
+    );
+    assert_ne!(
+        check["operation_outcome"]["next_command"].as_str(),
+        Some("cass doctor --repair-leaked-pages --dry-run --json"),
+        "a doubled reference must not be routed to the leak repair"
+    );
+
+    let dry = run_repair_leaked_pages(test_home, &data_dir, "--dry-run");
+    assert!(dry.status.success());
+    let dry: Value = serde_json::from_slice(&dry.stdout).expect("dry-run json");
+    assert_eq!(dry["inspection"]["status"].as_str(), Some("other_damage"));
+    assert_eq!(dry["planned_action"].as_str(), Some("refuse"));
+    assert_eq!(
+        dry["next_command"].as_str(),
+        Some("cass doctor repair --dry-run --json")
+    );
+
+    let applied = run_repair_leaked_pages(test_home, &data_dir, "--yes");
+    assert_eq!(
+        applied.status.code(),
+        Some(5),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let error = doctor_error_json(&applied.stderr);
+    assert_eq!(test_error_kind(&error), Some("data-corruption"));
+    assert_eq!(test_file_blake3(&db_path), damaged_blake3);
+    assert!(
+        !data_dir
+            .join("doctor")
+            .join("candidate-promotions")
+            .exists()
+            || fs::read_dir(data_dir.join("doctor").join("candidate-promotions"))
+                .expect("read backup root")
+                .next()
+                .is_none(),
+        "a refused repair takes no backup"
+    );
+    tracker.end(
+        "refusal",
+        Some("doctor, dry-run and --yes all refuse the leak repair"),
+        phase,
+    );
+    tracker.complete();
+}
+
+/// GH #503: an archive whose `fts_messages_config` shadow carries the catalog
+/// cass wrote before the #434 fix (a declared primary key with no
+/// sqlite_master autoindex row). The fixture is a synthetic two-message
+/// archive written by cass, with that one table rewritten by stock SQLite
+/// (writable_schema); its paths come from the generating machine's scratch
+/// directory. While the pinned engine refuses the catalog even for the shadow
+/// repair (doctor_recover::ENGINE_REPAIRS_MISSING_FTS5_SHADOW_AUTOINDEX),
+/// status must not send users to that repair, and the dry-run must not plan
+/// what --yes cannot do: both refuse with the same explanation and leave the
+/// bytes alone. When an engine bump flips the constant, this test must be
+/// rewritten to prove the in-place repair instead.
+#[test]
+fn doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog() {
+    let tracker = PhaseTracker::new(
+        "cli_doctor",
+        "doctor_rebuild_canonical_fts_is_truthful_about_the_503_legacy_shadow_catalog",
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    let db_path = data_dir.join("agent_search.db");
+    tracker.phase("fixture", "copy the legacy shadow-catalog archive", || {
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/gh503/legacy_fts_config_shadow.db"),
+            &db_path,
+        )
+        .expect("copy fixture");
+    });
+    let legacy_blake3 = test_file_blake3(&db_path);
+
+    let phase = tracker.start(
+        "status",
+        Some("the read-only probe names GH #503 and not the shadow repair"),
+    );
+    let status = cass_cmd(test_home)
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass status");
+    let status: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    assert_eq!(status["database"]["opened"].as_bool(), Some(false));
+    let open_error = status["database"]["open_error"]
+        .as_str()
+        .expect("open_error");
+    assert!(
+        open_error.contains("missing implicit autoindex slot 1 for table `fts_messages_config`"),
+        "{open_error}"
+    );
+    assert!(open_error.contains("GH #503"), "{open_error}");
+    assert!(
+        !open_error.contains("rebuild-canonical-fts"),
+        "{open_error}"
+    );
+    tracker.end(
+        "status",
+        Some("the read-only probe names GH #503 and not the shadow repair"),
+        phase,
+    );
+
+    let phase = tracker.start(
+        "repair",
+        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+    );
+    for mode in ["--dry-run", "--yes"] {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--rebuild-canonical-fts",
+                mode,
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --rebuild-canonical-fts");
+        assert_eq!(
+            out.status.code(),
+            Some(13),
+            "{mode}: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let error = doctor_error_json(&out.stderr);
+        assert_eq!(test_error_kind(&error), Some("storage"), "{mode}: {error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("legacy catalog"), "{mode}: {rendered}");
+        assert!(rendered.contains("GH #503"), "{mode}: {rendered}");
+        assert_eq!(
+            test_file_blake3(&db_path),
+            legacy_blake3,
+            "{mode} must not modify the archive"
+        );
+    }
+    tracker.end(
+        "repair",
+        Some("dry-run and --yes refuse alike and leave the archive untouched"),
+        phase,
+    );
+    tracker.complete();
+}
+
+/// 2l1b0.58: every (code, kind) doctor returns is advertised by
+/// `--emit-capabilities`, and robot-docs doctor documents no other code.
+/// Before the fix the table advertised 5 as `concurrency-lost` while doctor
+/// exits 5 with kind `doctor`, and it advertised 1, 6 and 73, which nothing
+/// returns; robot-docs said findings exit 1.
+#[test]
+fn doctor_exit_codes_match_the_advertised_contract() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let data_dir_arg = data_dir.to_str().expect("utf8");
+    let run = |step: &str, args: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = cass_cmd(test_home)
+            .args(args)
+            .output()
+            .expect("run cass doctor");
+        eprintln!(
+            "{}",
+            json!({
+                "test": "doctor_exit_codes_match_the_advertised_contract",
+                "step": step,
+                "command": args,
+                "exit": output.status.code(),
+                "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            })
+        );
+        output
+    };
+
+    let capabilities = run(
+        "emit-capabilities",
+        &["doctor", "--emit-capabilities", "--json"],
+    );
+    assert!(capabilities.status.success(), "emit-capabilities failed");
+    let envelope: Value =
+        serde_json::from_slice(&capabilities.stdout).expect("emit-capabilities json");
+    let advertised: Vec<(i64, String)> = envelope["exit_codes"]
+        .as_array()
+        .expect("exit_codes array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"].as_i64().expect("exit code"),
+                entry["kind"].as_str().expect("exit kind").to_string(),
+            )
+        })
+        .collect();
+    let assert_advertised = |code: i64, kind: &str| {
+        assert!(
+            advertised.iter().any(|(c, k)| *c == code && k == kind),
+            "doctor returned exit {code} kind {kind}, which --emit-capabilities does not advertise: {advertised:?}"
+        );
+    };
+
+    // Findings without a failed check exit 0 and are named in the payload.
+    let empty = run(
+        "check empty data dir",
+        &["doctor", "--json", "--data-dir", data_dir_arg],
+    );
+    assert_eq!(empty.status.code(), Some(0), "empty data dir");
+    let payload: Value = serde_json::from_slice(&empty.stdout).expect("doctor json");
+    assert_eq!(
+        payload["operation_outcome"]["exit_code_kind"], "health-failure",
+        "an empty data dir has findings: {payload:#}"
+    );
+    assert_advertised(0, "success");
+
+    // Error envelopes: a malformed run id is usage, nothing to undo is not-found.
+    for (step, run_id, code) in [
+        ("undo malformed id", "not-a-run-id", 2),
+        ("undo with no runs", "latest", 13),
+    ] {
+        let output = run(
+            step,
+            &[
+                "doctor",
+                "--undo",
+                run_id,
+                "--json",
+                "--data-dir",
+                data_dir_arg,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(code), "{step}");
+        let error = doctor_error_json(&output.stderr);
+        assert_eq!(
+            test_error_code(&error),
+            Some(i64::from(code)),
+            "{step}: {error:#}"
+        );
+        assert_advertised(
+            i64::from(code),
+            test_error_kind(&error).expect("error kind"),
+        );
+    }
+
+    // A failed check exits 5; the full report stays on stdout.
+    fs::write(
+        data_dir.join("agent_search.db"),
+        b"not a sqlite database\n".repeat(8),
+    )
+    .expect("write garbage canonical db");
+    let failed = run(
+        "check garbage db",
+        &["doctor", "--json", "--data-dir", data_dir_arg],
+    );
+    assert_eq!(failed.status.code(), Some(5), "garbage canonical db");
+    let payload: Value = serde_json::from_slice(&failed.stdout).expect("doctor json on failure");
+    assert!(
+        payload["failures"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0),
+        "exit 5 must come with failed checks: {payload:#}"
+    );
+    assert_advertised(5, "doctor");
+
+    // robot-docs doctor documents only advertised codes.
+    let docs = run("robot-docs doctor", &["robot-docs", "doctor"]);
+    assert!(docs.status.success(), "robot-docs doctor failed");
+    let docs = String::from_utf8(docs.stdout).expect("utf8 robot-docs");
+    let documented: Vec<i64> = docs
+        .lines()
+        .skip_while(|line| line.trim() != "Exit codes:")
+        .skip(1)
+        .take_while(|line| !line.starts_with("## "))
+        .filter_map(|line| {
+            let rest = line.strip_prefix("  ")?;
+            rest.starts_with(|c: char| c.is_ascii_digit())
+                .then(|| rest.split_whitespace().next()?.parse().ok())?
+        })
+        .collect();
+    assert!(
+        !documented.is_empty(),
+        "robot-docs doctor has no exit codes"
+    );
+    for code in documented {
+        assert!(
+            advertised.iter().any(|(c, _)| *c == code),
+            "robot-docs doctor documents exit {code}, which --emit-capabilities does not advertise"
+        );
+    }
+}
+
 #[test]
 fn doctor_fix_force_rebuild_refuses_archive_risk_rebuild_without_plan_fingerprint() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -763,6 +1497,10 @@ fn doctor_fix_force_rebuild_refuses_archive_risk_rebuild_without_plan_fingerprin
 fn doctor_fix_auto_runs_derived_lexical_rebuild_from_readable_archive() {
     let temp = tempfile::tempdir().expect("tempdir");
     let test_home = temp.path();
+    // RCH may place TMPDIR beneath the checkout. Establish a fixture-local
+    // repository boundary so the parent repository's ignore rules cannot add
+    // an unrelated config-exclusion approval requirement to this scenario.
+    fs::create_dir_all(test_home.join(".git")).expect("create repo boundary");
     let data_dir = test_home.join("cass-data");
     seed_healthy_empty_index(test_home, &data_dir);
 
@@ -1684,7 +2422,7 @@ fn doctor_rejects_repeated_repair_override_without_fix_before_executor() {
         "doctor should reject repeated-repair override unless --fix is present"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(payload["error"]["code"].as_i64(), Some(2));
     assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
     assert!(
@@ -1766,6 +2504,10 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
         "/semantic",
         "/derived_semantic_assets",
         "/storage_pressure",
+        "/storage_pressure/full_rebuild_readiness/status",
+        "/storage_pressure/full_rebuild_readiness/required_bytes",
+        "/storage_pressure/full_rebuild_readiness/available_bytes",
+        "/storage_pressure/full_rebuild_readiness/formula",
         "/check_scope/skipped_expensive_collectors",
         "/checks",
     ] {
@@ -1774,6 +2516,34 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
             "doctor check JSON missing {pointer}: {payload:#}"
         );
     }
+    // GH#442: doctor answers the predicate `index --full` refuses on, with
+    // the same numbers the indexer's preflight names, in JSON and as a
+    // check line.
+    let readiness = &payload["storage_pressure"]["full_rebuild_readiness"];
+    assert!(
+        matches!(
+            readiness["status"].as_str(),
+            Some("ready" | "blocked" | "unknown")
+        ),
+        "unexpected full_rebuild_readiness status: {readiness:#}"
+    );
+    assert!(
+        readiness["required_bytes"]
+            .as_u64()
+            .is_some_and(|required| required >= 512 * 1024 * 1024),
+        "full rebuild requirement must honour the 512 MiB floor: {readiness:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("full_rebuild_readiness")
+                    && check["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("Full rebuild"))
+            })),
+        "doctor check must report full-rebuild readiness as a check line: {payload:#}"
+    );
     assert!(
         payload["check_scope"]["skipped_expensive_collectors"]
             .as_array()
@@ -2083,8 +2853,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
         diff_out.stdout.is_empty(),
         "usage rejection should not emit a partial success payload"
     );
-    let diff_error: Value =
-        serde_json::from_slice(&diff_out.stderr).expect("baseline diff usage error JSON");
+    let diff_error = doctor_error_json(&diff_out.stderr);
     assert_eq!(test_error_kind(&diff_error), Some("usage"));
     assert!(
         diff_error["error"]["message"]
@@ -2111,8 +2880,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
         !save_out.status.success(),
         "baseline save --force-rebuild must fail closed"
     );
-    let save_error: Value =
-        serde_json::from_slice(&save_out.stderr).expect("baseline save usage error JSON");
+    let save_error = doctor_error_json(&save_out.stderr);
     assert_eq!(test_error_kind(&save_error), Some("usage"));
     assert!(
         !data_dir
@@ -2409,8 +3177,7 @@ fn doctor_support_bundle_sensitive_attachments_require_explicit_opt_in() {
         !no_opt_in.status.success(),
         "sensitive attachment without opt-in must fail closed"
     );
-    let no_opt_in_error: Value =
-        serde_json::from_slice(&no_opt_in.stderr).expect("no opt-in error JSON");
+    let no_opt_in_error = doctor_error_json(&no_opt_in.stderr);
     assert_eq!(test_error_kind(&no_opt_in_error), Some("usage"));
 
     let over_cap = cass_cmd(test_home.path())
@@ -2432,8 +3199,7 @@ fn doctor_support_bundle_sensitive_attachments_require_explicit_opt_in() {
         !over_cap.status.success(),
         "sensitive attachment over cap must fail closed"
     );
-    let over_cap_error: Value =
-        serde_json::from_slice(&over_cap.stderr).expect("over cap error JSON");
+    let over_cap_error = doctor_error_json(&over_cap.stderr);
     assert_eq!(test_error_kind(&over_cap_error), Some("usage"));
 
     let opted_in = cass_cmd(test_home.path())
@@ -2506,8 +3272,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         missing_out.stdout.is_empty(),
         "missing baseline should not emit a partial success payload on stdout"
     );
-    let missing_error: Value =
-        serde_json::from_slice(&missing_out.stderr).expect("missing baseline error JSON");
+    let missing_error = doctor_error_json(&missing_out.stderr);
     assert_eq!(test_error_kind(&missing_error), Some("not-found"));
 
     let save_out = cass_cmd(test_home.path())
@@ -2565,8 +3330,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
             .any(|reason| reason.as_str() == Some("baseline-write-failed")),
         "duplicate save should explain the write blocker: {duplicate_payload:#}"
     );
-    let duplicate_error: Value =
-        serde_json::from_slice(&duplicate_out.stderr).expect("duplicate save stderr JSON");
+    let duplicate_error = doctor_error_json(&duplicate_out.stderr);
     assert_eq!(
         test_error_kind(&duplicate_error),
         Some("output-not-writable")
@@ -2600,8 +3364,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         !bad_schema_out.status.success(),
         "incompatible baseline should fail"
     );
-    let bad_schema_error: Value =
-        serde_json::from_slice(&bad_schema_out.stderr).expect("bad schema error JSON");
+    let bad_schema_error = doctor_error_json(&bad_schema_out.stderr);
     assert_eq!(test_error_kind(&bad_schema_error), Some("config"));
     assert!(
         bad_schema_error["error"]["message"]
@@ -2637,8 +3400,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         !drifted_out.status.success(),
         "checksum-drifted baseline should fail"
     );
-    let drifted_error: Value =
-        serde_json::from_slice(&drifted_out.stderr).expect("drifted checksum error JSON");
+    let drifted_error = doctor_error_json(&drifted_out.stderr);
     assert_eq!(test_error_kind(&drifted_error), Some("config"));
     assert!(
         drifted_error["error"]["message"]
@@ -3099,7 +3861,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
         .output()
         .expect("run invalid mutating doctor check");
     assert!(!out.status.success(), "doctor check must reject --fix");
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(payload["status"].as_str(), Some("error"));
     assert_eq!(payload["kind"].as_str(), Some("argument_parsing"));
@@ -3125,7 +3887,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
         !out.status.success(),
         "doctor check must reject --force-rebuild"
     );
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(test_error_code(&payload), Some(2));
     assert!(
         payload["error"]["message"]
@@ -7181,7 +7943,7 @@ fn doctor_archive_export_refuses_unsafe_targets_and_bad_fingerprints() {
     } else {
         inside_out.stdout.as_slice()
     };
-    let inside_payload: Value = serde_json::from_slice(usage_json).expect("usage json");
+    let inside_payload = doctor_error_json(usage_json);
     assert_eq!(test_error_kind(&inside_payload), Some("usage"));
 
     let target_root = test_home.join("exports/bad-fingerprint");
@@ -7323,5 +8085,434 @@ fn doctor_archive_export_verify_reports_checksum_missing_and_extra_drift() {
     assert!(
         issue_kinds.contains(&"extra_file"),
         "extra target file should be reported: {payload:#}"
+    );
+}
+
+/// WS-B.5 (z2uon): `doctor` must make an untruncated WAL visible. Positive
+/// observable: on a freshly seeded archive the `archive_wal` check passes and
+/// names the sidecar size. Planted negative: a WAL sidecar grown past the
+/// 64 MiB bound (sparse, so the test costs no disk) turns the check into a
+/// `warn` with `fix_available`, and the read-only doctor leaves the sidecar
+/// exactly as it found it. No-claim: the `--fix` checkpoint of a real
+/// oversized WAL is not exercised here (the sparse tail is not valid WAL
+/// content), only the observation and the read-only contract.
+#[test]
+fn doctor_reports_oversized_wal_sidecar_without_touching_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let run_doctor = || -> Value {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --json");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+    let archive_wal_check = |payload: &Value| -> Value {
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|check| check["name"].as_str() == Some("archive_wal"))
+            .cloned()
+            .expect("archive_wal check present")
+    };
+
+    let baseline = archive_wal_check(&run_doctor());
+    assert_eq!(baseline["status"].as_str(), Some("pass"), "{baseline}");
+    assert!(
+        baseline["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("bytes")),
+        "{baseline}"
+    );
+
+    // Grow the sidecar past the bound without writing 65 MiB: a sparse tail
+    // of zeros is ignored by the engine (invalid frame checksums) but counts
+    // in the metadata the check reads.
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let oversized: u64 = 65 * 1024 * 1024;
+    let wal = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&wal_path)
+        .expect("open wal sidecar");
+    wal.set_len(oversized).expect("grow wal sidecar");
+    drop(wal);
+    let before = fs::metadata(&wal_path).expect("wal metadata").len();
+    assert_eq!(before, oversized);
+
+    let oversized_check = archive_wal_check(&run_doctor());
+    assert_eq!(
+        oversized_check["status"].as_str(),
+        Some("warn"),
+        "{oversized_check}"
+    );
+    assert_eq!(oversized_check["fix_available"].as_bool(), Some(true));
+    assert_eq!(oversized_check["fix_applied"].as_bool(), Some(false));
+    assert!(
+        oversized_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&oversized.to_string())),
+        "the warning must name the observed size: {oversized_check}"
+    );
+    assert_eq!(
+        fs::metadata(&wal_path).expect("wal metadata").len(),
+        oversized,
+        "a read-only doctor must not checkpoint or truncate the sidecar"
+    );
+}
+
+/// GH #382 / g3zyo: `doctor --fix` must not hang forever on an archive whose
+/// writable open loops (the owner's 10 GB archive with a 200 MB WAL did
+/// exactly that). Positive observable: with the checkpoint parked past a
+/// 1 s deadline the `archive_wal` check comes back `fail` naming the deadline,
+/// GH #382 and the stock-sqlite remedy, `fix_applied` stays false, the
+/// sidecar is untouched, and the whole command returns in seconds. Planted
+/// negative: the same fixture with the park removed is covered by the
+/// read-only test above (a sparse WAL is not valid content, so the real
+/// checkpoint path is not exercised here). No-claim: this proves the bound,
+/// not that frankensqlite's open no longer loops.
+#[test]
+fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let oversized: u64 = 65 * 1024 * 1024;
+    let wal = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&wal_path)
+        .expect("open wal sidecar");
+    wal.set_len(oversized).expect("grow wal sidecar");
+    drop(wal);
+
+    let started = std::time::Instant::now();
+    let out = cass_cmd(test_home)
+        .env("CASS_TEST_WAL_CHECKPOINT_PARK_MS", "20000")
+        .env("CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS", "1")
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --json");
+    let elapsed = started.elapsed();
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+        panic!(
+            "doctor json: {err}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let check = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("archive_wal"))
+        .cloned()
+        .expect("archive_wal check present");
+
+    assert_eq!(check["status"].as_str(), Some("fail"), "{check}");
+    assert_eq!(check["fix_applied"].as_bool(), Some(false), "{check}");
+    let message = check["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("did not complete within 1 s")
+            && message.contains("GH #382")
+            && message.contains("wal_checkpoint(TRUNCATE)"),
+        "the failure must name the deadline, the issue and the remedy: {message}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "doctor --fix must return once the deadline passes, not wait for the parked \
+         checkpoint; elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        fs::metadata(&wal_path).expect("wal metadata").len(),
+        oversized,
+        "a timed-out checkpoint must leave the sidecar as it found it"
+    );
+}
+
+/// GH #497: a deferred deep page-integrity probe cannot certify health.
+/// The deferred shape yields `reason_code == "integrity_unchecked"` next to
+/// the `database` warn, `status == "unknown"`, and `healthy == false`. The same
+/// archive as a regular file gets a `database` pass and no reason codes. The
+/// deferral is planted the cheap way — the probe refuses a non-regular file —
+/// so no multi-hundred-megabyte fixture is needed. No-claim: this does not
+/// make the probe run on large archives; it makes the skip visible.
+#[test]
+fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferred() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let run_doctor = || -> Value {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --json");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+    let database_check = |payload: &Value| -> Value {
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|check| check["name"].as_str() == Some("database"))
+            .cloned()
+            .expect("database check present")
+    };
+
+    let verified = run_doctor();
+    assert_eq!(verified["status"].as_str(), Some("healthy"), "{verified:#}");
+    assert_eq!(verified["healthy"], true, "{verified:#}");
+    assert_eq!(
+        database_check(&verified)["status"].as_str(),
+        Some("pass"),
+        "{verified:#}"
+    );
+    assert!(
+        verified["reason_code"].is_null()
+            && verified["degraded_reason_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.is_empty()),
+        "a verified run carries no reason codes: {verified:#}"
+    );
+
+    // Plant the deferral: the deep probe declines anything that is not a
+    // regular file, and a symlink is the cheapest such archive. The seed
+    // index and the first doctor run left a passing integrity attestation
+    // keyed on the archive's size and mtime, which would answer for the
+    // deferred probe — bumping the mtime retires it, so the deferred run has
+    // no verdict to fall back on (the shape a never-verified large archive
+    // presents).
+    let db_path = data_dir.join("agent_search.db");
+    let real_db_path = data_dir.join("agent_search.real.db");
+    fs::rename(&db_path, &real_db_path).expect("move the archive aside");
+    std::os::unix::fs::symlink(&real_db_path, &db_path).expect("symlink the archive");
+    let archive = fs::OpenOptions::new()
+        .write(true)
+        .open(&real_db_path)
+        .expect("open the archive for a timestamp bump");
+    archive
+        .set_modified(std::time::SystemTime::now())
+        .expect("bump the archive mtime");
+    drop(archive);
+
+    let deferred = run_doctor();
+    let database = database_check(&deferred);
+    assert_eq!(database["status"].as_str(), Some("warn"), "{deferred:#}");
+    assert!(
+        database["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("structural integrity is unchecked")),
+        "{database}"
+    );
+    assert_eq!(
+        deferred["status"].as_str(),
+        Some("unknown"),
+        "a deferred integrity probe cannot certify health: {deferred:#}"
+    );
+    assert_eq!(deferred["healthy"], false, "{deferred:#}");
+    assert_eq!(
+        deferred["reason_code"].as_str(),
+        Some("integrity_unchecked"),
+        "the unchecked state must be machine-readable: {deferred:#}"
+    );
+    assert!(
+        deferred["degraded_reason_codes"]
+            .as_array()
+            .is_some_and(|codes| codes.iter().any(|code| code == "integrity_unchecked")),
+        "{deferred:#}"
+    );
+}
+
+/// GH #391: `doctor --recover-from-archive` quarantines a canonical row whose
+/// identity columns were not text (a mis-typed aliased record, not a
+/// conversation with one damaged cell) and reports it in both output modes,
+/// while a row with only a coerced title is still exported.
+#[test]
+fn recover_from_archive_reports_quarantined_and_coerced_rows() {
+    use coding_agent_search::franken_sync::params;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let db_path = data_dir.join("agent_search.db");
+
+    let mut ids = BTreeMap::new();
+    {
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let conn = storage.raw();
+        conn.execute_compat(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
+             VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
+            params![],
+        )
+        .expect("insert agent");
+        let agent_id: i64 = conn
+            .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect("agent id");
+        for (external_id, source_path) in [
+            ("sess-ok", "/orig/ok.jsonl"),
+            ("sess-title", "/orig/title.jsonl"),
+            ("sess-alias", "/orig/alias.jsonl"),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO conversations(agent_id, external_id, title, source_path, started_at) \
+                 VALUES(?1, ?2, 'untitled', ?3, 1000)",
+                params![agent_id, external_id, source_path],
+            )
+            .expect("insert conversation");
+            let cid: i64 = conn
+                .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("conversation id");
+            // One preserved raw line each, so a readable row has something to export.
+            let wrapper = json!({
+                "__cass_historical_raw_json__":
+                    format!(r#"{{"type":"user","uuid":"u{cid}","text":"hi"}}"#)
+            })
+            .to_string();
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
+                 VALUES(?1, 0, 'user', NULL, 1000, 'hi', ?2, NULL)",
+                params![cid, wrapper],
+            )
+            .expect("insert message");
+            ids.insert(external_id, cid);
+        }
+        // TEXT affinity converts numerics on write but stores a BLOB as-is, so
+        // a blob is the mis-typed value that can be planted through SQL.
+        conn.execute_compat(
+            "UPDATE conversations SET title = X'DEADBEEF' WHERE id = ?1",
+            params![ids["sess-title"]],
+        )
+        .expect("plant title blob");
+        conn.execute_compat(
+            "UPDATE conversations SET source_path = X'DEADBEEF' WHERE id = ?1",
+            params![ids["sess-alias"]],
+        )
+        .expect("plant source_path blob");
+    }
+
+    let target = temp.path().join("recovered-json");
+    let out = cass_cmd(&home)
+        .args([
+            "doctor",
+            "--recover-from-archive",
+            target.to_str().expect("utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--db",
+            db_path.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run recover");
+    assert!(
+        out.status.success(),
+        "recover failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("recover JSON");
+    assert_eq!(envelope["sessions_written"], json!(2), "{envelope:#}");
+    assert_eq!(envelope["sessions_skipped"], json!(1), "{envelope:#}");
+    assert_eq!(envelope["rows_unreadable"], json!(0), "{envelope:#}");
+    assert_eq!(envelope["rows_quarantined"], json!(1), "{envelope:#}");
+    assert_eq!(envelope["rows_coerced"], json!(1), "{envelope:#}");
+    let sessions = envelope["sessions"].as_array().expect("sessions array");
+    let quarantined = sessions
+        .iter()
+        .find(|s| s["conversation_id"] == json!(ids["sess-alias"]))
+        .expect("quarantined row is listed");
+    assert!(quarantined["written_path"].is_null(), "{quarantined:#}");
+    assert!(
+        quarantined["skipped_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("quarantined canonical row")),
+        "{quarantined:#}"
+    );
+    assert!(
+        quarantined["coercions"][0]
+            .as_str()
+            .is_some_and(|c| c.starts_with("source_path: 4-byte blob")),
+        "{quarantined:#}"
+    );
+    let coerced = sessions
+        .iter()
+        .find(|s| s["conversation_id"] == json!(ids["sess-title"]))
+        .expect("coerced row is listed");
+    assert!(coerced["written_path"].is_string(), "{coerced:#}");
+    assert!(coerced["skipped_reason"].is_null(), "{coerced:#}");
+    assert!(
+        coerced["coercions"][0]
+            .as_str()
+            .is_some_and(|c| c.starts_with("title: 4-byte blob")),
+        "{coerced:#}"
+    );
+
+    let target_text = temp.path().join("recovered-text");
+    let out = cass_cmd(&home)
+        .args([
+            "doctor",
+            "--recover-from-archive",
+            target_text.to_str().expect("utf8"),
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--db",
+            db_path.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run recover (text)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(stdout.contains("Recovered 2 session(s)"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "0 unreadable, 1 quarantined (identity columns mis-typed), 1 with coerced column types"
+        ),
+        "{stdout}"
     );
 }

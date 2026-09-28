@@ -127,6 +127,9 @@ impl SemanticProgressiveUnavailableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticAnnUnavailableReason {
+    /// Global ANN candidate selection cannot enforce an authoritative session
+    /// allowlist before top-k. This query uses the filtered exact FSVI reader.
+    SessionScopeRequiresExact,
     /// More than one exact shard is active, but no sharded ANN topology was
     /// explicitly selected.
     MultipleExactShards,
@@ -145,6 +148,7 @@ impl SemanticAnnUnavailableReason {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::SessionScopeRequiresExact => "session_scope_requires_exact",
             Self::MultipleExactShards => "multiple_exact_shards",
             Self::SidecarMissing => "ann_sidecar_missing",
             Self::SidecarOpenFailed => "ann_sidecar_open_failed",
@@ -233,6 +237,10 @@ impl SemanticIndexArtifact {
 
     /// Clone the opened reader owner for a search operation.
     #[must_use]
+    // Currently uncalled. Retained deliberately as the owning-handle accessor
+    // beside the borrowing ones; deleting a crate-internal API is a design
+    // decision, not a lint fix.
+    #[allow(dead_code)]
     pub(crate) fn index_owner(&self) -> Arc<VectorIndex> {
         Arc::clone(&self.index)
     }
@@ -568,7 +576,23 @@ impl SemanticFilterMaps {
     fn sources_from_filter(&self, filter: &SourceFilter) -> Result<Option<HashSet<u32>>> {
         let result = match filter {
             SourceFilter::All => None,
-            SourceFilter::Local => Some(HashSet::from([self.source_id(LOCAL_SOURCE_ID)])),
+            // Every known local-*kind* source (backup roots, chatgpt-import),
+            // not only the built-in `local` id — the complement of the
+            // remote set, which is already classified by `sources.kind`
+            // (bead 5bf29). Synthesize the built-in id only when the archive
+            // has no registry row whose explicit kind should take precedence.
+            SourceFilter::Local => {
+                let mut local: HashSet<u32> = self
+                    .source_id_to_id
+                    .values()
+                    .copied()
+                    .filter(|id| !self.remote_source_ids.contains(id))
+                    .collect();
+                if !self.source_id_to_id.contains_key(LOCAL_SOURCE_ID) {
+                    local.insert(self.source_id(LOCAL_SOURCE_ID));
+                }
+                Some(local)
+            }
             SourceFilter::Remote => Some(self.remote_source_ids.clone()),
             SourceFilter::SourceId(id) => Some(HashSet::from([self.source_id(id)])),
         };
@@ -674,6 +698,44 @@ pub fn dot_product_f16_simd_bench(stored: &[f16], query: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch::SearchError;
+
+    #[test]
+    fn semantic_source_filters_respect_registered_kind_before_local_id_fallback() {
+        let canonical_local = source_id_hash(LOCAL_SOURCE_ID);
+        let named_local = source_id_hash("backup-local");
+        let maps = SemanticFilterMaps::for_tests(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (LOCAL_SOURCE_ID.to_string(), canonical_local),
+                ("backup-local".to_string(), named_local),
+            ]),
+            HashSet::from([canonical_local]),
+        );
+
+        assert_eq!(
+            maps.sources_from_filter(&SourceFilter::Local).unwrap(),
+            Some(HashSet::from([named_local]))
+        );
+        assert_eq!(
+            maps.sources_from_filter(&SourceFilter::Remote).unwrap(),
+            Some(HashSet::from([canonical_local]))
+        );
+
+        let legacy_maps = SemanticFilterMaps::for_tests(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+        assert_eq!(
+            legacy_maps
+                .sources_from_filter(&SourceFilter::Local)
+                .unwrap(),
+            Some(HashSet::from([canonical_local]))
+        );
+    }
 
     #[test]
     fn role_code_from_str_accepts_known_roles() {
@@ -758,6 +820,64 @@ mod tests {
         assert_eq!(
             entries_after, entries_before,
             "opening an artifact must not create conventional aliases or ANN sidecars"
+        );
+    }
+
+    #[test]
+    fn exact_artifact_concurrent_query_handles_share_generation_and_refuse_writer_admission() {
+        let dir = tempfile::tempdir().expect("artifact fixture");
+        let fsvi_path = dir.path().join("published-generation.fsvi");
+        let doc_id = SemanticDocId {
+            message_id: 41,
+            chunk_idx: 0,
+            agent_id: 7,
+            workspace_id: 11,
+            source_id: 13,
+            role: ROLE_ASSISTANT,
+            created_at_ms: 1_700_000_000_000,
+            content_hash: None,
+        }
+        .to_doc_id_string();
+        let mut writer = VectorIndex::create_with_revision(
+            &fsvi_path,
+            "fnv1a-2",
+            "published-generation-revision",
+            2,
+            Quantization::F16,
+        )
+        .expect("create published FSVI");
+        writer
+            .write_record(&doc_id, &[1.0, 0.0])
+            .expect("write published FSVI record");
+        writer.finish().expect("finish published FSVI");
+
+        let first = SemanticIndexArtifact::open(&fsvi_path, None)
+            .expect("open first same-inode query handle");
+        let second = SemanticIndexArtifact::open(&fsvi_path, None)
+            .expect("open second same-inode query handle");
+
+        for reader in [&first, &second] {
+            assert_eq!(reader.fsvi_path(), fsvi_path);
+            assert_eq!(
+                reader.index().embedder_revision(),
+                "published-generation-revision"
+            );
+            let hits = reader
+                .index()
+                .search_top_k(&[1.0, 0.0], 1, None)
+                .expect("search published FSVI generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, doc_id);
+        }
+
+        let writer_error = VectorIndex::open_writer(&fsvi_path)
+            .expect_err("read-only query handles must refuse competing writer admission");
+        assert!(
+            matches!(
+                &writer_error,
+                SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+            ),
+            "writer admission must fail through the typed FSVI lock contract: {writer_error}"
         );
     }
 

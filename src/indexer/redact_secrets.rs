@@ -11,6 +11,8 @@
 //! See also: `pages::secret_scan` (post-hoc scanning of existing data).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
@@ -18,85 +20,197 @@ use regex::{Regex, RegexSet};
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
 
+/// Return whether a JSON object key names a credential-bearing field.
+///
+/// Plain-text patterns can only redact a value when its label and value are in
+/// the same string (for example, `password=...`). Structured metadata stores
+/// them as separate JSON nodes, so the object walker must use the key's
+/// semantics. Normalization deliberately accepts the common snake/kebab/camel
+/// spellings while using an exact allowlist to avoid broad false positives such
+/// as `keyframe`, `monkey`, or `token_count`.
+pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| char::from(byte.to_ascii_lowercase()))
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "passwd"
+            | "pwd"
+            | "passphrase"
+            | "pin"
+            | "apikey"
+            | "apisecret"
+            | "token"
+            | "authtoken"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "sessiontoken"
+            | "bearertoken"
+            | "secrettoken"
+            | "oauthtoken"
+            | "secret"
+            | "secretkey"
+            | "accesskey"
+            | "awsaccesskeyid"
+            | "awssecretaccesskey"
+            | "awssessiontoken"
+            | "awssecuritytoken"
+            | "clienttoken"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "cookie"
+            | "setcookie"
+            | "privatekey"
+            | "privatekeypem"
+            | "secretkeybase"
+            | "databaseurl"
+            | "connectionstring"
+    ) || normalized.ends_with("password")
+        || normalized.ends_with("passwordhash")
+        || normalized.ends_with("hashedpassword")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("token")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeybase")
+        || normalized.ends_with("apikeys")
+        || normalized.ends_with("credentials")
+}
+
+fn redact_sensitive_json_value(
+    key: &str,
+    value: &serde_json::Value,
+    otherwise: impl FnOnce() -> serde_json::Value,
+) -> serde_json::Value {
+    if is_sensitive_json_field(key) && !value.is_null() {
+        serde_json::Value::String(REDACTED.to_owned())
+    } else {
+        otherwise()
+    }
+}
+
 /// A compiled secret-detection pattern.
 struct SecretPattern {
     pattern: &'static str,
     regex: Regex,
 }
 
+// Word boundaries are ASCII (`(?-u:\b)`), never Unicode `\b`. A Unicode word
+// boundary stops the regex crate's lazy DFA on any haystack with a non-ASCII
+// byte, and the whole RegexSet then runs on the PikeVM: on 593 MiB of real
+// session text the Unicode set scanned 10 MiB/s and the ASCII set 261-284 MiB/s,
+// with identical pattern matches on all 3.1M strings. Every boundary here sits
+// next to an ASCII word character, and ASCII word characters are a subset of
+// Unicode ones, so the ASCII form matches wherever the Unicode form did (plus a
+// token directly touching a non-ASCII letter): redaction can only get stricter.
+pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)";
+pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
+    r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#;
+pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)(?-u:\b)aws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const GITHUB_TOKEN_PATTERN: &str =
+    r"(?-u:\b)(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})(?-u:\b)";
+pub(crate) const OPENAI_API_KEY_PATTERN: &str =
+    r"(?-u:\b)(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})(?-u:\b)";
+pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
+    r"(?-u:\b)sk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_](?-u:\b)";
+pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)(?-u:\b)Bearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+pub(crate) const JWT_PATTERN: &str =
+    r"(?-u:\b)eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+(?-u:\b)";
+pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN EC PRIVATE KEY-----.*?(?:-----END EC PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN DSA PRIVATE KEY-----.*?(?:-----END DSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN OPENSSH PRIVATE KEY-----.*?(?:-----END OPENSSH PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN PRIVATE KEY-----.*?(?:-----END PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN ENCRYPTED PRIVATE KEY-----.*?(?:-----END ENCRYPTED PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)", // ubs:ignore — public key-block regex, not embedded credentials.
+    r")",
+);
+pub(crate) const DATABASE_URL_PATTERN: &str =
+    r#"(?i)(?-u:\b)(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)(?-u:\b)(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const SLACK_TOKEN_PATTERN: &str = r"(?-u:\b)xox[bpsaor]-[A-Za-z0-9\-]{10,}";
+pub(crate) const STRIPE_KEY_PATTERN: &str = r"(?-u:\b)[spr]k_live_[A-Za-z0-9]{20,}";
+
 /// All built-in patterns, compiled once on first use.
 static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
     vec![
-        // AWS Access Key ID (always starts with AKIA)
+        // AWS access key IDs: AKIA for long-lived IAM credentials and ASIA
+        // for temporary STS credentials.
         SecretPattern {
-            pattern: r"\bAKIA[0-9A-Z]{16}\b",
-            regex: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").expect("aws access key regex"),
+            pattern: AWS_ACCESS_KEY_PATTERN,
+            regex: Regex::new(AWS_ACCESS_KEY_PATTERN).expect("aws access key regex"),
         },
         // AWS Secret Key in assignment context
         SecretPattern {
-            pattern: r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
-            regex: Regex::new(
-                r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
-            )
-            .expect("aws secret regex"),
+            pattern: AWS_SECRET_KEY_PATTERN,
+            regex: Regex::new(AWS_SECRET_KEY_PATTERN).expect("aws secret regex"),
         },
-        // GitHub PAT (ghp_, gho_, ghu_, ghs_, ghr_)
+        // AWS STS session/security token in configuration context.
         SecretPattern {
-            pattern: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
-            regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").expect("github pat regex"),
+            pattern: AWS_SESSION_TOKEN_PATTERN,
+            regex: Regex::new(AWS_SESSION_TOKEN_PATTERN).expect("aws session token regex"),
         },
-        // OpenAI API key (sk-...)
+        // GitHub classic/app tokens and fine-grained PATs.
         SecretPattern {
-            pattern: r"\bsk-[A-Za-z0-9]{20,}\b",
-            regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
+            pattern: GITHUB_TOKEN_PATTERN,
+            regex: Regex::new(GITHUB_TOKEN_PATTERN).expect("github token regex"),
         },
-        // Anthropic API key (sk-ant-...)
+        // OpenAI legacy, project, and admin API keys.
         SecretPattern {
-            pattern: r"\bsk-ant-[A-Za-z0-9]{20,}\b",
-            regex: Regex::new(r"\bsk-ant-[A-Za-z0-9]{20,}\b").expect("anthropic key regex"),
+            pattern: OPENAI_API_KEY_PATTERN,
+            regex: Regex::new(OPENAI_API_KEY_PATTERN).expect("openai key regex"),
+        },
+        // Anthropic API keys, including current apiNN segmented keys.
+        SecretPattern {
+            pattern: ANTHROPIC_API_KEY_PATTERN,
+            regex: Regex::new(ANTHROPIC_API_KEY_PATTERN).expect("anthropic key regex"),
         },
         // Bearer tokens in authorization headers
         SecretPattern {
-            pattern: r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}",
-            regex: Regex::new(r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}").expect("bearer token regex"),
+            pattern: BEARER_TOKEN_PATTERN,
+            regex: Regex::new(BEARER_TOKEN_PATTERN).expect("bearer token regex"),
         },
         // JWT tokens (eyJ...)
         SecretPattern {
-            pattern: r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
-            regex: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
-                .expect("jwt regex"),
+            pattern: JWT_PATTERN,
+            regex: Regex::new(JWT_PATTERN).expect("jwt regex"),
         },
-        // PEM private keys
+        // PEM/OpenSSH/PGP private-key blocks. Match through the corresponding
+        // footer, or through end-of-input for a truncated paste. Redacting
+        // only the header leaves the encoded private key searchable.
         SecretPattern {
-            pattern: r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----",
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            pattern: PRIVATE_KEY_BLOCK_PATTERN,
+            regex: Regex::new(PRIVATE_KEY_BLOCK_PATTERN).expect("private key block regex"),
         },
         // Database connection URLs with credentials
         SecretPattern {
-            pattern: r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
-            regex: Regex::new(
-                r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
-            )
-            .expect("db url regex"),
+            pattern: DATABASE_URL_PATTERN,
+            regex: Regex::new(DATABASE_URL_PATTERN).expect("db url regex"),
         },
         // Generic key/token/secret/password assignments
         SecretPattern {
-            pattern: r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
-            regex: Regex::new(
-                r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
-            )
-            .expect("generic api key regex"),
+            pattern: GENERIC_SECRET_ASSIGNMENT_PATTERN,
+            regex: Regex::new(GENERIC_SECRET_ASSIGNMENT_PATTERN)
+                .expect("generic secret assignment regex"),
         },
-        // Slack tokens (xoxb-, xoxp-, xoxs-, xoxa-, xoxo-, xoxr-)
+        // Slack tokens (xoxb-, xoxp-, xoxs-, xoxa-, xoxo-, xoxr-).
         SecretPattern {
-            pattern: r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}",
-            regex: Regex::new(r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}").expect("slack token regex"),
+            pattern: SLACK_TOKEN_PATTERN,
+            regex: Regex::new(SLACK_TOKEN_PATTERN).expect("slack token regex"),
         },
         // Stripe keys (sk_live_, pk_live_, rk_live_)
         SecretPattern {
-            pattern: r"\b[spr]k_live_[A-Za-z0-9]{20,}",
-            regex: Regex::new(r"\b[spr]k_live_[A-Za-z0-9]{20,}").expect("stripe key regex"),
+            pattern: STRIPE_KEY_PATTERN,
+            regex: Regex::new(STRIPE_KEY_PATTERN).expect("stripe key regex"),
         },
     ]
 });
@@ -137,9 +251,40 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
     output
 }
 
+/// Insert a redacted JSON object entry without discarding an earlier value
+/// whose distinct source key redacted to the same placeholder. Generated
+/// suffixes contain only public punctuation/digits, so collision handling
+/// never reintroduces source-key bytes.
+pub(crate) fn insert_redacted_json_entry(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    next_suffixes: &mut HashMap<String, usize>,
+    redacted_key: String,
+    value: serde_json::Value,
+) {
+    if !object.contains_key(&redacted_key) {
+        object.insert(redacted_key, value);
+        return;
+    }
+
+    let next_suffix = next_suffixes.entry(redacted_key.clone()).or_insert(2);
+    let mut candidate = String::with_capacity(redacted_key.len() + 21);
+    loop {
+        candidate.clear();
+        candidate.push_str(&redacted_key);
+        candidate.push('#');
+        let _ = write!(&mut candidate, "{next_suffix}");
+        *next_suffix = next_suffix.saturating_add(1);
+        if !object.contains_key(&candidate) {
+            object.insert(candidate, value);
+            return;
+        }
+    }
+}
+
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted in-place.
+/// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
@@ -152,10 +297,17 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.iter().map(redact_json).collect())
         }
         serde_json::Value::Object(obj) => {
-            let mut new_obj = serde_json::Map::new();
+            let mut new_obj = serde_json::Map::with_capacity(obj.len());
+            let mut next_suffixes = HashMap::new();
             for (k, v) in obj {
                 let redacted_key = redact_text(k).into_owned();
-                new_obj.insert(redacted_key, redact_json(v));
+                let redacted_value = redact_sensitive_json_value(k, v, || redact_json(v));
+                insert_redacted_json_entry(
+                    &mut new_obj,
+                    &mut next_suffixes,
+                    redacted_key,
+                    redacted_value,
+                );
             }
             serde_json::Value::Object(new_obj)
         }
@@ -194,7 +346,14 @@ pub fn fuzz_redact_json_with_memoizing_redactor(
 ///    for backward compatibility; `CASS_INDEX_REDACTION` wins when both
 ///    are set.
 pub fn redaction_enabled() -> bool {
-    if let Ok(val) = dotenvy::var("CASS_INDEX_REDACTION") {
+    redaction_enabled_from_values(
+        dotenvy::var("CASS_INDEX_REDACTION").ok().as_deref(),
+        dotenvy::var("CASS_REDACT_SECRETS").ok().as_deref(),
+    )
+}
+
+fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> bool {
+    if let Some(val) = modern {
         let normalized = val.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "off" | "0" | "false" | "no" | "none" | "disabled" => return false,
@@ -210,10 +369,7 @@ pub fn redaction_enabled() -> bool {
             }
         }
     }
-    match dotenvy::var("CASS_REDACT_SECRETS") {
-        Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    }
+    !matches!(legacy, Some("0" | "false" | "off" | "no"))
 }
 
 /// Stable identifier for the compiled SECRET_PATTERNS list.
@@ -514,9 +670,16 @@ impl MemoizingRedactor {
             }
             serde_json::Value::Object(obj) => {
                 let mut new_obj = serde_json::Map::with_capacity(obj.len());
+                let mut next_suffixes = HashMap::new();
                 for (k, v) in obj {
                     let redacted_key = self.redact_text(k);
-                    new_obj.insert(redacted_key, self.redact_json(v));
+                    let redacted_value = redact_sensitive_json_value(k, v, || self.redact_json(v));
+                    insert_redacted_json_entry(
+                        &mut new_obj,
+                        &mut next_suffixes,
+                        redacted_key,
+                        redacted_value,
+                    );
                 }
                 serde_json::Value::Object(new_obj)
             }
@@ -553,6 +716,35 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
 
+    /// A Unicode `\b` in any pattern drops the whole RegexSet onto the PikeVM
+    /// for every non-ASCII message (26x slower on real session text); see the
+    /// note above AWS_ACCESS_KEY_PATTERN.
+    #[test]
+    fn secret_patterns_use_only_ascii_word_boundaries() {
+        for pattern in SECRET_PATTERNS.iter() {
+            let without_ascii_boundaries = pattern.pattern.replace(r"(?-u:\b)", "");
+            assert!(
+                !without_ascii_boundaries.contains(r"\b"),
+                "pattern uses a Unicode word boundary: {}",
+                pattern.pattern
+            );
+        }
+    }
+
+    #[test]
+    fn secret_touching_non_ascii_text_is_redacted() {
+        let token = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        for input in [
+            format!("凭据{token}结束"),
+            format!("é{token}é"),
+            format!("🔐 {token} 测试"),
+        ] {
+            let output = redact_text(&input);
+            assert!(!output.contains(token), "{input:?} -> {output:?}");
+            assert!(output.contains(REDACTED), "{input:?} -> {output:?}");
+        }
+    }
+
     /// FROZEN reference implementation of the redaction algorithm as of
     /// the 2026-08 redaction-perf campaign baseline. This is a verbatim
     /// copy of the pre-optimization `redact_text` body (RegexSet
@@ -588,6 +780,17 @@ mod tests {
         let output = redact_text(input);
         assert_eq!(output, "my key is [REDACTED]");
         assert!(!output.contains("sk-ABCDE"));
+
+        for current in [
+            "sk-proj-AbCdEf_0123456789-xYz987654321",
+            "sk-admin-AbCdEf_0123456789-xYz987654321",
+        ] {
+            assert_eq!(redact_text(current), REDACTED);
+        }
+        assert_eq!(
+            redact_text("sk-project-AbCdEf_0123456789-xYz987654321"),
+            "sk-project-AbCdEf_0123456789-xYz987654321"
+        );
     }
 
     #[test]
@@ -595,6 +798,11 @@ mod tests {
         let input = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "[REDACTED]");
+        assert_eq!(
+            redact_text("sk-ant-api03-AbCdEf_0123456789-xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("sk-ant-api03-short"), "sk-ant-api03-short");
     }
 
     #[test]
@@ -602,6 +810,11 @@ mod tests {
         let input = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "token [REDACTED]");
+        assert_eq!(
+            redact_text("github_pat_AbCdEf_0123456789_xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("github_pat_short"), "github_pat_short");
     }
 
     #[test]
@@ -612,31 +825,93 @@ mod tests {
     }
 
     #[test]
-    fn redacts_aws_access_key() {
-        let input = "AKIAIOSFODNN7EXAMPLE";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+    fn redacts_aws_access_key() -> Result<(), String> {
+        for input in ["AKIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE"] {
+            if redact_text(input) != "[REDACTED]" {
+                return Err(format!("access-key prefix was not redacted in {input}"));
+            }
+        }
+        for near_miss in ["ASIAIOSFODNN7EXAMPL", "asiaiosfodnn7example"] {
+            if redact_text(near_miss) != near_miss {
+                return Err(format!("near-miss access key was redacted: {near_miss}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
-    fn redacts_private_key_header() {
+    fn redacts_private_key_header() -> Result<(), String> {
         let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK...";
         let output = redact_text(input);
-        assert!(output.starts_with("[REDACTED]"));
+        (output == "[REDACTED]" && !output.contains("MIIEowIBAAK"))
+            .then_some(())
+            .ok_or_else(|| format!("truncated private-key body remained visible: {output}"))
+    }
+
+    #[test]
+    fn redacts_complete_and_truncated_private_key_bodies() -> Result<(), String> {
+        fn require(condition: bool, message: &'static str) -> Result<(), String> {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        }
+
+        let complete = "before\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\nafter";
+        require(
+            redact_text(complete) == "before\n[REDACTED]\nafter",
+            "complete PKCS#8 key was not fully redacted",
+        )?;
+
+        let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nENCRYPTEDSECRETBODY\n-----END ENCRYPTED PRIVATE KEY-----";
+        require(
+            redact_text(encrypted) == "[REDACTED]",
+            "encrypted private key was not fully redacted",
+        )?;
+
+        let truncated = "prefix\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA";
+        let output = redact_text(truncated);
+        require(
+            output == "prefix\n[REDACTED]" && !output.contains("b3BlbnNzaC1rZXktdjE"),
+            "truncated OpenSSH private key was not fully redacted",
+        )?;
+
+        let mismatched_footer = "-----BEGIN RSA PRIVATE KEY-----\nFIRST_SECRET_HALF\n-----END EC PRIVATE KEY-----\nSECOND_SECRET_HALF\n-----END RSA PRIVATE KEY-----\nafter"; // ubs:ignore — synthetic malformed-key fixture verifies fail-closed redaction.
+        let output = redact_text(mismatched_footer);
+        require(
+            output == "[REDACTED]\nafter"
+                && !output.contains("FIRST_SECRET_HALF")
+                && !output.contains("SECOND_SECRET_HALF"),
+            "mismatched footer terminated private-key redaction early",
+        )
     }
 
     #[test]
     fn redacts_generic_api_key_assignment() {
-        let input = "api_key=abcdefgh12345678";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in [
+            "api_key=abcdefgh12345678",
+            "password=\"correct horse battery staple!\"",
+            "password=P@ssw0rd!",
+            "api_key:'abc.def$ghi'",
+            "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
+        ] {
+            assert_eq!(redact_text(input), REDACTED, "secret survived in {input:?}");
+        }
+        for near_miss in ["password=short", "AWS_SESSION_TOKEN=short"] {
+            assert_eq!(redact_text(near_miss), near_miss);
+        }
     }
 
     #[test]
     fn redacts_database_url() {
-        let input = "DATABASE_URL=postgres://user:pass@host:5432/db";
-        let output = redact_text(input);
-        assert!(!output.contains("user:pass"));
+        for input in [
+            "DATABASE_URL=postgres://user:pass@host:5432/db",
+            "mongodb+srv://user:pass@cluster.mongodb.net/db",
+            "amqp://user:pass@broker.internal/vhost",
+        ] {
+            let output = redact_text(input);
+            assert!(
+                !output.contains("user:pass"),
+                "credential URL survived: {output}"
+            );
+        }
     }
 
     #[test]
@@ -649,9 +924,9 @@ mod tests {
 
     #[test]
     fn redacts_slack_token() {
-        let input = "xoxb-123456789-abcdefghij";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in ["xoxb-123456789-abcdefghij", "xoxo-123456789-abcdefghij"] {
+            assert_eq!(redact_text(input), REDACTED);
+        }
     }
 
     #[test]
@@ -701,25 +976,149 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn redaction_enabled_default() {
-        // When env var is not set, should be enabled
-        // Safety: only called in single-threaded test context
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
-        assert!(redaction_enabled());
+    fn redacted_json_key_collisions_preserve_every_value_without_leaking_keys() -> Result<(), String>
+    {
+        let input = json!({
+            "api_key=abcdefgh12345678": "first", // ubs:ignore — synthetic collision fixture, not a credential.
+            "password=abcdefgh12345678": "second", // ubs:ignore — synthetic collision fixture, not a credential.
+            "[REDACTED]#2": "preexisting",
+        });
+
+        let plain = redact_json(&input);
+        let memoized = MemoizingRedactor::with_capacity(8).redact_json(&input);
+        if plain != memoized {
+            return Err("plain and memoized JSON walkers disagreed".to_owned());
+        }
+
+        let object = plain
+            .as_object()
+            .ok_or_else(|| "redacted JSON was not an object".to_owned())?;
+        if object.len() != 3 {
+            return Err("redaction overwrote an object value".to_owned());
+        }
+        let mut values = object
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        if values != ["first", "preexisting", "second"] {
+            return Err(format!("redacted object values changed: {values:?}"));
+        }
+        object
+            .keys()
+            .all(|key| !key.contains("abcdefgh12345678"))
+            .then_some(())
+            .ok_or_else(|| "collision suffix leaked source-key bytes".to_owned())
     }
 
     #[test]
-    #[serial]
-    fn redaction_can_be_disabled() {
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
-        assert!(!redaction_enabled());
+    fn structured_credential_fields_redact_values_by_key_semantics() -> Result<(), String> {
+        let input = json!({
+            "password": "correct horse battery staple!", // ubs:ignore -- synthetic redaction fixture.
+            "API-Key": "abc.def$ghi", // ubs:ignore -- synthetic redaction fixture.
+            "aws_secret_access_key": "0123456789012345678901234567890123456789", // ubs:ignore -- synthetic redaction fixture.
+            "AWS_SESSION_TOKEN": "AQoEXAMPLE-session/value+=with.punctuation", // ubs:ignore -- synthetic redaction fixture.
+            "pin": 123456,
+            "credentials": {
+                "opaque": [true, 42, "not-pattern-shaped"]
+            },
+            "nested": {
+                "clientSecret": ["short", "values"],
+                "private_key_pem": {"body": "short"},
+                "sshPrivateKey": "opaque-short-key",
+                "client_secret_key": "opaque-short-key",
+                "rails_secret_key_base": "opaque-short-key",
+                "service_api_keys": ["opaque-short-key"],
+                "service_credentials": ["opaque-short-credential"],
+                "oauth_token": "opaque-short-value",
+                "service_password_hash": "not-pattern-shaped",
+                "cookie": "session=short",
+                "connection_string": "custom-driver opaque value"
+            },
+            "null_password": null,
+            "keyframe": "animation-safe",
+            "monkey": "animal-safe",
+            "token_count": 2048,
+            "private_key_count": 2,
+            "secret_key_enabled": true,
+            "public_key": "ssh-ed25519 AAAATESTPUBLICMATERIAL",
+        });
 
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "false") };
-        assert!(!redaction_enabled());
+        let plain = redact_json(&input);
+        let memoized = MemoizingRedactor::with_capacity(32).redact_json(&input);
+        if plain != memoized {
+            return Err("plain and memoized key-aware JSON redaction diverged".to_owned());
+        }
 
-        // Restore for other tests
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+        for pointer in [
+            "/password",
+            "/API-Key",
+            "/aws_secret_access_key",
+            "/AWS_SESSION_TOKEN",
+            "/pin",
+            "/credentials",
+            "/nested/clientSecret",
+            "/nested/private_key_pem",
+            "/nested/sshPrivateKey",
+            "/nested/client_secret_key",
+            "/nested/rails_secret_key_base",
+            "/nested/service_api_keys",
+            "/nested/service_credentials",
+            "/nested/oauth_token",
+            "/nested/service_password_hash",
+            "/nested/cookie",
+            "/nested/connection_string",
+        ] {
+            if plain.pointer(pointer) != Some(&json!(REDACTED)) {
+                return Err(format!("sensitive field was not fully redacted: {pointer}"));
+            }
+        }
+
+        for pointer in [
+            "/null_password",
+            "/keyframe",
+            "/monkey",
+            "/token_count",
+            "/private_key_count",
+            "/secret_key_enabled",
+            "/public_key",
+        ] {
+            if plain.pointer(pointer) != input.pointer(pointer) {
+                return Err(format!("safe near-miss field changed: {pointer}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redaction_enabled_default() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            if !redaction_enabled_from_values(modern, None) {
+                return Err(format!("unset policy must enable redaction: {modern:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn redaction_can_be_disabled() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            for legacy in ["0", "false", "off", "no"] {
+                if redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy disable was ignored: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for legacy in ["", "1", "true", "OFF", " false ", "unknown"] {
+                if !redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy exact matching changed: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `CASS_INDEX_REDACTION` is the documented operator switch for
@@ -727,65 +1126,24 @@ mod tests {
     /// over the legacy `CASS_REDACT_SECRETS` toggle and a warn+default
     /// path for unrecognized values.
     #[test]
-    #[serial]
-    fn cass_index_redaction_switch_controls_and_overrides_legacy() {
-        // Safety: serial test context; single-threaded env mutation.
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
+    fn cass_index_redaction_switch_controls_and_overrides_legacy() -> Result<(), String> {
+        for legacy in [None, Some("0"), Some("1"), Some("unknown")] {
+            for modern in ["off", "0", "false", "no", "none", "disabled", " OFF \t"] {
+                if redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern disable lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for modern in ["full", "on", "1", "true", "yes", " FULL \t", "lazy", "無効"] {
+                if !redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern full/fallback lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
         }
-        assert!(redaction_enabled(), "default must be full redaction");
-
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "off") };
-        assert!(!redaction_enabled(), "off must disable redaction");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "OFF") };
-        assert!(!redaction_enabled(), "value must be case-insensitive");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "full") };
-        assert!(redaction_enabled(), "full must enable redaction");
-
-        // Precedence: CASS_INDEX_REDACTION wins over the legacy switch
-        // in BOTH directions.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "full");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            redaction_enabled(),
-            "explicit full must override legacy disable"
-        );
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "off");
-            std::env::set_var("CASS_REDACT_SECRETS", "1");
-        }
-        assert!(
-            !redaction_enabled(),
-            "explicit off must override legacy enable"
-        );
-
-        // Unrecognized value: fail safe to full redaction.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "lazy");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
-        assert!(
-            redaction_enabled(),
-            "unrecognized value must default to full redaction"
-        );
-
-        // Empty value behaves as unset: legacy switch applies again.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            !redaction_enabled(),
-            "empty CASS_INDEX_REDACTION must fall through to legacy switch"
-        );
-
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
+        Ok(())
     }
 
     #[test]
@@ -965,11 +1323,16 @@ mod tests {
         let repeated_secret =
             "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
         let repeated_note = "same assistant boilerplate without secrets";
+        // The field name must NOT be a sensitive key: gh#419's key-aware
+        // walker replaces values under sensitive keys (`token`, `secret`, …)
+        // wholesale without ever consulting redact_text, so such values can
+        // never exercise the memo cache this test pins. A neutral key routes
+        // the candidate-bearing scalar through the cached text path.
         let value = json!({
             "events": [
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
             ],
             "footer": repeated_note,
         });

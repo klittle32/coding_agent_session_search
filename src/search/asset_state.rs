@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 
 use crate::indexer::{
     LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
@@ -40,6 +39,7 @@ use crate::search::tantivy::SCHEMA_HASH;
 #[cfg(test)]
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 use crate::search::vector_index::{SemanticProgressiveUnavailableReason, vector_index_path};
+use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum SearchMaintenanceMode {
@@ -83,6 +83,7 @@ pub(crate) enum SearchMaintenanceJobKind {
     LexicalRefresh,
     SemanticAcquire,
     SemanticRebuild,
+    AnalyticsRebuild,
 }
 
 impl SearchMaintenanceJobKind {
@@ -91,6 +92,7 @@ impl SearchMaintenanceJobKind {
             Self::LexicalRefresh => "lexical_refresh",
             Self::SemanticAcquire => "semantic_acquire",
             Self::SemanticRebuild => "semantic_rebuild",
+            Self::AnalyticsRebuild => "analytics_rebuild",
         }
     }
 
@@ -99,6 +101,7 @@ impl SearchMaintenanceJobKind {
             "lexical_refresh" => Some(Self::LexicalRefresh),
             "semantic_acquire" => Some(Self::SemanticAcquire),
             "semantic_rebuild" => Some(Self::SemanticRebuild),
+            "analytics_rebuild" => Some(Self::AnalyticsRebuild),
             _ => None,
         }
     }
@@ -206,7 +209,27 @@ pub(crate) fn windows_lock_conflict(_err: &std::io::Error) -> bool {
     false
 }
 
+/// Pure-read maintenance probe (gh#422): search-triggered refresh decisions
+/// must never write, so this variant is byte-for-byte read-only even for
+/// stale metadata (which it still hides from the caller).
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, false)
+}
+
+/// Observation-surface maintenance probe (#176 / bd-k9jb9): status, health,
+/// and TUI polls additionally REAP stale metadata in place (flock-guarded,
+/// best-effort) so subsequent readers observe a clean lock file without
+/// re-doing the staleness dance. Search paths must use the pure variant.
+pub(crate) fn read_search_maintenance_snapshot_reaping(
+    data_dir: &Path,
+) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, true)
+}
+
+fn read_search_maintenance_snapshot_inner(
+    data_dir: &Path,
+    reap_stale: bool,
+) -> SearchMaintenanceSnapshot {
     // Real index-run.lock files written by `acquire_index_run_lock`
     // have a fixed key=value shape under ~1 KiB. Cap the read at 64 KiB
     // so a corrupted or maliciously-large lock file cannot force us to
@@ -215,7 +238,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
 
     let lock_path = index_run_lock_path(data_dir);
     let sidecar_path = index_run_lock_metadata_sidecar_path(&lock_path);
-    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+    let file = match OpenOptions::new().read(true).open(&lock_path) {
         Ok(file) => file,
         Err(err) if windows_lock_conflict(&err) => {
             let raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ)
@@ -260,60 +283,82 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     snapshot.active = if current_process_owns_recorded_lock {
         true
     } else {
-        match file.try_lock_exclusive() {
+        match file.try_lock_shared() {
             Ok(()) => {
-                // We acquired the exclusive lock with no waiting, which is
-                // proof that no process holds it. POSIX flock (via fs2) is
-                // released automatically when the owning file description
-                // is closed — either explicitly on graceful drop, or by the
-                // kernel on process exit / crash. Therefore, if the file
-                // contains metadata but no holder is present, the previous
-                // owner is gone.
+                // A shared lock succeeds only when no writer holds the
+                // exclusive index-run lock: the metadata is stale.
                 //
-                // Historically this produced a permanent `orphaned: true`
-                // state that callers (notably the TUI) interpreted as
-                // "rebuild in progress, keep polling" — yielding a tight
-                // CPU-bound loop that only cleared when the user manually
-                // deleted the lock file (see issue #176).
+                // Historically stale metadata produced a permanent
+                // `orphaned: true` state that callers (notably the TUI)
+                // interpreted as "rebuild in progress, keep polling" —
+                // yielding a tight CPU-bound loop that only cleared when the
+                // user manually deleted the lock file (see issue #176).
                 //
-                // Reap the stale metadata in place while we hold the lock,
-                // so that this and every subsequent reader observes a
-                // clean state.
-                //
-                // We deliberately do NOT gate this on a `kill(pid, 0)`
-                // liveness probe. Under PID reuse (the recorded pid is
-                // reassigned to an unrelated live process), such a probe
-                // would refuse to reap and the spin would reappear. Flock
-                // acquisition is the stronger and more precise signal.
-                if metadata_present {
-                    if let Err(err) = file.set_len(0) {
-                        tracing::warn!(
-                            path = %lock_path.display(),
-                            error = %err,
-                            "failed to truncate stale index-run lock metadata"
-                        );
-                    } else {
-                        let _ = clear_index_run_lock_metadata_sidecar(&lock_path);
-                        let _ = file.sync_all();
-                        tracing::info!(
-                            path = %lock_path.display(),
-                            stale_pid = ?snapshot.pid,
-                            "cleared stale index-run lock metadata (previous owner gone)"
-                        );
-                        let _ = file.unlock();
-                        return SearchMaintenanceSnapshot::default();
-                    }
-                }
+                // On observation surfaces (#176, pinned by bd-k9jb9's e2e
+                // contract) the stale metadata is also reaped IN PLACE —
+                // guarded by the exclusive flock, best-effort — so every
+                // subsequent reader observes a clean file without re-doing
+                // this dance. Pure-read callers (gh#422 search paths) skip
+                // the reap and stay byte-for-byte read-only. On a read-only
+                // filesystem (or a lost lock race) the truncate is skipped;
+                // either way the caller gets the clean default snapshot.
                 let _ = file.unlock();
+                if metadata_present {
+                    if reap_stale {
+                        reap_stale_index_run_lock_metadata(&lock_path, &sidecar_path);
+                    }
+                    return SearchMaintenanceSnapshot::default();
+                }
                 false
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(err) if windows_lock_conflict(&err) => true,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(err)) if windows_lock_conflict(&err) => true,
             Err(_) => false,
         }
     };
     snapshot.orphaned = metadata_present && !snapshot.active;
     snapshot
+}
+
+/// #176 / bd-k9jb9: truncate stale `index-run.lock` metadata in place so a
+/// subsequent reader (next `cass status`, next TUI poll) observes a clean
+/// state without re-doing the reaping dance. The truncate happens only while
+/// holding the exclusive flock (concurrent readers/writers cannot race the
+/// reap) and is best-effort: a read-only filesystem or a lost lock race
+/// leaves the bytes untouched — the caller already reports the clean default
+/// snapshot either way. The file itself is truncated, never deleted, to
+/// preserve permissions and avoid create/recreate races with writers. The
+/// metadata sidecar is cleared alongside it, since an empty lock file falls
+/// back to the sidecar on the next read.
+fn reap_stale_index_run_lock_metadata(lock_path: &Path, sidecar_path: &Path) {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+        return;
+    };
+    if file.try_lock().is_err() {
+        // A writer appeared between our shared probe and now; its metadata
+        // is live again — do not touch it.
+        return;
+    }
+    match file.set_len(0) {
+        Ok(()) => {
+            let _ = file.sync_all();
+            tracing::info!(
+                path = %lock_path.display(),
+                "reaped stale index-run.lock metadata left by a dead owner (#176)"
+            );
+            if sidecar_path.exists() {
+                let _ = std::fs::write(sidecar_path, b"");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                error = %err,
+                "failed to reap stale index-run.lock metadata; leaving bytes in place"
+            );
+        }
+    }
+    let _ = file.unlock();
 }
 
 fn parse_search_maintenance_snapshot(
@@ -431,6 +476,11 @@ pub(crate) struct SearchAssetSnapshot {
 pub(crate) struct LexicalAssetState {
     pub status: &'static str,
     pub exists: bool,
+    /// b4uax (gh#382): the on-disk generation was written by the legacy
+    /// Tantivy engine (`meta.json`, no Quill `MANIFEST`) and cannot be read
+    /// by the current engine. It "exists" (so the flip is REBUILD, not
+    /// "empty"), but it is not searchable until a full lexical rebuild runs.
+    pub engine_incompatible: bool,
     pub fresh: bool,
     pub stale: bool,
     pub rebuilding: bool,
@@ -456,6 +506,16 @@ pub(crate) struct LexicalAssetState {
     pub processed_conversations: Option<u64>,
     pub total_conversations: Option<u64>,
     pub indexed_docs: Option<u64>,
+    /// GH #457: the published generation serves far fewer documents than the
+    /// completed rebuild checkpoint certified for it (see
+    /// [`lexical_generation_hollow_verdict`]). Search still runs against a
+    /// hollow generation and confidently answers "nothing found", so this is
+    /// a rebuild-now condition, never "stale but searchable".
+    pub hollow: bool,
+    /// Live documents in the published lexical generation, from manifest
+    /// metadata alone (`None` when no manifest decodes or the generation
+    /// predates the Quill engine).
+    pub live_docs: Option<u64>,
     pub status_reason: Option<String>,
     pub fingerprint: LexicalFingerprintState,
     pub checkpoint: LexicalCheckpointState,
@@ -491,6 +551,9 @@ pub(crate) struct SemanticAssetState {
     pub vector_index_path: Option<PathBuf>,
     pub model_dir: Option<PathBuf>,
     pub hnsw_path: Option<PathBuf>,
+    /// Presence is not native admission. Bounded inspection never loads a graph.
+    pub hnsw_present: bool,
+    pub hnsw_state: &'static str,
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
     pub progressive_reason_code: Option<&'static str>,
@@ -717,6 +780,8 @@ fn semantic_state_not_inspected(
         vector_index_path: None,
         model_dir: preference_surface.model_dir,
         hnsw_path: None,
+        hnsw_present: false,
+        hnsw_state: "not_inspected",
         hnsw_ready: false,
         progressive_ready: false,
         progressive_reason_code: None,
@@ -762,7 +827,49 @@ pub(crate) fn inspect_semantic_assets(
         SemanticPreference::DefaultModel => probe_semantic_availability(data_dir),
         SemanticPreference::HashFallback => probe_hash_semantic_availability(data_dir),
     };
+    let availability = apply_semantic_identity_invalidation(db_path, availability, preference);
     semantic_state_from_availability(data_dir, &availability, preference, current_db_fingerprint)
+}
+
+fn apply_semantic_identity_invalidation(
+    db_path: &Path,
+    availability: SemanticAvailability,
+    preference: SemanticPreference,
+) -> SemanticAvailability {
+    if !availability.can_search() {
+        return availability;
+    }
+    let identity_tier = match preference {
+        SemanticPreference::HashFallback => SemanticIdentityTier::Fast,
+        SemanticPreference::DefaultModel => SemanticIdentityTier::Quality,
+    };
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            // `db_available` is a point-in-time observation, not proof that
+            // this later marker read succeeded. If the marker cannot be
+            // checked, using the semantic index could expose stale
+            // agent/source identity metadata after a Pi/OMP reclassification.
+            // Mark semantic loading unavailable so hybrid search truthfully
+            // falls back to lexical; explicit semantic search must not return
+            // results from an index whose identity safety is unknown.
+            return SemanticAvailability::LoadFailed {
+                context: format!("checking semantic identity invalidation marker: {err}"),
+            };
+        }
+    };
+    match storage.semantic_identity_rebuild_required(identity_tier) {
+        Ok(true) => SemanticAvailability::IndexStale {
+            embedder_id: semantic_embedder_id(&availability, preference)
+                .unwrap_or_else(|| "semantic".to_string()),
+            reason: "canonical agent/source identity changed; run 'cass index --semantic' to rebuild semantic filter metadata"
+                .to_string(),
+        },
+        Ok(false) => availability,
+        Err(err) => SemanticAvailability::LoadFailed {
+            context: format!("checking semantic identity invalidation marker: {err}"),
+        },
+    }
 }
 
 pub(crate) fn semantic_state_from_availability(
@@ -794,7 +901,10 @@ pub(crate) fn semantic_state_from_availability(
         );
     }
     let base_vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
-    let base_model_dir = preference_surface.model_dir;
+    let base_model_dir = match availability {
+        SemanticAvailability::ModelMissing { model_dir, .. } => Some(model_dir.clone()),
+        _ => preference_surface.model_dir,
+    };
     let base_hnsw_path = base_embedder_id
         .as_deref()
         .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
@@ -840,7 +950,7 @@ pub(crate) fn semantic_state_from_availability(
     } else {
         runtime.hnsw_path.or(base_hnsw_path)
     };
-    let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
+    let (hnsw_present, hnsw_state) = bounded_ann_presence(hnsw_path.as_deref());
 
     // Sub-fix 3 for cass#257: report quality-tier readiness as a
     // first-class flag so operators querying `--mode semantic` can
@@ -862,7 +972,12 @@ pub(crate) fn semantic_state_from_availability(
         vector_index_path,
         model_dir,
         hnsw_path,
-        hnsw_ready,
+        hnsw_present,
+        hnsw_state,
+        // Only serving/deep admission against the retained exact owner may
+        // advertise native readiness. A metadata entry alone proves nothing
+        // about graph integrity, completeness, or source identity.
+        hnsw_ready: false,
         progressive_ready,
         progressive_reason_code,
         quality_tier_published,
@@ -872,6 +987,19 @@ pub(crate) fn semantic_state_from_availability(
         quality_tier,
         backlog,
         checkpoint,
+    }
+}
+
+fn bounded_ann_presence(path: Option<&Path>) -> (bool, &'static str) {
+    let Some(path) = path else {
+        return (false, "absent");
+    };
+    match std::fs::symlink_metadata(path) {
+        // Report even a dangling symlink as present, without following it or
+        // claiming that its target is a usable native accelerator.
+        Ok(_) => (true, "present_unverified"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, "absent"),
+        Err(_) => (false, "inspection_failed"),
     }
 }
 
@@ -1059,6 +1187,12 @@ fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
     FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+}
+
+fn active_policy_embedder_id() -> Option<String> {
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
+    FastEmbedder::config_for(embedder_name).map(|config| config.embedder_id)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
@@ -1315,6 +1449,15 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
                 )
             })?,
         )
+    } else if db_available {
+        // GH #353: the skip-open surfaces (health watermark lane, count-less
+        // status) deliberately never open the archive, but they must still
+        // compare the storage fingerprint `search` defers repair on instead
+        // of leaving `matches_current_db_fingerprint` null while reporting
+        // fresh. Serve the identity-keyed sidecar fingerprint — never an
+        // open — and stay honestly null when the sidecar does not describe
+        // the current archive identity.
+        crate::indexer::lexical_storage_fingerprint_for_db_cached_readonly(db_path, &index_path)
     } else {
         None
     };
@@ -1328,6 +1471,7 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
         maintenance,
         checkpoint: checkpoint.as_ref(),
         current_db_fingerprint: current_db_fingerprint.as_deref(),
+        live_docs: crate::search::tantivy::searchable_index_live_doc_count(&index_path),
     }))
 }
 
@@ -1341,7 +1485,104 @@ struct LexicalObservationInput<'a> {
     maintenance: SearchMaintenanceSnapshot,
     checkpoint: Option<&'a LexicalRebuildCheckpoint>,
     current_db_fingerprint: Option<&'a str>,
+    /// Live documents the published generation serves, from manifest metadata
+    /// alone (GH #457); `None` when no manifest decodes.
+    live_docs: Option<u64>,
 }
+
+/// GH #457: floor, as a percentage of the completed checkpoint's
+/// `indexed_docs`, below which the published generation is HOLLOW.
+///
+/// Every rebuild proves `live == indexed_docs` before it certifies its
+/// checkpoint, incremental ingest only adds documents, and an upsert replaces
+/// one live document with one live document, so the served count never
+/// legitimately drops below what the checkpoint certified; `cass forget`
+/// rewrites the checkpoint along with the derived assets. Half is a generous
+/// margin against any bookkeeping skew while still catching the reported
+/// shape (3 live documents against ~1M certified) by orders of magnitude.
+pub(crate) const LEXICAL_HOLLOW_LIVE_DOC_FLOOR_PERCENT: u64 = 50;
+
+/// GH #457: a published lexical generation that serves far fewer documents
+/// than its completed rebuild checkpoint certified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LexicalHollowVerdict {
+    /// `indexed_docs` recorded by the completed checkpoint for this DB.
+    pub expected_docs: u64,
+    /// Documents the published generation currently serves.
+    pub live_docs: u64,
+}
+
+impl LexicalHollowVerdict {
+    /// Share of the certified documents the generation no longer serves.
+    #[must_use]
+    pub(crate) fn missing_percent(&self) -> u64 {
+        if self.expected_docs == 0 {
+            return 0;
+        }
+        let missing = u128::from(self.expected_docs.saturating_sub(self.live_docs));
+        u64::try_from(missing * 100 / u128::from(self.expected_docs)).unwrap_or(100)
+    }
+
+    /// Operator-facing reason naming the gap and the only remedy that works.
+    #[must_use]
+    pub(crate) fn reason(&self) -> String {
+        format!(
+            "lexical index is HOLLOW: the published Quill generation serves {live} live document(s) \
+             but the completed rebuild checkpoint certified {expected} indexed document(s) \
+             ({missing}% missing); search silently answers from a near-empty index. \
+             Run `cass index`: its pre-scan check rebuilds the lexical index from the canonical \
+             database when the live index is sparse (`cass index --full` does the same after a \
+             full rescan)",
+            live = self.live_docs,
+            expected = self.expected_docs,
+            missing = self.missing_percent(),
+        )
+    }
+}
+
+/// GH #457: compare what the published generation serves against what the
+/// completed checkpoint certified. `expected_docs` must already be gated on
+/// a completed checkpoint for the current DB and lexical contract (a
+/// mismatched or incomplete checkpoint is reported by its own signal);
+/// `None` on either side means "no verdict", never "hollow".
+#[must_use]
+pub(crate) fn lexical_generation_hollow_verdict(
+    expected_docs: Option<u64>,
+    live_docs: Option<u64>,
+) -> Option<LexicalHollowVerdict> {
+    let expected_docs = expected_docs.filter(|&docs| docs > 0)?;
+    let live_docs = live_docs?;
+    // u128 so the comparison is exact at every scale (saturating u64 math
+    // would collapse the ratio near the top of the range).
+    let hollow = u128::from(live_docs) * 100
+        < u128::from(expected_docs) * u128::from(LEXICAL_HOLLOW_LIVE_DOC_FLOOR_PERCENT);
+    hollow.then_some(LexicalHollowVerdict {
+        expected_docs,
+        live_docs,
+    })
+}
+
+/// `indexed_docs` certified by a COMPLETED lexical rebuild checkpoint that
+/// describes `db_path` under the current lexical contract; `None` when no
+/// such checkpoint exists (nothing certified means nothing to be hollow
+/// against). Shared by readiness, `doctor` and the post-run indexer guard so
+/// every surface applies the same gate (GH #457).
+pub(crate) fn completed_lexical_checkpoint_indexed_docs(
+    index_path: &Path,
+    db_path: &Path,
+) -> Option<u64> {
+    let checkpoint = load_lexical_rebuild_checkpoint(index_path).ok().flatten()?;
+    let certified = checkpoint.completed
+        && crate::stored_path_identity_matches(&checkpoint.db_path, db_path)
+        && checkpoint.schema_hash == SCHEMA_HASH
+        && lexical_rebuild_page_size_is_compatible(checkpoint.page_size);
+    certified.then_some(checkpoint.indexed_docs as u64)
+}
+
+/// b4uax: the exact operator contract for a legacy Tantivy generation. Names
+/// the command and the expected cost so `status`/`triage` never leave an
+/// established archive guessing after the engine flip.
+pub(crate) const LEGACY_ENGINE_STATUS_REASON: &str = "lexical index was built by the legacy Tantivy engine and the current Quill engine cannot read it; search is unavailable until `cass index --full` completes a one-time full lexical rebuild (cost scales with message count: minutes on small archives, an hour-scale run on multi-million-message archives; `--force-rebuild` skips the filesystem rescan)";
 
 fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> LexicalAssetState {
     let LexicalObservationInput {
@@ -1353,8 +1594,19 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         maintenance,
         checkpoint,
         current_db_fingerprint,
+        live_docs,
     } = input;
     let exists = crate::search::tantivy::searchable_index_exists(index_path);
+    // b4uax: a Tantivy-era `meta.json` without a Quill `MANIFEST` (or a
+    // federated manifest) is an index generation the current engine cannot
+    // open. `exists` stays true; the state must say "rebuild required", not
+    // "ready".
+    let engine_incompatible = exists
+        && !index_path
+            .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
+            .exists()
+        && !crate::search::tantivy::federated_search_manifest_path(index_path).exists()
+        && index_path.join("meta.json").exists();
     let checkpoint_db_matches =
         checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
     let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
@@ -1371,6 +1623,19 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
     let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
     let fingerprint_mismatch = fingerprint_matches == Some(false);
+    // GH #457: only a checkpoint that otherwise certifies this generation for
+    // this DB can be contradicted by the served count; an incomplete, foreign
+    // or contract-mismatched checkpoint already carries its own verdict.
+    let certified_docs = checkpoint
+        .filter(|state| {
+            state.completed
+                && checkpoint_db_matches == Some(true)
+                && schema_matches == Some(true)
+                && page_size_compatible == Some(true)
+        })
+        .map(|state| state.indexed_docs as u64);
+    let hollow_verdict = lexical_generation_hollow_verdict(certified_docs, live_docs);
+    let hollow = hollow_verdict.is_some();
     // F4 (cass tech debt): derive the (legacy) second-resolution clock
     // from `now_ms` rather than the other way around so the comparison
     // against ms-precision `last_progress_at_ms` below is no longer
@@ -1379,10 +1644,22 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
-    let age_stale = match age_seconds {
+    let age_exceeds_threshold = match age_seconds {
         Some(age) => age > stale_threshold,
         None => true,
     };
+    // GH #452: a checkpoint fingerprint that still matches the live database
+    // means no conversation and no message has been added since the last
+    // successful index (`content-v1:<conversations>:<max_conversation_id>:
+    // <max_message_id>`), so the index is not out of date — only old. Age alone
+    // must not mark it stale and send every ordinary read into a refresh.
+    //
+    // Only genuine age is covered: an index with NO recorded `last_indexed_at`
+    // is unproven rather than old, and stays stale. Every other staleness
+    // signal (contract, engine, checkpoint, fingerprint mismatch) is untouched.
+    let age_stale_covered_by_fingerprint =
+        age_seconds.is_some() && fingerprint_matches == Some(true);
+    let age_stale = age_exceeds_threshold && !age_stale_covered_by_fingerprint;
     let maintenance_targets_current_db = maintenance
         .db_path
         .as_ref()
@@ -1424,14 +1701,16 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         // A stalled rebuild leaves the on-disk index unchanged; if it
         // existed before the stall it is still searchable, so treat
         // `stalled` like the indexer just hadn't gotten there yet.
-        !exists || contract_mismatch
+        !exists || contract_mismatch || engine_incompatible
     } else {
         exists
-            && (age_stale
+            && (engine_incompatible
+                || age_stale
                 || checkpoint_db_mismatch
                 || checkpoint_incomplete
                 || contract_mismatch
-                || fingerprint_mismatch)
+                || fingerprint_mismatch
+                || hollow)
     };
     let fresh = exists && !stale && !rebuilding;
     let status = if stalled {
@@ -1440,6 +1719,10 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         "building"
     } else if !exists {
         "missing"
+    } else if engine_incompatible {
+        "legacy_engine"
+    } else if hollow {
+        "hollow"
     } else if stale {
         "stale"
     } else {
@@ -1454,6 +1737,10 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
         Some("lexical index metadata missing".to_string())
+    } else if engine_incompatible {
+        Some(LEGACY_ENGINE_STATUS_REASON.to_string())
+    } else if let Some(verdict) = hollow_verdict {
+        Some(verdict.reason())
     } else if checkpoint_db_mismatch {
         Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
@@ -1500,6 +1787,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     LexicalAssetState {
         status,
         exists,
+        engine_incompatible,
         fresh,
         stale,
         rebuilding,
@@ -1521,6 +1809,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         indexed_docs: checkpoint
             .filter(|_| checkpoint_progress_usable)
             .map(|state| state.indexed_docs as u64),
+        hollow,
+        live_docs,
         status_reason,
         fingerprint: LexicalFingerprintState {
             current_db_fingerprint: current_db_fingerprint.map(ToOwned::to_owned),
@@ -1545,12 +1835,12 @@ fn semantic_embedder_id(
     match availability {
         SemanticAvailability::Ready { embedder_id }
         | SemanticAvailability::UpdateAvailable { embedder_id, .. }
-        | SemanticAvailability::IndexBuilding { embedder_id, .. } => Some(embedder_id.clone()),
+        | SemanticAvailability::IndexBuilding { embedder_id, .. }
+        | SemanticAvailability::IndexStale { embedder_id, .. }
+        | SemanticAvailability::ModelMissing { embedder_id, .. } => Some(embedder_id.clone()),
         SemanticAvailability::HashFallback => Some(HashEmbedder::default().id().to_string()),
         _ => match preference {
-            SemanticPreference::DefaultModel => {
-                Some(FastEmbedder::embedder_id_static().to_string())
-            }
+            SemanticPreference::DefaultModel => active_policy_embedder_id(),
             SemanticPreference::HashFallback => Some(HashEmbedder::default().id().to_string()),
         },
     }
@@ -1610,6 +1900,7 @@ fn semantic_availability_code(availability: &SemanticAvailability) -> &'static s
         SemanticAvailability::Downloading { .. } => "downloading",
         SemanticAvailability::Verifying => "verifying",
         SemanticAvailability::IndexBuilding { .. } => "index_building",
+        SemanticAvailability::IndexStale { .. } => "update_available",
         SemanticAvailability::HashFallback => "hash_fallback",
         SemanticAvailability::Disabled { .. } => "disabled",
         SemanticAvailability::ModelMissing { .. } => "model_missing",
@@ -1628,7 +1919,9 @@ fn semantic_status_from_availability(availability: &SemanticAvailability) -> &'s
         | SemanticAvailability::Verifying
         | SemanticAvailability::IndexBuilding { .. } => "building",
         SemanticAvailability::Disabled { .. } => "disabled",
-        SemanticAvailability::UpdateAvailable { .. } => "stale",
+        SemanticAvailability::UpdateAvailable { .. } | SemanticAvailability::IndexStale { .. } => {
+            "stale"
+        }
         SemanticAvailability::NotInstalled
         | SemanticAvailability::NeedsConsent
         | SemanticAvailability::ModelMissing { .. }
@@ -1660,6 +1953,7 @@ fn semantic_hint(
         }
         (_, SemanticAvailability::IndexMissing { .. })
         | (_, SemanticAvailability::UpdateAvailable { .. })
+        | (_, SemanticAvailability::IndexStale { .. })
         | (_, SemanticAvailability::IndexBuilding { .. }) => {
             "Run 'cass index --semantic' to build or refresh vector assets; lexical search remains available"
         }
@@ -2152,6 +2446,39 @@ pub(crate) fn unified_maintenance_view(
 mod tests {
     use super::*;
 
+    #[test]
+    fn semantic_identity_marker_overrides_ready_asset_status_per_tier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("create cass db");
+        storage
+            .mark_semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+            .expect("mark fast semantic identity stale");
+        drop(storage);
+
+        let stale = apply_semantic_identity_invalidation(
+            &db_path,
+            SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+        );
+        assert!(
+            stale.is_index_stale(),
+            "status must not advertise a Pi-era fast-tier artifact as ready: {stale:?}"
+        );
+
+        let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+        storage
+            .complete_semantic_identity_rebuild(SemanticIdentityTier::Fast)
+            .expect("complete fast semantic identity rebuild");
+        drop(storage);
+        let ready = apply_semantic_identity_invalidation(
+            &db_path,
+            SemanticAvailability::HashFallback,
+            SemanticPreference::HashFallback,
+        );
+        assert!(ready.is_hash_fallback());
+    }
+
     #[cfg(windows)]
     fn active_lock_fixture_pid(_non_windows_pid: u32) -> u32 {
         std::process::id()
@@ -2200,6 +2527,7 @@ mod tests {
             SearchMaintenanceJobKind::LexicalRefresh,
             SearchMaintenanceJobKind::SemanticAcquire,
             SearchMaintenanceJobKind::SemanticRebuild,
+            SearchMaintenanceJobKind::AnalyticsRebuild,
         ] {
             assert_eq!(
                 SearchMaintenanceJobKind::parse_lock_value(kind.as_lock_value()),
@@ -2231,56 +2559,81 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_metadata_from_dead_owner_is_reaped_on_read() {
+    fn gh422_stale_lock_metadata_is_ignored_without_mutating_it_on_read() {
         // Regression for issue #176: the TUI used to see a permanent
         // `orphaned: true` state when the index-run.lock file contained
-        // metadata from a crashed process, because nothing in the read
-        // path cleaned it up. That produced a tight CPU-bound poll loop
-        // on startup. The read path now reaps stale metadata atomically
-        // while holding the exclusive flock.
+        // metadata from a crashed process. A successful shared-lock probe now
+        // returns a clean snapshot without rewriting the file, preserving both
+        // the old spin fix and search's strict read-only contract.
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
-        // The reap path does not probe the recorded pid — POSIX flock
-        // acquisition is the signal — so the concrete pid value in the
-        // fixture is irrelevant. We still record one so the parser
-        // runs through its full happy path.
-        std::fs::write(
-            &lock_path,
-            concat!(
-                "pid=4242\n",
-                "started_at_ms=1733000111000\n",
-                "updated_at_ms=1733000112000\n",
-                "db_path=/tmp/cass/agent_search.db\n",
-                "mode=index\n",
-                "job_id=lexical-refresh-1733000111000-4242\n",
-                "job_kind=lexical_refresh\n",
-                "phase=rebuilding\n"
-            ),
-        )
-        .expect("write lock metadata");
+        let stale_metadata = concat!(
+            "pid=4242\n",
+            "started_at_ms=1733000111000\n",
+            "updated_at_ms=1733000112000\n",
+            "db_path=/tmp/cass/agent_search.db\n",
+            "mode=index\n",
+            "job_id=lexical-refresh-1733000111000-4242\n",
+            "job_kind=lexical_refresh\n",
+            "phase=rebuilding\n"
+        );
+        std::fs::write(&lock_path, stale_metadata).expect("write lock metadata");
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
         assert!(!snapshot.active, "no owner, must not be reported active");
         assert!(
             !snapshot.orphaned,
-            "stale metadata must be reaped, not reported as orphaned"
+            "stale metadata must be ignored, not reported as orphaned"
         );
-        assert!(snapshot.pid.is_none(), "pid must be cleared after reap");
+        assert!(
+            snapshot.pid.is_none(),
+            "stale pid must not escape the probe"
+        );
         assert!(
             snapshot.job_id.is_none(),
-            "job_id must be cleared after reap"
+            "stale job_id must not escape the probe"
         );
-        assert!(snapshot.phase.is_none(), "phase must be cleared after reap");
-
-        // File must still exist (to preserve permissions and avoid
-        // creating/recreating races) but be empty.
-        let post = std::fs::metadata(&lock_path).expect("lock file still present");
-        assert_eq!(post.len(), 0, "stale metadata must be truncated in place");
+        assert!(
+            snapshot.phase.is_none(),
+            "stale phase must not escape the probe"
+        );
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read unchanged lock metadata"),
+            stale_metadata.as_bytes(),
+            "the PURE probe (gh#422 search paths) must preserve every byte"
+        );
 
         // Second read also returns a clean default snapshot.
         let snapshot2 = read_search_maintenance_snapshot(temp.path());
         assert!(!snapshot2.active);
         assert!(!snapshot2.orphaned);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read lock metadata after second probe"),
+            stale_metadata.as_bytes(),
+            "repeated pure observation must remain byte-for-byte read-only"
+        );
+
+        // #176 / bd-k9jb9 contract: the REAPING probe (status/health/TUI
+        // observation surfaces) truncates the stale metadata in place —
+        // never deleting the file — so subsequent readers observe a clean
+        // lock without re-doing the staleness dance.
+        let reaped = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!reaped.active);
+        assert!(!reaped.orphaned);
+        assert_eq!(
+            std::fs::metadata(&lock_path)
+                .expect("stat lock after reaping probe")
+                .len(),
+            0,
+            "stale lock metadata must be truncated in place by the reaping probe"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be truncated, never deleted"
+        );
+        let after_reap = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!after_reap.active);
+        assert!(!after_reap.orphaned);
     }
 
     #[test]
@@ -2367,15 +2720,210 @@ mod tests {
         }
     }
 
+    fn hollow_probe_checkpoint(db_path: &Path, indexed_docs: usize) -> LexicalRebuildCheckpoint {
+        LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        }
+    }
+
+    fn hollow_probe_state(
+        index_path: &Path,
+        db_path: &Path,
+        checkpoint: Option<&LexicalRebuildCheckpoint>,
+        live_docs: Option<u64>,
+    ) -> LexicalAssetState {
+        lexical_state_from_observations(LexicalObservationInput {
+            index_path,
+            db_path,
+            stale_threshold: 3600,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_001_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint,
+            current_db_fingerprint: Some("content-v1:10:10:100"),
+            live_docs,
+        })
+    }
+
+    /// GH #457: a completed, fingerprint-matching checkpoint that certified
+    /// 1,000 documents over a generation serving 3 is HOLLOW — its own
+    /// status, stale, not fresh, and the reason names the only remedy.
+    #[test]
+    fn lexical_state_reports_a_hollow_generation_as_its_own_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+        let checkpoint = hollow_probe_checkpoint(&db_path, 1_000);
+
+        let state = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(3));
+        assert!(state.hollow);
+        assert_eq!(state.live_docs, Some(3));
+        assert_eq!(state.status, "hollow");
+        assert!(state.stale);
+        assert!(!state.fresh);
+        assert_eq!(
+            state.fingerprint.matches_current_db_fingerprint,
+            Some(true),
+            "hollowness is orthogonal to the content fingerprint"
+        );
+        let reason = state.status_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("HOLLOW"), "{reason}");
+        assert!(reason.contains("3 live document"), "{reason}");
+        assert!(reason.contains("1000 indexed document"), "{reason}");
+        assert!(reason.contains("99% missing"), "{reason}");
+        assert!(reason.contains("Run `cass index`"), "{reason}");
+
+        // Exactly the floor is not hollow; one below it is.
+        let at_floor = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(500));
+        assert!(!at_floor.hollow, "50% of the certified count is the floor");
+        assert_eq!(at_floor.status, "ready");
+        let below_floor = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(499));
+        assert!(below_floor.hollow);
+
+        // Growth after the rebuild (incremental ingest) is never hollow.
+        let grown = hollow_probe_state(&index_path, &db_path, Some(&checkpoint), Some(5_000));
+        assert!(!grown.hollow);
+        assert_eq!(grown.status, "ready");
+    }
+
+    /// GH #457: without a certifying checkpoint, or without a decodable
+    /// manifest, there is no verdict — an incomplete checkpoint keeps its
+    /// own `partial`/incomplete signal and never doubles as hollow.
+    #[test]
+    fn lexical_state_never_calls_an_uncertified_generation_hollow() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let no_checkpoint = hollow_probe_state(&index_path, &db_path, None, Some(0));
+        assert!(!no_checkpoint.hollow);
+        assert_ne!(no_checkpoint.status, "hollow");
+
+        let mut incomplete = hollow_probe_checkpoint(&db_path, 1_000);
+        incomplete.completed = false;
+        let partial = hollow_probe_state(&index_path, &db_path, Some(&incomplete), Some(3));
+        assert!(
+            !partial.hollow,
+            "an incomplete checkpoint is partial, not hollow"
+        );
+        assert_eq!(partial.status, "stale");
+        assert!(
+            partial
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("incomplete")
+        );
+
+        let mut foreign = hollow_probe_checkpoint(&db_path, 1_000);
+        foreign.db_path = temp.path().join("other.db").display().to_string();
+        let foreign_state = hollow_probe_state(&index_path, &db_path, Some(&foreign), Some(3));
+        assert!(
+            !foreign_state.hollow,
+            "a foreign checkpoint certifies nothing here"
+        );
+
+        let unreadable = hollow_probe_state(
+            &index_path,
+            &db_path,
+            Some(&hollow_probe_checkpoint(&db_path, 1_000)),
+            None,
+        );
+        assert!(!unreadable.hollow, "no manifest means no verdict");
+        assert_eq!(unreadable.status, "ready");
+
+        let zero_certified = hollow_probe_state(
+            &index_path,
+            &db_path,
+            Some(&hollow_probe_checkpoint(&db_path, 0)),
+            Some(0),
+        );
+        assert!(!zero_certified.hollow, "an empty archive certifies nothing");
+    }
+
+    #[test]
+    fn hollow_verdict_math_is_exact_at_the_floor_and_saturates() {
+        assert_eq!(lexical_generation_hollow_verdict(None, Some(0)), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(0), Some(0)), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(10), None), None);
+        assert_eq!(lexical_generation_hollow_verdict(Some(10), Some(5)), None);
+        let verdict = lexical_generation_hollow_verdict(Some(10), Some(4)).expect("hollow");
+        assert_eq!(verdict.missing_percent(), 60);
+        let huge = lexical_generation_hollow_verdict(Some(u64::MAX), Some(1)).expect("hollow");
+        assert_eq!(huge.missing_percent(), 99);
+        assert!(huge.reason().contains("Run `cass index`"));
+    }
+
+    /// b4uax (gh#382): a Tantivy-era `meta.json` without a Quill MANIFEST is
+    /// an existing-but-unreadable generation: not fresh, not "ready", and the
+    /// reason names the exact rebuild command.
+    #[test]
+    fn legacy_tantivy_generation_reports_engine_incompatible() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write legacy meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 3600,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_001_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: None,
+            current_db_fingerprint: None,
+            live_docs: None,
+        });
+        assert!(state.exists, "a legacy generation still counts as existing");
+        assert!(state.engine_incompatible);
+        assert!(!state.fresh);
+        assert!(state.stale);
+        assert_eq!(state.status, "legacy_engine");
+        let reason = state.status_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("cass index --full"));
+        assert!(reason.contains("Tantivy"));
+    }
+
     #[test]
     fn lexical_state_marks_fingerprint_mismatch_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        // Simulate an existing tantivy index (meta.json present) so the
+        // Simulate an existing Quill generation (MANIFEST present) so the
         // "missing" branch in lexical_state_from_observations doesn't short
         // circuit before the fingerprint check we want to exercise.
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2402,6 +2950,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2421,12 +2970,126 @@ mod tests {
         assert_eq!(state.indexed_docs, None);
     }
 
+    /// GH #452: an index whose checkpoint fingerprint still matches the live
+    /// database has nothing new to ingest, so an old `last_indexed_at` alone
+    /// must report `ready` — not `stale`, which sends every ordinary read into
+    /// an archive-scale refresh.
+    #[test]
+    fn lexical_state_treats_age_as_covered_by_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+        // Indexed long ago (well past the 60 s threshold) but the database has
+        // not gained a conversation or a message since.
+        let input = |current_db_fingerprint: Option<&'static str>| LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint,
+            live_docs: None,
+        };
+
+        let covered = lexical_state_from_observations(input(Some("content-v1:10:10:100")));
+        assert_eq!(
+            covered.status, "ready",
+            "a matching fingerprint covers pure age-staleness"
+        );
+        assert_eq!(covered.status_reason, None);
+
+        // New content since the checkpoint still reports stale.
+        let changed = lexical_state_from_observations(input(Some("content-v1:11:11:120")));
+        assert_eq!(changed.status, "stale");
+
+        // No fingerprint probe at all: age still decides, unchanged.
+        let unprobed = lexical_state_from_observations(input(None));
+        assert_eq!(unprobed.status, "stale");
+        assert!(
+            unprobed
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("older than the stale threshold"))
+        );
+    }
+
+    /// An index with a matching fingerprint but NO recorded `last_indexed_at`
+    /// is unproven, not merely old: it stays stale.
+    #[test]
+    fn lexical_state_keeps_unknown_age_stale_even_with_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: None,
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("content-v1:10:10:100"),
+            live_docs: None,
+        });
+
+        assert_eq!(state.status, "stale");
+    }
+
     #[test]
     fn lexical_state_marks_checkpoint_db_mismatch_stale_without_fingerprint_probe() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         let other_db_path = temp.path().join("other_agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
@@ -2455,6 +3118,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2491,6 +3155,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "missing");
@@ -2508,7 +3173,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2547,6 +3216,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "building");
@@ -2569,7 +3239,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2596,6 +3270,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("before"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2657,6 +3332,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "building");
@@ -2668,7 +3344,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");
@@ -2709,6 +3389,7 @@ mod tests {
             },
             checkpoint: Some(&checkpoint),
             current_db_fingerprint: Some("after"),
+            live_docs: None,
         });
 
         assert_eq!(state.status, "stale");
@@ -2734,7 +3415,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");
@@ -2761,6 +3446,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert_eq!(state.status, "ready");
@@ -2783,7 +3469,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2816,6 +3506,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding, "active rebuild lock must still register");
@@ -2855,7 +3546,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2885,6 +3580,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding);
@@ -2901,7 +3597,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2931,6 +3631,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         assert!(state.rebuilding);
@@ -2955,7 +3656,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2985,6 +3690,7 @@ mod tests {
             },
             checkpoint: None,
             current_db_fingerprint: None,
+            live_docs: None,
         });
 
         let age = state
@@ -3048,7 +3754,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
@@ -3084,7 +3794,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
@@ -3115,20 +3829,23 @@ mod tests {
     }
 
     #[test]
-    fn inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe() {
+    fn inspect_search_assets_fails_semantic_closed_when_identity_marker_is_unreadable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
 
         // The availability probe validates the artifact it finds (it no
         // longer trusts bare file existence), so the fixture must be a real
-        // hash vector index. The contract under test is unchanged: the DB
-        // itself (an unopenable directory here) must not be re-opened when
-        // the caller already probed it.
+        // hash vector index. `db_available` only records an earlier probe: an
+        // unreadable identity marker must still disable semantic search.
         let embedder = HashEmbedder::default();
         let vector_path = vector_index_path(temp.path(), embedder.id());
         std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
@@ -3160,11 +3877,18 @@ mod tests {
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
         })
-        .expect("semantic metadata probe should trust the existing DB availability signal");
+        .expect("semantic metadata inspection should degrade without failing the whole snapshot");
 
-        assert_eq!(snapshot.semantic.status, "hash_fallback");
-        assert_eq!(snapshot.semantic.availability, "hash_fallback");
-        assert!(snapshot.semantic.can_search);
+        assert_eq!(snapshot.semantic.status, "error");
+        assert_eq!(snapshot.semantic.availability, "load_failed");
+        assert!(!snapshot.semantic.can_search);
+        assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
+        assert!(
+            snapshot
+                .semantic
+                .summary
+                .contains("checking semantic identity invalidation marker")
+        );
     }
 
     #[test]
@@ -3181,6 +3905,32 @@ mod tests {
         assert!(state.available);
         assert!(state.can_search);
         assert_eq!(state.fallback_mode, None);
+    }
+
+    #[test]
+    fn semantic_state_preserves_missing_model_identity_and_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp.path().join("models/multilingual-minilm");
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::ModelMissing {
+                embedder_id: "multilingual-minilm-384".to_string(),
+                model_dir: model_dir.clone(),
+                missing_files: vec!["model.safetensors".to_string()],
+            },
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(
+            state.embedder_id.as_deref(),
+            Some("multilingual-minilm-384")
+        );
+        assert_eq!(state.model_dir.as_deref(), Some(model_dir.as_path()));
+        assert_eq!(
+            state.vector_index_path.as_deref(),
+            Some(vector_index_path(temp.path(), "multilingual-minilm-384").as_path())
+        );
     }
 
     #[test]
@@ -3237,11 +3987,52 @@ mod tests {
             "human summary and JSON reason code must agree: {}",
             state.summary
         );
-        assert!(state.hnsw_ready);
+        assert!(state.hnsw_present);
+        assert_eq!(state.hnsw_state, "present_unverified");
+        assert!(
+            !state.hnsw_ready,
+            "arbitrary bytes cannot prove native admission"
+        );
         assert_eq!(
             state.embedder_id.as_deref(),
             Some(FastEmbedder::embedder_id_static())
         );
+    }
+
+    #[test]
+    fn bounded_ann_presence_does_not_read_or_modify_sidecar_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ann.chsw");
+        assert_eq!(bounded_ann_presence(None), (false, "absent"));
+        assert_eq!(bounded_ann_presence(Some(&path)), (false, "absent"));
+        std::fs::write(&path, b"not native ANN metadata").expect("write decoy");
+        let before = std::fs::metadata(&path).expect("metadata before");
+        assert_eq!(
+            bounded_ann_presence(Some(&path)),
+            (true, "present_unverified")
+        );
+        let after = std::fs::metadata(&path).expect("metadata after");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.permissions(), after.permissions());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not native ANN metadata");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ann_presence_reports_dangling_symlink_without_following_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("absent-target");
+        let link = temp.path().join("ann.chsw");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        assert_eq!(
+            bounded_ann_presence(Some(&link)),
+            (true, "present_unverified")
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]

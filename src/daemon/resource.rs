@@ -11,16 +11,25 @@ use std::fs;
 use std::process::Command;
 
 use tracing::debug;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use tracing::warn;
 
 // Inline POSIX constants and FFI for sysconf / setpriority — avoids a direct `libc` dependency.
-#[cfg(target_os = "linux")]
+// `setpriority(PRIO_PROCESS, ...)` has the same signature and semantics on
+// Linux and macOS, so the nice path is shared across Unix; `sysconf` is only
+// needed by the Linux `/proc/self/statm` memory probe.
+#[cfg(unix)]
 mod posix {
-    use std::ffi::{c_int, c_long, c_uint};
+    #[cfg(target_os = "linux")]
+    use std::ffi::c_long;
+    use std::ffi::{c_int, c_uint};
+    #[cfg(target_os = "linux")]
     pub const _SC_PAGESIZE: c_int = 30;
     pub const PRIO_PROCESS: c_int = 0;
+    // SAFETY: declarations match the POSIX prototypes of sysconf(3) and setpriority(2).
+    #[allow(unsafe_code)]
     unsafe extern "C" {
+        #[cfg(target_os = "linux")]
         pub fn sysconf(name: c_int) -> c_long;
         pub fn setpriority(which: c_int, who: c_uint, prio: c_int) -> c_int;
     }
@@ -29,8 +38,8 @@ mod posix {
 /// Resource monitor for tracking daemon resource usage.
 #[derive(Debug, Default)]
 pub struct ResourceMonitor {
-    /// Cached PID for /proc lookups.
-    #[cfg(target_os = "linux")]
+    /// Cached PID for /proc lookups and priority calls.
+    #[cfg(unix)]
     pid: u32,
 }
 
@@ -38,7 +47,7 @@ impl ResourceMonitor {
     /// Create a new resource monitor.
     pub fn new() -> Self {
         Self {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             pid: std::process::id(),
         }
     }
@@ -84,6 +93,7 @@ impl ResourceMonitor {
 
     /// Get system page size in bytes.
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
     fn page_size() -> u64 {
         // SAFETY: sysconf has no pointer arguments and is thread-safe for this key.
         let raw = unsafe { posix::sysconf(posix::_SC_PAGESIZE) };
@@ -94,8 +104,9 @@ impl ResourceMonitor {
     ///
     /// Nice values range from -20 (highest priority) to 19 (lowest priority).
     /// Returns true if successful.
+    #[allow(unsafe_code)]
     pub fn apply_nice(&self, nice_value: i32) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             if !(-20..=19).contains(&nice_value) {
                 warn!(
@@ -128,7 +139,7 @@ impl ResourceMonitor {
             true
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             debug!(nice = nice_value, "nice not supported on this platform");
             let _ = nice_value;
@@ -221,8 +232,10 @@ mod tests {
     #[test]
     fn test_resource_monitor_creation() {
         let monitor = ResourceMonitor::new();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         assert!(monitor.pid > 0);
+        #[cfg(not(unix))]
+        let _ = monitor;
     }
 
     #[test]

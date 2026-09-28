@@ -16,6 +16,506 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_multi_connector", test_name)
 }
 
+/// GH #423: Codebuff and Freebuff share one Manicode store with no per-chat
+/// writer marker, so their history indexes under the `codebuff` lineage,
+/// attributed to the run state's project root. The records follow FAD's
+/// source-schema fixtures (public TypeScript persistence schema), not captured
+/// native app history.
+#[test]
+fn codebuff_cli_indexes_shared_manicode_history_and_updates_native_messages() {
+    use serde_json::{Value, json};
+    use std::time::{Duration, SystemTime};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let project = home.join(".config/manicode/projects/demo");
+    let chat = project.join("chats/2026-09-01T12-00-00.000Z");
+    std::fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    let write_transcript = |answer: &str, modified: SystemTime| {
+        let records = json!([
+            {"id":"user-native-1", "variant":"user", "content":"codebuffneedle how do I pin the toolchain",
+             "timestamp":"2026-09-01T12:00:00.000Z"},
+            {"id":"ai-native-2", "variant":"ai", "content": answer,
+             "timestamp":"2026-09-01T12:00:05.000Z"}
+        ]);
+        std::fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    };
+    let start = SystemTime::now() - Duration::from_secs(3600);
+    write_transcript("codebuffprior: pin it in rust-toolchain.toml", start);
+    std::fs::write(
+        chat.join("run-state.json"),
+        serde_json::to_vec(&json!({
+            "sessionState": {"fileContext": {"projectRoot": "/work/codebuff-demo", "cwd": "/work/codebuff-demo"}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Negative: JSON outside a chats/<id>/chat-messages.json slot is not history.
+    std::fs::write(
+        project.join("notes.json"),
+        br#"[{"id":"stray","variant":"user","content":"codebuffstray"}]"#,
+    )
+    .unwrap();
+
+    let command = || {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    };
+    let search = |needle: &str| -> Vec<Value> {
+        let output = command()
+            .args([
+                "search",
+                needle,
+                "--agent",
+                "codebuff",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "10000",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        result["hits"].as_array().cloned().unwrap_or_default()
+    };
+    let messages = || -> i64 {
+        let output = command()
+            .args(["stats", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<Value>(&output).unwrap()["messages"]
+            .as_i64()
+            .unwrap()
+    };
+
+    command()
+        .args(["index", "--full", "--json"])
+        .assert()
+        .success();
+    let hits = search("codebuffneedle");
+    assert!(!hits.is_empty(), "codebuff history must be searchable");
+    for hit in &hits {
+        assert_eq!(hit["agent"], "codebuff", "{hit}");
+        assert_eq!(hit["workspace"], "/work/codebuff-demo", "{hit}");
+    }
+    assert!(
+        search("codebuffstray").is_empty(),
+        "stray JSON must not index"
+    );
+    assert_eq!(messages(), 2);
+
+    // An edited native message updates in place instead of duplicating. A real
+    // edit is newer than the previous run, which incremental discovery requires.
+    write_transcript("revised codebuffrevision answer", SystemTime::now());
+    assert_eq!(search("codebuffprior").len(), 1);
+    command().args(["index", "--json"]).assert().success();
+    assert_eq!(search("codebuffrevision").len(), 1);
+    assert!(
+        search("codebuffprior").is_empty(),
+        "the replaced answer must leave the lexical index"
+    );
+    assert_eq!(messages(), 2, "a native-ID edit must not append a message");
+}
+
+/// GH #499 (bead 2l1b0.49): once an incremental run tombstones a row inside a
+/// sealed Quill segment, every date-filtered search failed with "posting
+/// cursor invariant failed: Boolean children belong to different segment
+/// domains" (exit 9) on frankensearch-quill 0.3.1. The indexer tombstones on
+/// the revised-native-message path, so a Codebuff edit reproduces it. Twelve
+/// messages keep the tombstone density under the engine's compaction
+/// threshold, and the window covers only some of them: a window over every
+/// row lowers to a whole-segment match and never reached the bug.
+#[test]
+fn gh499_date_window_after_a_native_revision_tombstones_a_sealed_segment() {
+    use coding_agent_search::search::{quill_bridge, tantivy};
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime};
+
+    /// Tombstones and segments summed over every Quill MANIFEST under
+    /// `root`: a single generation or each shard of a federated bundle.
+    fn manifest_totals(root: &Path) -> (u64, usize) {
+        let mut totals = (0, 0);
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            if dir.join("MANIFEST").is_file()
+                && let Some(live) = quill_bridge::manifest_live_doc_count(&dir)
+            {
+                totals.0 += live.tombstones;
+                totals.1 += live.segments;
+            }
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        totals
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let data = tmp.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let chat = home.join(".config/manicode/projects/window/chats/2026-08-01T12-00-00.000Z");
+    fs::create_dir_all(&chat).unwrap();
+    let transcript = chat.join("chat-messages.json");
+    // Message i is dated 2026-08-(i+1); message 5 is the one revised.
+    let write_transcript = |revised: bool, modified: SystemTime| {
+        let records: Vec<Value> = (0..12)
+            .map(|i| {
+                let text = if i == 5 && revised {
+                    format!("windowmsg{i} gh499marker revisedanswer")
+                } else {
+                    format!("windowmsg{i} gh499marker originalanswer{i}")
+                };
+                json!({
+                    "id": format!("native-{i}"),
+                    "variant": if i % 2 == 0 { "user" } else { "ai" },
+                    "content": text,
+                    "timestamp": format!("2026-08-{:02}T12:00:00.000Z", i + 1),
+                })
+            })
+            .collect();
+        fs::write(&transcript, serde_json::to_vec(&records).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    };
+    write_transcript(false, SystemTime::now() - Duration::from_secs(3600));
+
+    let command = || {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("TZ", "UTC")
+            .current_dir(&home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    };
+    let index = |args: &[&str]| {
+        let started = std::time::Instant::now();
+        let output = command().args(args).output().unwrap();
+        eprintln!(
+            "{}",
+            json!({"step": "index", "args": args, "exit": output.status.code(),
+                   "elapsed_ms": started.elapsed().as_millis()})
+        );
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    index(&["index", "--full", "--json"]);
+    write_transcript(true, SystemTime::now());
+    index(&["index", "--json"]);
+
+    let index_root = tantivy::expected_index_dir(&data);
+    let (tombstones, segments) = manifest_totals(&index_root);
+    eprintln!(
+        "{}",
+        json!({"step": "manifest", "root": index_root, "tombstones": tombstones,
+               "segments": segments})
+    );
+    assert!(
+        tombstones > 0,
+        "the fixture needs a tombstone in a sealed segment ({segments} segments)"
+    );
+
+    let output = command()
+        .args([
+            "search",
+            "gh499marker",
+            "--agent",
+            "codebuff",
+            "--since",
+            "2026-08-04",
+            "--until",
+            "2026-08-09",
+            "--mode",
+            "lexical",
+            "--robot",
+            "--limit",
+            "50",
+            "--no-maintenance",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "{}",
+        json!({"step": "search", "exit": output.status.code(), "stderr_tail":
+               stderr.lines().rev().take(3).collect::<Vec<_>>()})
+    );
+    assert!(
+        output.status.success(),
+        "a date-filtered search over a tombstoned segment must succeed: {stderr}"
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let contents: Vec<&str> = payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["content"].as_str().unwrap_or_default())
+        .collect();
+    let messages: BTreeSet<usize> = contents
+        .iter()
+        .filter_map(|content| {
+            let start = content.find("windowmsg")? + "windowmsg".len();
+            content[start..]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    eprintln!("{}", json!({"step": "hits", "messages": messages}));
+    // 2026-08-04 through 2026-08-09 are messages 3..=8.
+    assert_eq!(
+        messages,
+        (3..=8).collect::<BTreeSet<usize>>(),
+        "{contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .any(|content| content.contains("revisedanswer")),
+        "the live replacement is served: {contents:?}"
+    );
+    assert!(
+        !contents
+            .iter()
+            .any(|content| content.contains("originalanswer5")),
+        "the tombstoned row is not: {contents:?}"
+    );
+}
+
+/// Generated rolling windows use the reporter-confirmed Grok Bot 0.44.0
+/// envelope and chat fields (GH447 comment 5592555144). They exercise CASS
+/// ingestion, not a live macOS application or complete cloud history.
+#[test]
+fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    fn encoded_key(key: &str) -> String {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+        key.bytes()
+            .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
+            .collect::<Vec<_>>()
+            .chunks(5)
+            .map(|chunk| {
+                let value =
+                    chunk.iter().fold(0_u8, |value, bit| (value << 1) | *bit) << (5 - chunk.len());
+                char::from(alphabet[usize::from(value)])
+            })
+            .collect()
+    }
+    fn command(home: &Path, data: &Path, root: &Path, streaming: &str) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_GROK_BOT_DATA_ROOT", root)
+            .env("CASS_DATA_DIR", data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_STREAMING_INDEX", streaming)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    }
+    fn search(home: &Path, data: &Path, root: &Path, needle: &str, streaming: &str) -> Value {
+        let output = command(home, data, root, streaming)
+            .args([
+                "search",
+                needle,
+                "--agent",
+                "grok_bot",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "10000",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        assert_ne!(
+            result.pointer("/budget/timed_out").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            result["hits"].is_array(),
+            "search must return verified hits"
+        );
+        result
+    }
+    for streaming in ["0", "1"] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let root = home.join("Grok Bot 空間/sand-client-persistence");
+        let data = home.join("archive");
+        fs::create_dir_all(&root).unwrap();
+        let key = "sand.client.slice.account.auth0%7Cuser_00000000000000000000000000.transcript.replicas.81da155f-cc4c-58b3-aadf-770858d5e55c";
+        let path = root.join(format!("{}.blob", encoded_key(key)));
+        let window = |start: u32| {
+            json!({"schemaVersion":1,"value":{"entries":
+            (start..start + 200).map(|native| json!({
+                "kind":"send-message","id":format!("entry-{native}"),
+                "message":{"type":"text","content": match native {
+                    1 => "groknativeevictedneedle", 201 => "groknativenewtailneedle", _ => "identical timestamp and content",
+                }},"timestampMs":1_767_225_622_759_i64,
+                "secretRequest":{"content":"grokexcludedsecretneedle"},
+            })).collect::<Vec<_>>()}})
+        };
+        fs::write(&path, window(1).to_string()).unwrap();
+        let original_source = fs::read(&path).unwrap();
+        command(home, &data, &root, streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success();
+        assert_eq!(fs::read(&path).unwrap(), original_source);
+        let (conversation_id, before) = {
+            let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+            let conversations = storage.list_conversations(10, 0).unwrap();
+            assert_eq!(conversations.len(), 1);
+            assert_eq!(conversations[0].agent_slug, "grok_bot");
+            assert_eq!(conversations[0].metadata_json["history_complete"], false);
+            assert!(conversations[0].workspace.is_none());
+            let id = conversations[0].id.unwrap();
+            let messages = storage.fetch_messages(id).unwrap();
+            assert_eq!(messages.len(), 200);
+            (id, serde_json::to_value(messages).unwrap())
+        };
+        fs::write(&path, window(2).to_string()).unwrap();
+        let rolled_source = fs::read(&path).unwrap();
+        // Each command is a new process. Incremental, replay, and explicit full
+        // rebuild must all preserve the canonical 201-message archive.
+        for full in [false, false, true] {
+            let mut index = command(home, &data, &root, streaming);
+            index.args(["index", "--json", "--no-progress-events"]);
+            if full {
+                index.arg("--full");
+            }
+            index.assert().success();
+            assert_eq!(fs::read(&path).unwrap(), rolled_source);
+            let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+            let messages = storage.fetch_messages(conversation_id).unwrap();
+            assert_eq!(messages.len(), 201, "streaming={streaming} full={full}");
+            assert_eq!(serde_json::to_value(&messages[..200]).unwrap(), before);
+            assert_eq!(messages[200].idx, 200);
+            assert_eq!(messages[200].extra_json["grok_bot_entry_id"], "entry-201");
+            drop(storage);
+            for needle in ["groknativeevictedneedle", "groknativenewtailneedle"] {
+                let result = search(home, &data, &root, needle, streaming);
+                let hits = result["hits"].as_array().unwrap();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "canonical old/new message must remain searchable"
+                );
+                assert_eq!(hits[0]["agent"], "grok_bot");
+                let view = command(home, &data, &root, streaming)
+                    .args(["view"])
+                    .arg(&path)
+                    // A search hit's line_number is the canonical message
+                    // ordinal; since #493 (5173f7db) follow-ups name it with
+                    // --message-index, and --line is only a physical JSONL line.
+                    .args([
+                        "--source",
+                        hits[0]["source_id"].as_str().unwrap(),
+                        "--conversation-id",
+                        &conversation_id.to_string(),
+                        "--message-index",
+                        &hits[0]["line_number"].as_u64().unwrap().to_string(),
+                        "--json",
+                    ])
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
+                let value: Value = serde_json::from_slice(&view).unwrap();
+                assert!(
+                    value.to_string().contains(needle),
+                    "canonical view must retain the searched message"
+                );
+            }
+            assert!(
+                search(home, &data, &root, "grokexcludedsecretneedle", streaming)["hits"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
 fn truncate_output(bytes: &[u8], max_len: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() > max_len {

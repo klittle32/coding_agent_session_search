@@ -39,6 +39,12 @@ thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn shutdown_driver() -> bool {
+    DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
+}
+
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
 fn drive<T>(future: impl Future<Output = T>) -> T {
     let runtime = DRIVER
@@ -58,115 +64,6 @@ fn drive<T>(future: impl Future<Output = T>) -> T {
     output
 }
 
-/// True when `err` can mean the connection's schema image predates another
-/// connection's DDL commit.
-///
-/// fsqlite 0.2.1 upstream regression (verified by standalone probe on both
-/// macOS and Linux, absent at the 0.1.19 git pin): a connection opened before
-/// another connection CREATEs a table does not see that table through the
-/// plain `query`/`execute` paths — but `prepare()` refreshes the shared
-/// schema publication before resolving, after which the same SQL succeeds.
-/// The facade therefore treats these errors as possibly-stale-schema, drives
-/// a `prepare()` of the same SQL to force the refresh, and retries once.
-/// Plan-time resolution failures have no side effects, so the retry is safe.
-fn schema_stale(err: &FrankenError) -> bool {
-    matches!(
-        err,
-        FrankenError::NoSuchTable { .. }
-            | FrankenError::NoSuchColumn { .. }
-            | FrankenError::NoSuchIndex { .. }
-    )
-}
-
-/// Bounded retry for `FrankenError::BusyRecovery`.
-///
-/// fsqlite 0.2's ns-lifecycle opens can put a database into a short
-/// "recovery in progress" window; statements admitted during that window
-/// fail with `BusyRecovery` immediately instead of waiting out the
-/// connection's busy timeout. C SQLite's busy handler covers
-/// `SQLITE_BUSY_RECOVERY`, and the 0.1.x line had no recovery windows at
-/// all, so a bounded caller-side retry restores the pre-0.2 observable
-/// behavior. Plain `Busy` is deliberately NOT retried here: cass classifies
-/// ordinary lock contention itself and the engine owns that timeout.
-fn retry_busy_recovery<T>(
-    mut attempt: impl FnMut() -> Result<T, FrankenError>,
-) -> Result<T, FrankenError> {
-    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
-    let start = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_millis(5);
-    loop {
-        match attempt() {
-            Err(FrankenError::BusyRecovery) if start.elapsed() < RETRY_BUDGET => {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(BACKOFF_CAP);
-            }
-            other => return other,
-        }
-    }
-}
-
-/// Bounded retry for autocommit-safe transients: `BusyRecovery` always, and
-/// `BusySnapshot` only when `allow_snapshot_retry` (i.e. the statement runs in
-/// autocommit mode, where a failed statement rolled back atomically and can be
-/// re-run). fsqlite 0.3.x surfaces `BusySnapshot` from single autocommit
-/// statements while a peer session's epoch unwinds (dropped-connection
-/// reclamation, tempdir inode reuse), so this keeps the pre-0.3 observable
-/// behavior for the bridge's blocking callers.
-fn retry_transient_statement<T>(
-    allow_snapshot_retry: bool,
-    mut attempt: impl FnMut() -> Result<T, FrankenError>,
-) -> Result<T, FrankenError> {
-    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
-    let start = std::time::Instant::now();
-    let mut backoff = std::time::Duration::from_millis(5);
-    loop {
-        match attempt() {
-            Err(FrankenError::BusyRecovery) if start.elapsed() < RETRY_BUDGET => {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(BACKOFF_CAP);
-            }
-            Err(FrankenError::BusySnapshot { .. })
-                if allow_snapshot_retry && start.elapsed() < RETRY_BUDGET =>
-            {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(BACKOFF_CAP);
-            }
-            other => return other,
-        }
-    }
-}
-
-/// Classify the manual-transaction effect of a Connection-level statement.
-fn manual_txn_transition(sql: &str) -> Option<bool> {
-    let head = sql.trim_start().get(..12).unwrap_or(sql.trim_start());
-    let head = head.to_ascii_uppercase();
-    if head.starts_with("BEGIN") {
-        Some(true)
-    } else if head.starts_with("COMMIT") || head.starts_with("ROLLBACK") || head.starts_with("END")
-    {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-macro_rules! with_engine_retries {
-    ($conn:expr, $sql:expr, $attempt:expr) => {{
-        let first = retry_busy_recovery(|| $attempt);
-        match first {
-            Err(ref err) if schema_stale(err) => {
-                // `prepare` refreshes the schema image from the shared
-                // publication plane even when it ultimately fails to resolve.
-                let _ = drive($conn.prepare($sql));
-                retry_busy_recovery(|| $attempt)
-            }
-            other => other,
-        }
-    }};
-}
-
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------
@@ -175,10 +72,6 @@ macro_rules! with_engine_retries {
 /// blocking method signatures.
 pub struct Connection {
     inner: frankensqlite::Connection,
-    /// True while a caller-managed `BEGIN`-family transaction is open on this
-    /// connection. Tracked so autocommit-only `BusySnapshot` retries never
-    /// re-run a statement whose enclosing explicit transaction was aborted.
-    manual_txn: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -194,7 +87,18 @@ impl Connection {
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open(path))?,
-            manual_txn: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Open read-only while permitting derived WAL-index recovery under the
+    /// engine's recovery locks. Database/WAL writes remain forbidden.
+    pub fn open_schema_only_with_wal_index_recovery(
+        path: impl Into<String>,
+    ) -> Result<Self, FrankenError> {
+        Ok(Self {
+            inner: drive(
+                frankensqlite::Connection::open_schema_only_with_wal_index_recovery(path),
+            )?,
         })
     }
 
@@ -202,7 +106,6 @@ impl Connection {
     pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only(path))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -213,7 +116,6 @@ impl Connection {
     ) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -223,19 +125,14 @@ impl Connection {
         &self.inner
     }
 
+    /// Descriptor-bound identity, distinct from a possibly replaced pathname.
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
+        drive(self.inner.file_identity())
+    }
+
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        let transition = manual_txn_transition(sql);
-        let allow_snapshot_retry = !self.manual_txn.get() && transition != Some(true);
-        let result = retry_transient_statement(allow_snapshot_retry, || {
-            with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
-        });
-        if result.is_ok()
-            && let Some(open) = transition
-        {
-            self.manual_txn.set(open);
-        }
-        result
+        drive(self.inner.execute(sql))
     }
 
     /// Execute a single SQL statement with positional parameters.
@@ -244,14 +141,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
-        retry_transient_statement(allow_snapshot_retry, || {
-            with_engine_retries!(
-                self.inner,
-                sql,
-                drive(self.inner.execute_with_params(sql, params))
-            )
-        })
+        drive(self.inner.execute_with_params(sql, params))
     }
 
     /// Execute a string of semicolon-separated SQL statements.
@@ -261,10 +151,7 @@ impl Connection {
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
-        retry_transient_statement(allow_snapshot_retry, || {
-            with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
-        })
+        drive(self.inner.query(sql))
     }
 
     /// Query with positional parameters, returning all rows.
@@ -273,14 +160,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
-        retry_transient_statement(allow_snapshot_retry, || {
-            with_engine_retries!(
-                self.inner,
-                sql,
-                drive(self.inner.query_with_params(sql, params))
-            )
-        })
+        drive(self.inner.query_with_params(sql, params))
     }
 
     /// Query with positional parameters, streaming rows into `f`.
@@ -288,21 +168,17 @@ impl Connection {
         &self,
         sql: &str,
         params: &[SqliteValue],
-        mut f: F,
+        f: F,
     ) -> Result<(), FrankenError>
     where
         F: FnMut(&Row) -> Result<(), FrankenError>,
     {
-        with_engine_retries!(
-            self.inner,
-            sql,
-            drive(self.inner.query_with_params_for_each(sql, params, &mut f))
-        )
+        drive(self.inner.query_with_params_for_each(sql, params, f))
     }
 
     /// Query, returning exactly one row.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
-        with_engine_retries!(self.inner, sql, drive(self.inner.query_row(sql)))
+        drive(self.inner.query_row(sql))
     }
 
     /// Query with positional parameters, returning exactly one row.
@@ -311,23 +187,27 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Row, FrankenError> {
-        with_engine_retries!(
-            self.inner,
-            sql,
-            drive(self.inner.query_row_with_params(sql, params))
-        )
+        drive(self.inner.query_row_with_params(sql, params))
     }
 
     /// Prepare a statement for repeated execution.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>, FrankenError> {
         Ok(PreparedStatement {
-            inner: retry_busy_recovery(|| drive(self.inner.prepare(sql)))?,
+            inner: drive(self.inner.prepare(sql))?,
         })
     }
 
     /// Last-inserted rowid on this connection.
     pub fn last_insert_rowid(&self) -> i64 {
         self.inner.last_insert_rowid()
+    }
+
+    /// Return every in-range page that neither a b-tree nor the durable
+    /// freelist owns (integrity_check's "page N is never used" class) to the
+    /// freelist through a normal write commit. Returns the pages freed. Run
+    /// only at a quiescent point: no other writer may be active.
+    pub fn repair_orphaned_pages(&self) -> Result<usize, FrankenError> {
+        drive(self.inner.repair_orphaned_pages())
     }
 
     /// Close the connection (rolls back any active transaction, then runs the
@@ -443,7 +323,6 @@ pub mod compat {
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         Ok(Connection {
             inner: drive(frankensqlite::compat::open_with_flags(path, flags))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -459,7 +338,11 @@ pub mod compat {
         where
             F: FnOnce(&Row) -> Result<T, FrankenError>;
 
-        /// Execute a query and collect all rows into a `Vec<T>` via `f`.
+        /// Stream rows through `f` and collect the mapped values.
+        ///
+        /// The facade does not retain a second `Vec<Row>` containing every
+        /// original text/blob payload. The returned `Vec<T>` and any buffers
+        /// required by the engine's query plan still consume memory.
         fn query_map_collect<T, F>(
             &self,
             sql: &str,
@@ -473,10 +356,8 @@ pub mod compat {
         fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
     }
 
-    // Implemented over the facade's own retrying primitives (not the async
-    // `compat::ConnectionExt`) so these paths inherit the stale-schema
-    // prepare-refresh retry. Mirrors upstream compat semantics: `ParamValue`
-    // unwrap + rusqlite-style row mapping.
+    // Mirrors upstream compat semantics: `ParamValue` unwrap plus
+    // rusqlite-style row mapping.
     impl ConnectionExt for Connection {
         fn query_row_map<T, F>(
             &self,
@@ -502,11 +383,11 @@ pub mod compat {
             F: FnMut(&Row) -> Result<T, FrankenError>,
         {
             let values = param_slice_to_values(params);
-            let rows = self.query_with_params(sql, &values)?;
-            let mut mapped = Vec::with_capacity(rows.len());
-            for row in &rows {
+            let mut mapped = Vec::new();
+            self.query_with_params_for_each(sql, &values, |row| {
                 mapped.push(f(row)?);
-            }
+                Ok(())
+            })?;
             Ok(mapped)
         }
 
@@ -529,7 +410,7 @@ pub mod compat {
     impl Transaction<'_> {
         /// Commit the transaction.
         pub fn commit(&mut self) -> Result<(), FrankenError> {
-            super::retry_busy_recovery(|| drive(self.inner.commit()))
+            drive(self.inner.commit())
         }
 
         /// Roll back the transaction explicitly.
@@ -656,9 +537,7 @@ pub mod compat {
     impl TransactionExt for Connection {
         fn transaction(&self) -> Result<Transaction<'_>, FrankenError> {
             Ok(Transaction {
-                inner: super::retry_busy_recovery(|| {
-                    drive(AsyncTransactionExt::transaction(self.as_async()))
-                })?,
+                inner: drive(AsyncTransactionExt::transaction(self.as_async()))?,
             })
         }
     }
@@ -699,5 +578,247 @@ pub mod migrate {
         pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
             drive(self.inner.run(conn.as_async()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compat::RowExt;
+    use super::*;
+    use asupersync::{Cx, cx::CapMask};
+
+    #[test]
+    fn nested_sql_bridge_restores_full_and_restricted_callers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = RuntimeBuilder::current_thread().build()?;
+        runtime.block_on(async {
+            let parent = Cx::current().expect("outer runtime context");
+            for restricted in [false, true] {
+                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                let assert_caller = || {
+                    let current = Cx::current().expect("restored caller context");
+                    assert_eq!(current.task_id(), caller.task_id());
+                    assert_eq!(current.region_id(), caller.region_id());
+                    assert_eq!(current.capabilities(), caller.capabilities());
+                    if restricted {
+                        assert!(!current.capabilities().spawn);
+                        assert!(!current.capabilities().io);
+                    }
+                };
+
+                let conn = Connection::open(":memory:")?;
+                assert_caller();
+                conn.execute_batch(
+                    "CREATE TABLE bridge_values (value INTEGER); \
+                     INSERT INTO bridge_values VALUES (40);",
+                )?;
+                assert_caller();
+                let mut values = Vec::new();
+                conn.query_with_params_for_each("SELECT value FROM bridge_values", &[], |row| {
+                    // Streaming invokes this closure inside drive(). Exercise
+                    // a second bridge while that runtime is still polling.
+                    let mapping = Cx::current().expect("row callback context");
+                    let nested = Connection::open(":memory:")?;
+                    let extra = nested.query_row("SELECT 2")?.get_typed::<i64>(0)?;
+                    nested.close()?;
+                    let restored = Cx::current().expect("restored row callback context");
+                    assert_eq!(restored.task_id(), mapping.task_id());
+                    assert_eq!(restored.region_id(), mapping.region_id());
+                    assert_eq!(restored.capabilities(), mapping.capabilities());
+                    values.push(row.get_typed::<i64>(0)? + extra);
+                    Ok(())
+                })?;
+                assert_eq!(values, vec![42]);
+                assert_caller();
+                conn.close()?;
+                assert_caller();
+                drop(restriction);
+                let restored = Cx::current().expect("restored outer runtime context");
+                assert_eq!(restored.task_id(), parent.task_id());
+                assert_eq!(restored.region_id(), parent.region_id());
+                assert_eq!(restored.capabilities(), parent.capabilities());
+            }
+            Ok::<(), FrankenError>(())
+        })?;
+        assert!(shutdown_driver(), "SQLite bridge runtime must drain");
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(30)));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_statement_execute_error_does_not_replay_prior_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute("CREATE TABLE replay_guard (value INTEGER NOT NULL);")?;
+
+        let result = conn.execute(
+            "INSERT INTO replay_guard (value) VALUES (1); \
+             SELECT * FROM missing_replay_target;",
+        );
+        assert!(
+            matches!(&result, Err(FrankenError::NoSuchTable { .. })),
+            "missing SELECT target did not surface NoSuchTable: {result:?}"
+        );
+
+        let count = conn
+            .query_row("SELECT COUNT(*) FROM replay_guard;")?
+            .get_typed::<i64>(0)?;
+        assert_eq!(count, 1, "the successful prefix statement was replayed");
+        Ok(())
+    }
+
+    #[test]
+    fn row_callback_busy_recovery_is_propagated_exactly_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open(":memory:")?;
+        let mut invocations = 0_u32;
+
+        let result = conn.query_with_params_for_each("SELECT 1;", &[], |_row| {
+            invocations += 1;
+            Err(FrankenError::BusyRecovery)
+        });
+
+        assert!(matches!(result, Err(FrankenError::BusyRecovery)));
+        assert_eq!(invocations, 1, "row callback was replayed after its error");
+        Ok(())
+    }
+
+    #[test]
+    fn engine_transaction_state_covers_every_execution_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn require(condition: bool, message: &'static str) -> Result<(), std::io::Error> {
+            condition
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other(message))
+        }
+
+        let conn = Connection::open(":memory:")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "new connection marked in transaction",
+        )?;
+
+        let invalid = conn.execute_batch("BEGIN INVALID;");
+        require(invalid.is_err(), "invalid BEGIN unexpectedly succeeded")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "failed control statement changed bridge state",
+        )?;
+
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION; CREATE TABLE batch_opened (id INTEGER);")?;
+        require(
+            conn.as_async().in_transaction(),
+            "multi-statement batch BEGIN was not observed",
+        )?;
+        conn.execute("SAVEPOINT bridge_state_test")?;
+        conn.execute("ROLLBACK TO bridge_state_test")?;
+        require(
+            conn.as_async().in_transaction(),
+            "ROLLBACK TO incorrectly closed the outer transaction",
+        )?;
+        conn.execute("RELEASE bridge_state_test")?;
+        conn.execute_batch("COMMIT;")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "COMMIT left transaction marked open",
+        )?;
+
+        conn.execute_with_params("BEGIN;", &[])?;
+        require(
+            conn.as_async().in_transaction(),
+            "parameterized BEGIN was not observed",
+        )?;
+        conn.execute_with_params("ROLLBACK;", &[])?;
+        require(
+            !conn.as_async().in_transaction(),
+            "ROLLBACK left transaction marked open",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_streams_through_the_bridge_and_preserves_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::{ConnectionExt, ParamValue};
+
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE mapped_rows (id INTEGER PRIMARY KEY, body TEXT); \
+             INSERT INTO mapped_rows VALUES (1, 'first'), (2, 'second'), (3, 'third');",
+        )?;
+        let values = conn.query_map_collect(
+            "SELECT id, body FROM mapped_rows WHERE id >= ?1 ORDER BY id DESC",
+            &[ParamValue::from(2_i64)],
+            |row| {
+                // The old collect-then-map path ran this outside drive().
+                // This is also a regression for nested bridge ownership.
+                let context = Cx::current().expect("streaming row callback context");
+                let nested = Connection::open(":memory:")?;
+                let extra = nested.query_row("SELECT 10")?.get_typed::<i64>(0)?;
+                nested.close()?;
+                let restored = Cx::current().expect("restored row callback context");
+                assert_eq!(restored.task_id(), context.task_id());
+                assert_eq!(restored.region_id(), context.region_id());
+                Ok((
+                    row.get_typed::<i64>(0)? + extra,
+                    row.get_typed::<String>(1)?,
+                ))
+            },
+        )?;
+        assert_eq!(values, vec![(13, "third".into()), (12, "second".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_error_stops_callbacks_without_replay_or_partial_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::ConnectionExt;
+
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE mapped_errors (id INTEGER PRIMARY KEY); \
+             INSERT INTO mapped_errors VALUES (1), (2), (3);",
+        )?;
+        let mut seen = Vec::new();
+        let result: Result<Vec<i64>, FrankenError> =
+            conn.query_map_collect("SELECT id FROM mapped_errors ORDER BY id", &[], |row| {
+                let id = row.get_typed::<i64>(0)?;
+                seen.push(id);
+                if id == 2 {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                Ok(id)
+            });
+        assert!(matches!(result, Err(FrankenError::BusyRecovery)));
+        assert_eq!(seen, vec![1, 2]);
+        let recovered: Vec<i64> =
+            conn.query_map_collect("SELECT id FROM mapped_errors ORDER BY id", &[], |row| {
+                row.get_typed(0)
+            })?;
+        assert_eq!(recovered, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_empty_and_engine_error_do_not_invoke_mapper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::ConnectionExt;
+
+        let conn = Connection::open(":memory:")?;
+        let mut calls = 0;
+        let empty: Vec<i64> = conn.query_map_collect("SELECT 1 WHERE 0", &[], |row| {
+            calls += 1;
+            row.get_typed(0)
+        })?;
+        assert!(empty.is_empty());
+        let missing: Result<Vec<i64>, FrankenError> =
+            conn.query_map_collect("SELECT id FROM missing_mapped_table", &[], |row| {
+                calls += 1;
+                row.get_typed(0)
+            });
+        assert!(matches!(missing, Err(FrankenError::NoSuchTable { .. })));
+        assert_eq!(calls, 0);
+        Ok(())
     }
 }

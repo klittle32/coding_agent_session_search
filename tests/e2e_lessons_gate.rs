@@ -20,6 +20,8 @@
 //!
 //! Each subcommand is driven in robot mode; stdout must be pure JSON.
 
+mod util;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -28,6 +30,8 @@ use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use tempfile::TempDir;
 
+use util::timeout::spawn_with_timeout_or_diag;
+
 /// Generous per-surface wall-clock bound; only fires on a true hang.
 const SURFACE_BOUND: Duration = Duration::from_secs(60);
 
@@ -35,6 +39,8 @@ const SURFACE_BOUND: Duration = Duration::from_secs(60);
 const RAW_USERNAME: &str = "realuser";
 const RAW_EMAIL_DOMAIN: &str = "corp.example";
 const RAW_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+const RCH_COMMIT_REF: &str = "commit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EXPORT_COMMIT_REF: &str = "commit:cccccccccccccccccccccccccccccccccccccccc";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lessons")
@@ -56,13 +62,17 @@ fn lessons_args(extra: &[&str]) -> Vec<String> {
 fn run_lessons(extra: &[&str]) -> Result<(Value, String, Duration), String> {
     let args = lessons_args(extra);
     let started = Instant::now();
-    let out = Command::new(cargo_bin("cass"))
+    let mut command = Command::new(cargo_bin("cass"));
+    command
         .args(&args)
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .map_err(|e| format!("spawn {extra:?}: {e}"))?;
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    let label = format!(
+        "lessons-fixture-{}",
+        extra.first().copied().unwrap_or("list")
+    );
+    let out = spawn_with_timeout_or_diag(command, &label, None, SURFACE_BOUND);
     let elapsed = started.elapsed();
     let code = out
         .status
@@ -81,16 +91,23 @@ fn run_lessons(extra: &[&str]) -> Result<(Value, String, Duration), String> {
     Ok((value, stdout, elapsed))
 }
 
-/// Run the real lessons surface in live mode from `repo`.
-fn run_live_lessons(repo: &std::path::Path) -> Result<(Value, String), String> {
-    let out = Command::new(cargo_bin("cass"))
-        .args(["lessons", "list", "--status", "all", "--json"])
+/// Run one real lessons surface in live mode from `repo`, retaining stderr so
+/// the malformed-evidence warning and its privacy boundary are testable.
+fn run_live_lessons(
+    repo: &std::path::Path,
+    extra: &[&str],
+) -> Result<(Value, String, String), String> {
+    let mut command = Command::new(cargo_bin("cass"));
+    command
+        .arg("lessons")
+        .args(extra)
+        .arg("--json")
         .current_dir(repo)
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .map_err(|e| format!("spawn live lessons: {e}"))?;
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    let label = format!("lessons-live-{}", extra.first().copied().unwrap_or("list"));
+    let out = spawn_with_timeout_or_diag(command, &label, Some(repo), SURFACE_BOUND);
     if !out.status.success() {
         return Err(format!(
             "live lessons exited {:?}; stderr: {}",
@@ -100,9 +117,11 @@ fn run_live_lessons(repo: &std::path::Path) -> Result<(Value, String), String> {
     }
     let stdout =
         String::from_utf8(out.stdout).map_err(|e| format!("live lessons stdout not UTF-8: {e}"))?;
+    let stderr =
+        String::from_utf8(out.stderr).map_err(|e| format!("live lessons stderr not UTF-8: {e}"))?;
     let value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("live lessons stdout not JSON: {e}; head: {}", head(&stdout)))?;
-    Ok((value, stdout))
+    Ok((value, stdout, stderr))
 }
 
 fn git(repo: &std::path::Path, args: &[&str]) -> Result<(), String> {
@@ -143,7 +162,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     let closed = serde_json::json!({
         "id": "bd-live-closed",
         "title": "Harden live Bead evidence",
-        "status": "closed",
+        "status": " closed ",
         "issue_type": "bug",
         "labels": ["live-lessons"],
         "updated_at": "2026-06-20T16:47:23Z",
@@ -159,7 +178,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     });
     std::fs::write(
         beads.join("issues.jsonl"),
-        format!("{closed}\nnot-json\n{open}\n"),
+        format!("\n{closed}\nnot-json MALFORMED_BEAD_RAW_MARKER_must_not_be_logged\n\n{open}\n"),
     )
     .map_err(|e| format!("write Beads fixture: {e}"))?;
 
@@ -186,6 +205,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     )
     .map_err(|e| format!("write proof artifact: {e}"))?;
     let emitted = serde_json::json!({
+        "scenario_id": null,
         "label": "live-proof",
         "status": "pass",
         "path": "/untrusted/escape/live-proof.proof.json",
@@ -216,12 +236,96 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
         },
         "outcome": "passed"
     });
+    let malformed_proof = serde_json::json!({
+        "label": "MALFORMED_PROOF_RAW_MARKER_must_not_be_logged",
+        "status": "pass"
+    });
     std::fs::write(
         proofs.join("proof-manifest.jsonl"),
-        format!("{emitted}\n{structured}\n"),
+        format!("\n{emitted}\n{structured}\n\n{malformed_proof}\n"),
     )
     .map_err(|e| format!("write proof manifest: {e}"))?;
     Ok(repo)
+}
+
+fn leak_msg(label: &str, what: &str) -> String {
+    format!("{label} leaked {what}")
+}
+
+fn bool_at(v: &Value, ptr: &str) -> Option<bool> {
+    v.pointer(ptr).and_then(Value::as_bool)
+}
+
+/// 98anf.1: a missing source is `missing` (nonfatal, intake complete); an
+/// unreadable one (invalid UTF-8, or permission-denied where the OS enforces
+/// it) is `unreadable`, the intake is incomplete, the rejected-record counts
+/// stay zero, and no path or OS error text leaks into stdout/stderr.
+#[test]
+fn live_mode_distinguishes_missing_and_unreadable_sources() -> Result<(), String> {
+    let repo = seed_live_lessons_repo()?;
+    let beads_path = repo.path().join(".beads/issues.jsonl");
+    let proofs_path = repo.path().join(".cass/proofs/proof-manifest.jsonl");
+    let mut failures = Vec::new();
+
+    // Invalid UTF-8 Beads source; proof manifest moved aside => missing.
+    std::fs::write(&beads_path, [0xff_u8, 0xfe, b'{', b'}', b'\n'])
+        .map_err(|e| format!("write invalid utf-8 beads fixture: {e}"))?;
+    let parked_manifest = repo.path().join(".cass/proofs/proof-manifest.jsonl.parked");
+    std::fs::rename(&proofs_path, &parked_manifest)
+        .map_err(|e| format!("park proof manifest: {e}"))?;
+    let (v, raw, stderr) = run_live_lessons(repo.path(), &["list", "--status", "all"])?;
+    if str_at(&v, "/manifest/source_status/beads") != Some("unreadable") {
+        failures.push(format!(
+            "invalid utf-8 beads source should be unreadable: {:?}",
+            str_at(&v, "/manifest/source_status/beads")
+        ));
+    }
+    if str_at(&v, "/manifest/source_status/proofs") != Some("missing") {
+        failures.push(format!(
+            "absent proof manifest should be missing: {:?}",
+            str_at(&v, "/manifest/source_status/proofs")
+        ));
+    }
+    if bool_at(&v, "/manifest/intake_complete") != Some(false) {
+        failures.push("an unreadable source must not report a complete intake".to_string());
+    }
+    if u64_at(&v, "/manifest/rejected_records/beads") != Some(0) {
+        failures.push("an unreadable source must not be counted as rejected records".to_string());
+    }
+    if !stderr.contains("evidence source(s) unreadable: beads") {
+        failures.push(format!(
+            "stderr omitted the bounded unreadable-source warning: {}",
+            head(&stderr)
+        ));
+    }
+    let repo_str = repo.path().to_string_lossy().into_owned();
+    for (label, text) in [("stdout", &raw), ("stderr", &stderr)] {
+        if text.contains(&repo_str) || text.contains("issues.jsonl") {
+            failures.push(leak_msg(label, "a source path"));
+        }
+        if text.contains("os error") || text.contains("stream did not contain valid UTF-8") {
+            failures.push(leak_msg(label, "an OS/decoder error string"));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&beads_path, "{}\n").map_err(|e| format!("rewrite beads: {e}"))?;
+        std::fs::set_permissions(&beads_path, std::fs::Permissions::from_mode(0o000))
+            .map_err(|e| format!("chmod 000: {e}"))?;
+        let enforced = std::fs::read_to_string(&beads_path).is_err();
+        let outcome = run_live_lessons(repo.path(), &["list", "--status", "all"]);
+        let _ = std::fs::set_permissions(&beads_path, std::fs::Permissions::from_mode(0o600));
+        let (v, _, _) = outcome?;
+        if enforced && str_at(&v, "/manifest/source_status/beads") != Some("unreadable") {
+            failures.push(format!(
+                "permission-denied beads source should be unreadable: {:?}",
+                str_at(&v, "/manifest/source_status/beads")
+            ));
+        }
+    }
+    finish(failures)
 }
 
 fn head(s: &str) -> String {
@@ -303,6 +407,9 @@ fn lessons_list_all_has_expected_graph_shape() -> Result<(), String> {
         ("/manifest/commits_scanned", 5),
         ("/manifest/beads_scanned", 3),
         ("/manifest/proofs_scanned", 1),
+        ("/manifest/schema_version", 2),
+        ("/manifest/rejected_records/beads", 0),
+        ("/manifest/rejected_records/proofs", 0),
     ] {
         if u64_at(&v, ptr) != Some(want) {
             failures.push(count_mismatch(ptr, u64_at(&v, ptr), want));
@@ -333,7 +440,7 @@ fn repeated_fix_dedupes_with_merged_provenance() -> Result<(), String> {
 
     let matches: Vec<Value> = lessons_array(&v)
         .into_iter()
-        .filter(|l| has_source_ref(l, "commit:abc123") || has_source_ref(l, "bead:bd-rch-1"))
+        .filter(|l| has_source_ref(l, RCH_COMMIT_REF) || has_source_ref(l, "bead:bd-rch-1"))
         .collect();
     if matches.len() != 1 {
         failures.push(format!(
@@ -342,8 +449,8 @@ fn repeated_fix_dedupes_with_merged_provenance() -> Result<(), String> {
         ));
     }
     if let Some(lesson) = matches.first() {
-        if !has_source_ref(lesson, "commit:abc123") {
-            failures.push("rch lesson missing commit:abc123 provenance".to_string());
+        if !has_source_ref(lesson, RCH_COMMIT_REF) {
+            failures.push(format!("rch lesson missing {RCH_COMMIT_REF} provenance"));
         }
         if !has_source_ref(lesson, "bead:bd-rch-1") {
             failures.push("rch lesson missing bead:bd-rch-1 provenance".to_string());
@@ -492,7 +599,7 @@ fn redaction_removes_planted_markers_and_counts_them() -> Result<(), String> {
     // The redacted export lesson is still present and useful.
     let has_export = lessons_array(&v)
         .into_iter()
-        .any(|l| has_source_ref(&l, "commit:leak01"));
+        .any(|l| has_source_ref(&l, EXPORT_COMMIT_REF));
     if !has_export {
         failures.push("redacted export lesson is missing".to_string());
     }
@@ -548,11 +655,27 @@ fn view_round_trips_a_lesson_id() -> Result<(), String> {
     if str_at(&view, "/lesson/lesson_id") != Some(id.as_str()) {
         failures.push("view returned a different lesson id".to_string());
     }
+    if u64_at(&view, "/manifest/schema_version") != Some(2)
+        || u64_at(&view, "/manifest/rejected_records/beads") != Some(0)
+        || u64_at(&view, "/manifest/rejected_records/proofs") != Some(0)
+    {
+        failures.push("fixture view omitted or corrupted its extraction manifest".to_string());
+    }
+    // 98anf.1: fixture mode is explicit — live sources were not consulted.
+    if str_at(&view, "/manifest/source_status/beads") != Some("fixture")
+        || str_at(&view, "/manifest/source_status/proofs") != Some("fixture")
+        || bool_at(&view, "/manifest/intake_complete") != Some(true)
+    {
+        failures.push("fixture manifest did not report explicit fixture source status".to_string());
+    }
 
     // A bogus id is a clean not-found, not a crash or stdout pollution.
     let (missing, _r3, _e3) = run_lessons(&["view", "lsn-deadbeefdeadbeef"])?;
     if missing.get("found").and_then(Value::as_bool) != Some(false) {
         failures.push("view of a bogus id should report found=false".to_string());
+    }
+    if u64_at(&missing, "/manifest/schema_version") != Some(2) {
+        failures.push("not-found view omitted its extraction manifest".to_string());
     }
     finish(failures)
 }
@@ -562,21 +685,58 @@ fn view_round_trips_a_lesson_id() -> Result<(), String> {
 #[test]
 fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), String> {
     let repo = seed_live_lessons_repo()?;
-    let (v, raw) = run_live_lessons(repo.path())?;
+    let nested = repo.path().join("nested/working/directory");
+    std::fs::create_dir_all(&nested)
+        .map_err(|e| format!("create nested live invocation directory: {e}"))?;
+    let (v, raw, stderr) = run_live_lessons(&nested, &["list", "--status", "all"])?;
     let mut failures = Vec::new();
 
     if str_at(&v, "/mode") != Some("live") {
         failures.push(format!("mode != live: {:?}", str_at(&v, "/mode")));
     }
+    let expected_project = repo
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| "live fixture repository has no UTF-8 basename".to_string())?;
+    if str_at(&v, "/project") != Some(expected_project.as_str()) {
+        failures.push(format!(
+            "nested live invocation project != repository root basename: {:?}",
+            str_at(&v, "/project")
+        ));
+    }
     for (ptr, want) in [
         ("/manifest/commits_scanned", 1_u64),
         ("/manifest/beads_scanned", 1),
         ("/manifest/proofs_scanned", 2),
+        ("/manifest/schema_version", 2),
+        ("/manifest/rejected_records/beads", 1),
+        ("/manifest/rejected_records/proofs", 1),
         ("/manifest/candidates_emitted", 4),
     ] {
         if u64_at(&v, ptr) != Some(want) {
             failures.push(count_mismatch(ptr, u64_at(&v, ptr), want));
         }
+    }
+    if !stderr.contains("skipped 2 malformed record(s) (Beads: 1, proofs: 1)") {
+        failures.push(format!(
+            "live stderr omitted bounded malformed-evidence warning: {}",
+            head(&stderr)
+        ));
+    }
+    // 98anf.1: both live sources were read; rejected records inside a read
+    // source still leave the intake complete.
+    if str_at(&v, "/manifest/source_status/beads") != Some("read")
+        || str_at(&v, "/manifest/source_status/proofs") != Some("read")
+        || bool_at(&v, "/manifest/intake_complete") != Some(true)
+    {
+        failures.push(format!(
+            "live manifest source status drifted: {:?}/{:?} complete={:?}",
+            str_at(&v, "/manifest/source_status/beads"),
+            str_at(&v, "/manifest/source_status/proofs"),
+            bool_at(&v, "/manifest/intake_complete")
+        ));
     }
     let lessons = lessons_array(&v);
     for source_ref in [
@@ -626,18 +786,54 @@ fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), Strin
     }) {
         failures.push("live lesson missing Git commit provenance".to_string());
     }
-    for raw_marker in [
+    let forbidden_markers = [
         "liveprivate",
         "proofprivate",
         "corp.example",
         RAW_DIGEST,
         "OPEN_RAW_MARKER_must_not_be_mined",
         "STRUCTURED_RAW_MARKER_must_not_be_mined",
+        "MALFORMED_BEAD_RAW_MARKER_must_not_be_logged",
+        "MALFORMED_PROOF_RAW_MARKER_must_not_be_logged",
         "/home/never-read/private.json",
-    ] {
-        if raw.contains(raw_marker) {
-            failures.push(leaked_marker_msg("live metadata", raw_marker));
+    ];
+    for &raw_marker in &forbidden_markers {
+        if raw.contains(raw_marker) || stderr.contains(raw_marker) {
+            failures.push(leaked_marker_msg("live stdout/stderr", raw_marker));
         }
+    }
+    if let Some(live_id) = lessons.iter().find_map(|lesson| {
+        lesson
+            .get("lesson_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }) {
+        let (view, view_raw, view_stderr) = run_live_lessons(&nested, &["view", &live_id])?;
+        if view.get("found").and_then(Value::as_bool) != Some(true) {
+            failures.push(format!("live view of {live_id} reported not found"));
+        }
+        for (ptr, want) in [
+            ("/manifest/schema_version", 2_u64),
+            ("/manifest/rejected_records/beads", 1),
+            ("/manifest/rejected_records/proofs", 1),
+        ] {
+            if u64_at(&view, ptr) != Some(want) {
+                failures.push(count_mismatch(ptr, u64_at(&view, ptr), want));
+            }
+        }
+        if !view_stderr.contains("skipped 2 malformed record(s) (Beads: 1, proofs: 1)") {
+            failures.push(format!(
+                "live view stderr omitted bounded malformed-evidence warning: {}",
+                head(&view_stderr)
+            ));
+        }
+        for &raw_marker in &forbidden_markers {
+            if view_raw.contains(raw_marker) || view_stderr.contains(raw_marker) {
+                failures.push(leaked_marker_msg("live view stdout/stderr", raw_marker));
+            }
+        }
+    } else {
+        failures.push("live list returned no lesson id for view manifest coverage".to_string());
     }
     if u64_at(&v, "/redaction/home_paths").unwrap_or(0) < 2
         || u64_at(&v, "/redaction/emails").unwrap_or(0) < 2

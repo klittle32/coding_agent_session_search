@@ -4,19 +4,26 @@
 //! The verifier confirms correct structure, config schema, payload integrity, and
 //! the absence of secrets in site/.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
-use super::bundle::IntegrityManifest;
-use super::encrypt::{EncryptionConfig, SCHEMA_VERSION};
+use super::bundle::{IntegrityManifest, validate_pinned_vendor_assets};
+use super::encrypt::{
+    EncryptionConfig, KdfAlgorithm, SCHEMA_VERSION, SlotType, validate_supported_payload_format,
+};
+#[cfg(test)]
+use super::errors::DecryptError;
+use super::profiles::ShareProfile;
+use super::redact::RedactionEngine;
+use crate::franken_sync::compat::RowExt;
 use std::fmt;
 
 /// Maximum chunk file size (GitHub Pages hard limit)
@@ -24,6 +31,15 @@ const MAX_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Maximum chunk_size config value (32 MiB)
 const MAX_CONFIG_CHUNK_SIZE: usize = 32 * 1024 * 1024;
+
+/// Browser runtime ceilings: the viewer holds plaintext plus a WASM copy and
+/// must not accept an archive that implies unbounded fetch/decompression work.
+const MAX_BROWSER_ARCHIVE_CHUNKS: usize = 4_096;
+const MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE: u64 = 640 * 1024 * 1024;
+
+/// Integrity manifest schema understood by this verifier.
+const INTEGRITY_MANIFEST_VERSION: u8 = 1;
 
 /// Required files that must exist in site/
 const REQUIRED_FILES: &[&str] = &[
@@ -65,6 +81,8 @@ const ENCRYPTED_CONFIG_KEYS: &[&str] = &[
     "kdf_defaults",
     "payload",
     "key_slots",
+    // Slot-id high-water mark written by key add/revoke (2l1b0.61).
+    "next_slot_id",
 ];
 const UNENCRYPTED_CONFIG_KEYS: &[&str] = &["encrypted", "version", "payload", "warning"];
 const ENCRYPTED_PAYLOAD_KEYS: &[&str] = &[
@@ -121,6 +139,8 @@ pub struct VerifyChecks {
     pub size_limits: CheckResult,
     pub integrity: CheckResult,
     pub no_secrets_in_site: CheckResult,
+    /// A plaintext archive holds no value its declared share profile removes.
+    pub share_profile: CheckResult,
 }
 
 impl VerifyChecks {
@@ -132,7 +152,22 @@ impl VerifyChecks {
             && self.size_limits.passed
             && self.integrity.passed
             && self.no_secrets_in_site.passed
+            && self.share_profile.passed
     }
+}
+
+/// What verification established about a bundle's share profile (2l1b0.60).
+///
+/// An encrypted bundle records its profile inside the payload, which
+/// verification cannot open, so only plaintext archives are rescanned.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShareProfileEvidence {
+    /// Profile recorded in the plaintext archive's `export_meta`.
+    pub declared: Option<String>,
+    /// Whether every exported text surface was rescanned with that profile's rules.
+    pub rescanned: bool,
+    /// Values those rules would still rewrite, counted per surface; never the values.
+    pub residual: BTreeMap<String, u64>,
 }
 
 /// Complete verification result
@@ -142,6 +177,8 @@ pub struct VerifyResult {
     pub status: String,
     /// Individual check results
     pub checks: VerifyChecks,
+    /// Share profile declared by, and rescanned in, a plaintext archive
+    pub share_profile: ShareProfileEvidence,
     /// Warning messages (non-fatal issues)
     pub warnings: Vec<String>,
     /// Total site size in bytes
@@ -164,7 +201,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         println!("Verifying bundle at: {}", site_dir.display());
     }
 
-    let warnings = Vec::new();
+    let mut warnings = Vec::new();
 
     // Check 1: Required files
     if verbose {
@@ -210,6 +247,12 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     }
     let no_secrets_in_site = check_no_secrets(&site_dir);
 
+    // Check 7: Share profile (plaintext archives only)
+    if verbose {
+        println!("  Checking share-profile redaction...");
+    }
+    let (share_profile_check, share_profile) = check_share_profile(&site_dir, &mut warnings);
+
     // Calculate total site size
     let site_size_bytes = calculate_dir_size(&site_dir)?;
 
@@ -220,6 +263,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         size_limits,
         integrity,
         no_secrets_in_site,
+        share_profile: share_profile_check,
     };
 
     let status = if checks.all_passed() {
@@ -231,9 +275,75 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     Ok(VerifyResult {
         status,
         checks,
+        share_profile,
         warnings,
         site_size_bytes,
     })
+}
+
+fn failed_check_details(verification: &VerifyResult) -> String {
+    [
+        ("required_files", &verification.checks.required_files),
+        ("config_schema", &verification.checks.config_schema),
+        ("payload_manifest", &verification.checks.payload_manifest),
+        ("size_limits", &verification.checks.size_limits),
+        ("integrity", &verification.checks.integrity),
+        (
+            "no_secrets_in_site",
+            &verification.checks.no_secrets_in_site,
+        ),
+        ("share_profile", &verification.checks.share_profile),
+    ]
+    .into_iter()
+    .filter(|(_, check)| !check.passed)
+    .map(|(name, check)| match check.details.as_deref() {
+        Some(details) => format!("{name}: {details}"),
+        None => name.to_string(),
+    })
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
+/// Require every full-bundle verification check to pass.
+///
+/// This is the fail-closed gate for completed local/config exports. It returns
+/// the detailed verification result only when the bundle is safe to report as
+/// successfully built or ready for manual deployment.
+pub fn ensure_valid_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
+    let site_dir = super::resolve_site_dir(path)?;
+    let verification = verify_bundle(&site_dir, verbose)?;
+    if verification.status != "valid" {
+        bail!(
+            "Pages bundle at {} failed full verification: {}",
+            site_dir.display(),
+            failed_check_details(&verification)
+        );
+    }
+    Ok(verification)
+}
+
+/// Run a deployment action only after the exact site path it receives passes
+/// every Pages bundle verification check.
+///
+/// Keeping path resolution, verification, and action dispatch in one helper
+/// prevents callers from validating one directory and accidentally deploying a
+/// different one. The action is never invoked for an invalid bundle.
+pub fn with_verified_bundle_for_deployment<T>(
+    path: &Path,
+    verbose: bool,
+    action: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let site_dir = super::resolve_site_dir(path)?;
+    let verification = verify_bundle(&site_dir, verbose)?;
+    if verification.status != "valid" {
+        bail!(
+            "Refusing to deploy invalid Pages bundle at {}: {}",
+            site_dir.display(),
+            failed_check_details(&verification)
+        );
+    }
+
+    action(&site_dir)
 }
 
 /// Check that all required files exist
@@ -258,6 +368,10 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
     // Also check payload/ directory exists
     if !site_dir.join("payload").is_dir() {
         missing.push("payload/");
+    }
+
+    if let Err(error) = validate_pinned_vendor_assets(site_dir) {
+        invalid.push(format!("vendor runtime ({error:#})"));
     }
 
     if missing.is_empty() && invalid.is_empty() {
@@ -372,6 +486,29 @@ fn collect_unknown_fields(
 fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
+    if let Err(error) = validate_supported_payload_format(config) {
+        // Unit-test fixtures pin the production Argon2 parameters, while the
+        // encryption module deliberately compiles much cheaper parameters under
+        // cfg(test). Ignore only that exact build-mode mismatch; all production
+        // verification and every other shared-format failure remain fail-closed.
+        #[cfg(test)]
+        let expected_fixture_parameter_mismatch = config.kdf_defaults.memory_kb == 65_536
+            && config.kdf_defaults.iterations == 3
+            && config.kdf_defaults.parallelism == 4
+            && matches!(
+                error.downcast_ref::<DecryptError>(),
+                Some(DecryptError::UnsupportedMetadata(field)) if field == "kdf_defaults"
+            );
+        #[cfg(not(test))]
+        let expected_fixture_parameter_mismatch = false;
+
+        if !expected_fixture_parameter_mismatch {
+            errors.push(format!(
+                "encrypted config is not supported by this build: {error:#}"
+            ));
+        }
+    }
+
     if config.version != SCHEMA_VERSION {
         errors.push(format!(
             "version must be {}; got {}. The current encrypted pages format supports only schema version {}.",
@@ -428,6 +565,30 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
             config.payload.chunk_count
         ));
     }
+    if config.payload.chunk_count > u32::MAX as usize {
+        errors.push(format!(
+            "chunk_count {} exceeds the u32 nonce counter space",
+            config.payload.chunk_count
+        ));
+    }
+    if config.payload.chunk_count > MAX_BROWSER_ARCHIVE_CHUNKS {
+        errors.push(format!(
+            "chunk_count {} exceeds browser runtime limit {}",
+            config.payload.chunk_count, MAX_BROWSER_ARCHIVE_CHUNKS
+        ));
+    }
+    if config.payload.total_plaintext_size > MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE {
+        errors.push(format!(
+            "total_plaintext_size {} exceeds browser runtime limit {}",
+            config.payload.total_plaintext_size, MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE
+        ));
+    }
+    if config.payload.total_compressed_size > MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE {
+        errors.push(format!(
+            "total_compressed_size {} exceeds browser runtime limit {}",
+            config.payload.total_compressed_size, MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE
+        ));
+    }
 
     // Validate payload file paths (relative, under payload/, no parent traversal)
     for (i, file) in config.payload.files.iter().enumerate() {
@@ -451,20 +612,73 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         errors.push("key_slots cannot be empty".to_string());
     }
 
+    for (name, value) in [
+        ("memory_kb", config.kdf_defaults.memory_kb),
+        ("iterations", config.kdf_defaults.iterations),
+        ("parallelism", config.kdf_defaults.parallelism),
+    ] {
+        if value == 0 {
+            errors.push(format!("kdf_defaults.{name} must be greater than zero"));
+        }
+    }
+
+    let mut slot_ids = HashSet::new();
     for (i, slot) in config.key_slots.iter().enumerate() {
-        // Validate slot.salt is base64
-        if BASE64_STANDARD.decode(&slot.salt).is_err() {
-            errors.push(format!("key_slot[{}].salt is not valid base64", i));
+        if !slot_ids.insert(slot.id) {
+            errors.push(format!("key_slot[{i}].id duplicates slot id {}", slot.id));
         }
 
-        // Validate slot.wrapped_dek is base64
-        if BASE64_STANDARD.decode(&slot.wrapped_dek).is_err() {
-            errors.push(format!("key_slot[{}].wrapped_dek is not valid base64", i));
+        let expected_kdf = match slot.slot_type {
+            SlotType::Password => KdfAlgorithm::Argon2id,
+            SlotType::Recovery => KdfAlgorithm::HkdfSha256,
+        };
+        if slot.kdf != expected_kdf {
+            errors.push(format!(
+                "key_slot[{i}].kdf does not match its {:?} slot type",
+                slot.slot_type
+            ));
         }
 
-        // Validate slot.nonce is base64
-        if BASE64_STANDARD.decode(&slot.nonce).is_err() {
-            errors.push(format!("key_slot[{}].nonce is not valid base64", i));
+        match slot.slot_type {
+            SlotType::Password => match slot.argon2_params.as_ref() {
+                Some(params) if params == &config.kdf_defaults => {}
+                Some(_) => errors.push(format!(
+                    "key_slot[{i}].argon2_params must match kdf_defaults"
+                )),
+                None => errors.push(format!(
+                    "key_slot[{i}] password slot is missing argon2_params"
+                )),
+            },
+            SlotType::Recovery if slot.argon2_params.is_some() => errors.push(format!(
+                "key_slot[{i}] recovery slot must not contain argon2_params"
+            )),
+            SlotType::Recovery => {}
+        }
+
+        match BASE64_STANDARD.decode(&slot.salt) {
+            Ok(bytes) if bytes.is_empty() => {
+                errors.push(format!("key_slot[{i}].salt must not be empty"));
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(format!("key_slot[{i}].salt is not valid base64")),
+        }
+
+        match BASE64_STANDARD.decode(&slot.wrapped_dek) {
+            Ok(bytes) if bytes.len() == 48 => {}
+            Ok(bytes) => errors.push(format!(
+                "key_slot[{i}].wrapped_dek should be 48 bytes, got {}",
+                bytes.len()
+            )),
+            Err(_) => errors.push(format!("key_slot[{i}].wrapped_dek is not valid base64")),
+        }
+
+        match BASE64_STANDARD.decode(&slot.nonce) {
+            Ok(bytes) if bytes.len() == 12 => {}
+            Ok(bytes) => errors.push(format!(
+                "key_slot[{i}].nonce should be 12 bytes, got {}",
+                bytes.len()
+            )),
+            Err(_) => errors.push(format!("key_slot[{i}].nonce is not valid base64")),
         }
     }
 
@@ -487,6 +701,7 @@ fn validate_unencrypted_config(config: &UnencryptedConfig) -> Vec<String> {
     } else {
         let path = Path::new(&config.payload.path);
         validate_payload_path(&mut errors, "payload.path", path);
+        validate_browser_payload_url_path(&mut errors, "payload.path", &config.payload.path);
     }
 
     let valid_formats = ["sqlite"];
@@ -495,6 +710,15 @@ fn validate_unencrypted_config(config: &UnencryptedConfig) -> Vec<String> {
             "payload.format should be one of {:?}, got '{}'",
             valid_formats, config.payload.format
         ));
+    }
+
+    match config.payload.size_bytes {
+        None => errors.push("payload.size_bytes is required for bounded browser loading".to_string()),
+        Some(0) => errors.push("payload.size_bytes must be greater than zero".to_string()),
+        Some(size) if size > MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE => errors.push(format!(
+            "payload.size_bytes {size} exceeds browser runtime limit {MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE}"
+        )),
+        Some(_) => {}
     }
 
     errors
@@ -518,6 +742,33 @@ fn validate_payload_path(errors: &mut Vec<String>, label: &str, path: &Path) -> 
         ok = false;
     }
     ok
+}
+
+/// Mirror the browser's URL-path checks for an unencrypted payload.
+///
+/// `Path` validation alone is insufficient here: filesystems normalize empty
+/// and `.` components, while URL fetches interpret percent escapes and reserve
+/// query/fragment delimiters. A bundle must not verify successfully when the
+/// shipped browser loader will reject it or request a different resource.
+fn validate_browser_payload_url_path(errors: &mut Vec<String>, label: &str, raw_path: &str) {
+    if raw_path.contains(['?', '#', '\\', '%']) {
+        errors.push(format!(
+            "{label} contains URL query, fragment, backslash, or percent-escape characters"
+        ));
+    }
+
+    let segments = raw_path.split('/').collect::<Vec<_>>();
+    if segments.len() < 2 {
+        errors.push(format!("{label} must reference a file under payload/"));
+    }
+
+    for segment in segments {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            errors.push(format!(
+                "{label} contains an empty or traversal URL segment"
+            ));
+        }
+    }
 }
 
 /// Check payload manifest validity
@@ -627,6 +878,15 @@ fn check_payload_manifest(site_dir: &Path) -> CheckResult {
                             errors.push(format!("{} must not be a symlink", unenc.payload.path));
                         } else if !file_type.is_file() {
                             errors.push(format!("{} must be a regular file", unenc.payload.path));
+                        } else if let Some(expected) = unenc.payload.size_bytes
+                            && expected != meta.len()
+                        {
+                            errors.push(format!(
+                                "{} size does not match payload.size_bytes (actual {}, declared {})",
+                                unenc.payload.path,
+                                meta.len(),
+                                expected
+                            ));
                         }
                     }
                     Err(_) => errors.push(format!("Missing payload file: {}", unenc.payload.path)),
@@ -776,6 +1036,13 @@ fn check_integrity(site_dir: &Path, verbose: bool) -> CheckResult {
         Ok(m) => m,
         Err(e) => return CheckResult::fail(format!("Failed to parse integrity.json: {}", e)),
     };
+
+    if manifest.version != INTEGRITY_MANIFEST_VERSION {
+        return CheckResult::fail(format!(
+            "Unsupported integrity manifest version {}; expected {}",
+            manifest.version, INTEGRITY_MANIFEST_VERSION
+        ));
+    }
 
     let mut errors = Vec::new();
     let mut checked_files: HashSet<String> = HashSet::new();
@@ -1100,26 +1367,9 @@ fn detect_encoded_path_violation(rel_path: &str) -> Option<String> {
 fn check_no_secrets(site_dir: &Path) -> CheckResult {
     let mut errors = Vec::new();
 
-    // Check for forbidden files
-    for file in SECRET_FILES {
-        let path = site_dir.join(file);
-        if fs::symlink_metadata(&path).is_ok() {
-            errors.push(format!("Secret file found in site/: {}", file));
-        }
-    }
-
-    // Check for forbidden directories
-    for dir in SECRET_DIRS {
-        let path = site_dir.join(dir);
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            let file_type = metadata.file_type();
-            if file_type.is_dir() || file_type.is_symlink() {
-                errors.push(format!("Secret directory found in site/: {}/", dir));
-            }
-        }
-    }
-
-    // Recursive scan: detect secret files/dirs hidden in subdirectories
+    // Detect forbidden artifacts at every depth. ASCII-case-insensitive matching
+    // prevents trivial case changes from bypassing this gate on case-sensitive
+    // hosts while matching the behavior users see on common case-folding hosts.
     find_secrets_recursive(site_dir, site_dir, &mut errors);
 
     // Check config.json doesn't contain plaintext secrets.
@@ -1138,6 +1388,12 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
     } else {
         CheckResult::fail(errors.join("; "))
     }
+}
+
+fn matches_forbidden_name(name: &str, forbidden_names: &[&str]) -> bool {
+    forbidden_names
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
 fn find_forbidden_config_keys(value: &Value, current_path: &str, findings: &mut Vec<String>) {
@@ -1194,8 +1450,8 @@ fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String
             Some(n) => n.to_string(),
             None => continue,
         };
-        let is_secret_file = SECRET_FILES.contains(&name.as_str());
-        let is_secret_dir = SECRET_DIRS.contains(&name.as_str());
+        let is_secret_file = matches_forbidden_name(&name, SECRET_FILES);
+        let is_secret_dir = matches_forbidden_name(&name, SECRET_DIRS);
 
         let rel_path = path
             .strip_prefix(base)
@@ -1203,41 +1459,28 @@ fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String
             .to_string_lossy()
             .replace('\\', "/");
 
-        if file_type.is_dir() {
-            if is_secret_dir {
-                // Skip if this is a top-level match (already caught above)
-                if current != base {
-                    findings.push(format!(
-                        "Secret directory found in site subdirectory: {}/",
-                        rel_path
-                    ));
-                }
+        if is_secret_dir {
+            if current == base {
+                findings.push(format!("Secret directory found in site/: {rel_path}/"));
+            } else {
+                findings.push(format!(
+                    "Secret directory found in site subdirectory: {rel_path}/"
+                ));
             }
+        } else if is_secret_file {
+            if current == base {
+                findings.push(format!("Secret file found in site/: {rel_path}"));
+            } else {
+                findings.push(format!(
+                    "Secret file found in site subdirectory: {rel_path}"
+                ));
+            }
+        }
+
+        if file_type.is_dir() {
             // Only recurse into real directories. Symlinked directories are handled below
             // so a malicious or accidental loop cannot drag verification outside site/.
             find_secrets_recursive(base, &path, findings);
-        } else if file_type.is_symlink() {
-            if is_secret_dir {
-                if current != base {
-                    findings.push(format!(
-                        "Secret directory found in site subdirectory: {}/",
-                        rel_path
-                    ));
-                }
-            } else if is_secret_file && current != base {
-                findings.push(format!(
-                    "Secret file found in site subdirectory: {}",
-                    rel_path
-                ));
-            }
-        } else if file_type.is_file() && is_secret_file {
-            // Skip if this is a top-level match (already caught above)
-            if current != base {
-                findings.push(format!(
-                    "Secret file found in site subdirectory: {}",
-                    rel_path
-                ));
-            }
         }
     }
 }
@@ -1321,6 +1564,173 @@ fn calculate_dir_size(dir: &Path) -> Result<u64> {
 }
 
 /// Print verification result in human-readable format
+/// Text surfaces a Pages export redacts, as (label, table, column, holds JSON).
+/// Both FTS tables are rescanned too: a value left in the search index is as
+/// public as one left in the message it indexes.
+const SHARE_PROFILE_SURFACES: &[(&str, &str, &str, bool)] = &[
+    ("conversations.title", "conversations", "title", false),
+    (
+        "conversations.workspace",
+        "conversations",
+        "workspace",
+        false,
+    ),
+    (
+        "conversations.source_path",
+        "conversations",
+        "source_path",
+        false,
+    ),
+    (
+        "conversations.metadata_json",
+        "conversations",
+        "metadata_json",
+        true,
+    ),
+    ("messages.content", "messages", "content", false),
+    (
+        "messages.attachment_refs",
+        "messages",
+        "attachment_refs",
+        true,
+    ),
+    ("snippets.file_path", "snippets", "file_path", false),
+    ("snippets.snippet_text", "snippets", "snippet_text", false),
+    ("messages_fts.content", "messages_fts", "content", false),
+    (
+        "messages_code_fts.content",
+        "messages_code_fts",
+        "content",
+        false,
+    ),
+];
+
+/// Rescan a plaintext archive with the share profile it declares (2l1b0.60).
+///
+/// Fails when the archive declares a profile verification cannot check, or
+/// when that profile's rules would still rewrite an exported value; the
+/// residual is reported as counts per surface, never the values. Workspaces
+/// are rescanned as plain text because project-name anonymization is a
+/// mapping, not a pattern. The home-path and username rules use the verifying
+/// account's home directory, so they catch the exporting account's paths when
+/// the exporting account verifies, as every export does before it reports
+/// success. What this check cannot read is a warning; the payload checks own
+/// structural failures.
+fn check_share_profile(
+    site_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (CheckResult, ShareProfileEvidence) {
+    let mut evidence = ShareProfileEvidence::default();
+    let config = File::open(site_dir.join("config.json"))
+        .map_err(anyhow::Error::from)
+        .and_then(|file| {
+            Ok(serde_json::from_reader::<_, ArchiveConfig>(
+                BufReader::new(file),
+            )?)
+        });
+    // An encrypted archive records its profile inside the payload.
+    let Ok(ArchiveConfig::Unencrypted(config)) = config else {
+        return (CheckResult::pass(), evidence);
+    };
+    let relative = Path::new(&config.payload.path);
+    let payload = site_dir.join(relative);
+    if !validate_payload_path(&mut Vec::new(), "payload.path", relative)
+        || !fs::symlink_metadata(&payload).is_ok_and(|meta| meta.file_type().is_file())
+    {
+        return (CheckResult::pass(), evidence);
+    }
+    let conn = match super::open_existing_sqlite_db(&payload) {
+        Ok(conn) => conn,
+        Err(error) => {
+            warnings.push(format!(
+                "share profile not checked: the plaintext payload could not be opened ({error:#})"
+            ));
+            return (CheckResult::pass(), evidence);
+        }
+    };
+    let declared = conn
+        .query_row("SELECT value FROM export_meta WHERE key = 'share_profile'")
+        .ok()
+        .and_then(|row| row.get_typed::<String>(0).ok());
+    let Some(declared) = declared else {
+        warnings.push(
+            "the plaintext archive records no share profile, so it was exported without \
+             share-profile redaction of usernames, hostnames and home paths"
+                .to_string(),
+        );
+        return (CheckResult::pass(), evidence);
+    };
+    evidence.declared = Some(declared.clone());
+    let Some(profile) = [
+        ShareProfile::Public,
+        ShareProfile::Team,
+        ShareProfile::Personal,
+    ]
+    .into_iter()
+    .find(|profile| profile.label() == declared) else {
+        return (
+            CheckResult::fail(format!(
+                "archive declares share profile '{declared}', which verification cannot check"
+            )),
+            evidence,
+        );
+    };
+    let engine = RedactionEngine::new(profile.export_redaction_config());
+    for &(label, table, column, json) in SHARE_PROFILE_SURFACES {
+        let sql = format!("SELECT \"{column}\" FROM \"{table}\" WHERE \"{column}\" IS NOT NULL");
+        let mut residual = 0_u64;
+        let scanned = conn.query_with_params_for_each(&sql, &[], |row| {
+            residual += residual_values(&engine, &row.get_typed::<String>(0)?, json);
+            Ok(())
+        });
+        if let Err(error) = scanned {
+            return (
+                CheckResult::fail(format!(
+                    "could not rescan {label} for the '{declared}' share profile: {error}"
+                )),
+                evidence,
+            );
+        }
+        if residual > 0 {
+            evidence.residual.insert(label.to_string(), residual);
+        }
+    }
+    evidence.rescanned = true;
+    if evidence.residual.is_empty() {
+        return (CheckResult::pass(), evidence);
+    }
+    let surfaces = evidence
+        .residual
+        .iter()
+        .map(|(surface, count)| format!("{surface} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        CheckResult::fail(format!(
+            "values the '{declared}' share profile removes remain in {surfaces}"
+        )),
+        evidence,
+    )
+}
+
+/// How many values in `text` the engine would still rewrite. JSON is rescanned
+/// by string value, as the export redacted it; text that does not parse is
+/// rescanned whole.
+fn residual_values(engine: &RedactionEngine, text: &str, json: bool) -> u64 {
+    fn walk(engine: &RedactionEngine, node: &Value) -> u64 {
+        match node {
+            Value::String(text) => u64::from(!engine.redact_text(text).changes.is_empty()),
+            Value::Array(items) => items.iter().map(|item| walk(engine, item)).sum(),
+            Value::Object(fields) => fields.values().map(|item| walk(engine, item)).sum(),
+            _ => 0,
+        }
+    }
+    if json && let Ok(value) = serde_json::from_str::<Value>(text) {
+        return walk(engine, &value);
+    }
+    u64::from(!engine.redact_text(text).changes.is_empty())
+}
+
 pub fn print_result(result: &VerifyResult, verbose: bool) {
     let status_icon = if result.status == "valid" {
         "✓"
@@ -1344,6 +1754,15 @@ pub fn print_result(result: &VerifyResult, verbose: bool) {
     print_check("  Size limits", &result.checks.size_limits, verbose);
     print_check("  Integrity", &result.checks.integrity, verbose);
     print_check("  No secrets", &result.checks.no_secrets_in_site, verbose);
+    print_check("  Share profile", &result.checks.share_profile, verbose);
+    if let Some(profile) = &result.share_profile.declared {
+        let scope = if result.share_profile.rescanned {
+            "rescanned"
+        } else {
+            "not rescanned"
+        };
+        println!("\nShare profile: {profile} ({scope})");
+    }
 
     if !result.warnings.is_empty() {
         println!("\nWarnings:");
@@ -1387,7 +1806,9 @@ fn print_check(name: &str, result: &CheckResult, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pages::bundle::IntegrityEntry;
+    use crate::pages::bundle::{
+        IntegrityEntry, generate_integrity_manifest, write_pinned_vendor_assets,
+    };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1401,7 +1822,19 @@ mod tests {
     /// `fixture_name` is the subdirectory under tests/fixtures/pages_verify/ (e.g., "valid", "unencrypted")
     fn copy_fixture(fixture_name: &str, dest: &Path) -> Result<()> {
         let src = fixtures_dir().join(fixture_name).join("site");
-        copy_dir_recursive(&src, dest)
+        let had_integrity_manifest = src.join("integrity.json").is_file();
+        copy_dir_recursive(&src, dest)?;
+        write_pinned_vendor_assets(dest)?;
+
+        if had_integrity_manifest {
+            let manifest = generate_integrity_manifest(dest)?;
+            fs::write(
+                dest.join("integrity.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Recursively copy a directory and its contents
@@ -1594,6 +2027,33 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_same_size_vendor_runtime_tampering() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+
+        let runtime_path = site_dir.join("vendor/fflate.js");
+        let mut runtime = fs::read(&runtime_path).unwrap();
+        runtime[0] ^= 0x01;
+        fs::write(runtime_path, runtime).unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert_eq!(result.status, "invalid");
+        assert!(!result.checks.required_files.passed);
+        assert!(
+            result
+                .checks
+                .required_files
+                .details
+                .as_deref()
+                .is_some_and(|details| {
+                    details.contains("vendor/fflate.js") && details.contains("SHA-256")
+                })
+        );
+        assert!(!result.checks.integrity.passed);
+    }
+
+    #[test]
     fn test_config_schema_allows_zero_chunk_encrypted_archive() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -1633,6 +2093,57 @@ mod tests {
     }
 
     #[test]
+    fn test_config_schema_rejects_base64_wrapped_dek_with_wrong_length() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["key_slots"][0]["wrapped_dek"] = Value::String("AA==".to_string());
+        fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let result = check_config_schema(&site_dir);
+
+        assert!(!result.passed, "a one-byte wrapped DEK must be rejected");
+        assert!(
+            result
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("wrapped_dek should be 48 bytes")),
+            "wrong-length wrapped DEK should have an actionable error: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    fn test_config_schema_rejects_self_consistent_unsupported_argon_parameters() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["kdf_defaults"]["memory_kb"] = Value::from(1);
+        config["key_slots"][0]["argon2_params"]["memory_kb"] = Value::from(1);
+        fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let result = check_config_schema(&site_dir);
+
+        assert!(
+            !result.passed,
+            "self-consistent metadata unsupported by the decryptor must be rejected"
+        );
+        assert!(
+            result.details.as_deref().is_some_and(|details| {
+                details.contains("encrypted config is not supported by this build")
+            }),
+            "unsupported Argon2 parameters should name the compatibility failure: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
     fn test_verify_unencrypted_site() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -1641,9 +2152,184 @@ mod tests {
         copy_fixture("unencrypted", &site_dir).unwrap();
 
         let result = verify_bundle(&site_dir, true).unwrap();
-        assert!(result.checks.config_schema.passed);
-        assert!(result.checks.payload_manifest.passed);
-        assert_eq!(result.status, "valid");
+        assert!(
+            result.checks.config_schema.passed,
+            "config schema: {:?}",
+            result.checks.config_schema
+        );
+        assert!(
+            result.checks.payload_manifest.passed,
+            "payload manifest: {:?}",
+            result.checks.payload_manifest
+        );
+        assert_eq!(result.status, "valid", "checks: {:?}", result.checks);
+    }
+
+    #[test]
+    fn unencrypted_payload_requires_a_bounded_exact_declared_size() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("unencrypted", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let original: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        let mut missing = original.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("size_bytes");
+        fs::write(&config_path, serde_json::to_vec_pretty(&missing).unwrap()).unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            !schema.passed
+                && schema
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("size_bytes is required")),
+            "missing size metadata must fail before the browser fetches the database: {:?}",
+            schema.details
+        );
+
+        let mut oversized = original.clone();
+        oversized["payload"]["size_bytes"] = Value::from(MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE + 1);
+        fs::write(&config_path, serde_json::to_vec_pretty(&oversized).unwrap()).unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            !schema.passed
+                && schema
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("browser runtime limit")),
+            "oversized unencrypted databases must be rejected: {:?}",
+            schema.details
+        );
+
+        let mut mismatched = original;
+        mismatched["payload"]["size_bytes"] = Value::from(18);
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&mismatched).unwrap(),
+        )
+        .unwrap();
+        let manifest = check_payload_manifest(&site_dir);
+        assert!(
+            !manifest.passed
+                && manifest
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("size does not match")),
+            "payload bytes must exactly match their declaration: {:?}",
+            manifest.details
+        );
+    }
+
+    #[test]
+    fn unencrypted_payload_path_must_match_browser_url_semantics() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("unencrypted", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let original: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        for invalid_path in [
+            "payload//data.sqlite",
+            "payload/./data.sqlite",
+            "payload/%2e%2e/data.sqlite",
+            "payload/subdir%2fdata.sqlite",
+            "payload/subdir%5cdata.sqlite",
+            "payload/data.sqlite?download=1",
+            "payload/data.sqlite#fragment",
+            "payload/%zz.sqlite",
+            "payload/data%20copy.sqlite",
+        ] {
+            let mut config = original.clone();
+            config["payload"]["path"] = Value::from(invalid_path);
+            fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+            let schema = check_config_schema(&site_dir);
+            assert!(
+                !schema.passed,
+                "browser-incompatible payload path must fail verification: {invalid_path}"
+            );
+        }
+
+        let mut ordinary_filename = original;
+        ordinary_filename["payload"]["path"] = Value::from("payload/data copy.sqlite");
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&ordinary_filename).unwrap(),
+        )
+        .unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            schema.passed,
+            "ordinary filename characters should remain valid: {:?}",
+            schema.details
+        );
+    }
+
+    #[test]
+    fn verified_deployment_invokes_action_for_valid_exact_site() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        let invoked = std::cell::Cell::new(false);
+
+        let value = with_verified_bundle_for_deployment(temp.path(), false, |verified_site| {
+            invoked.set(true);
+            assert_eq!(verified_site, site_dir);
+            Ok(17_u8)
+        })?;
+
+        assert!(invoked.get());
+        assert_eq!(value, 17);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_bundle_never_reaches_deployment_action() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        fs::write(
+            site_dir.join("recovery-secret.txt"),
+            b"must never be deployed",
+        )?;
+        let invoked = std::cell::Cell::new(false);
+
+        let error = with_verified_bundle_for_deployment(&site_dir, false, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .expect_err("a private recovery artifact must block deployment");
+
+        assert!(!invoked.get(), "invalid bundle reached deployment action");
+        let message = format!("{error:#}");
+        assert!(message.contains("Refusing to deploy invalid Pages bundle"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_bundle_gate_rejects_post_build_private_artifact() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        ensure_valid_bundle(&site_dir, false)?;
+
+        fs::write(
+            site_dir.join("recovery-secret.txt"),
+            b"post-build private material",
+        )?;
+        let error = ensure_valid_bundle(&site_dir, false)
+            .expect_err("post-build private artifacts must block success reporting");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed full verification"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
     }
 
     #[test]
@@ -1842,6 +2528,31 @@ mod tests {
     }
 
     #[test]
+    fn test_check_no_secrets_rejects_nested_mixed_case_private_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(site_dir.join("nested/Private")).unwrap();
+        fs::write(
+            site_dir.join("nested/Master-Key.json"),
+            "wrapped key metadata",
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+
+        assert!(!result.passed);
+        let details = result.details.unwrap_or_default();
+        assert!(
+            details.contains("nested/Private/"),
+            "mixed-case private directory bypassed the scan: {details}"
+        );
+        assert!(
+            details.contains("nested/Master-Key.json"),
+            "mixed-case secret filename bypassed the scan: {details}"
+        );
+    }
+
+    #[test]
     fn test_check_no_secrets_flags_nested_config_secret_key_with_whitespace() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -2017,25 +2728,30 @@ mod tests {
         // Copy valid fixture
         copy_fixture("valid", &site_dir).unwrap();
 
-        // Create integrity.json
+        // Create integrity.json over EVERY file in the site: the integrity
+        // check's coverage rule flags any uncovered file, and the prepared
+        // site contains more than REQUIRED_FILES (payload chunks, the
+        // materialized vendor/ assets, ...). Walking the tree keeps this
+        // manifest builder honest as the bundle contract grows.
         let mut files = BTreeMap::new();
-        for file in REQUIRED_FILES {
-            let hash = compute_file_hash(&site_dir.join(file)).unwrap();
-            let size = fs::metadata(site_dir.join(file)).unwrap().len();
-            files.insert(file.to_string(), IntegrityEntry { sha256: hash, size });
+        for entry in walkdir::WalkDir::new(&site_dir) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&site_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "integrity.json" {
+                continue;
+            }
+            let hash = compute_file_hash(entry.path()).unwrap();
+            let size = fs::metadata(entry.path()).unwrap().len();
+            files.insert(rel, IntegrityEntry { sha256: hash, size });
         }
-        // Add payload chunk
-        let chunk_hash = compute_file_hash(&site_dir.join("payload/chunk-00000.bin")).unwrap();
-        let chunk_size = fs::metadata(site_dir.join("payload/chunk-00000.bin"))
-            .unwrap()
-            .len();
-        files.insert(
-            "payload/chunk-00000.bin".to_string(),
-            IntegrityEntry {
-                sha256: chunk_hash,
-                size: chunk_size,
-            },
-        );
 
         let manifest = IntegrityManifest {
             version: 1,
@@ -2049,7 +2765,39 @@ mod tests {
         .unwrap();
 
         let result = verify_bundle(&site_dir, false).unwrap();
-        assert!(result.checks.integrity.passed);
+        assert!(
+            result.checks.integrity.passed,
+            "integrity check failed: {:?}",
+            result.checks.integrity
+        );
+    }
+
+    #[test]
+    fn test_integrity_rejects_unknown_manifest_version() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let integrity_path = site_dir.join("integrity.json");
+        let mut manifest: IntegrityManifest =
+            serde_json::from_reader(BufReader::new(File::open(&integrity_path).unwrap())).unwrap();
+        manifest.version = INTEGRITY_MANIFEST_VERSION + 1;
+        fs::write(
+            &integrity_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = check_integrity(&site_dir, false);
+
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("Unsupported integrity manifest version")),
+            "unknown integrity schema should fail explicitly: {:?}",
+            result.details
+        );
     }
 
     #[test]

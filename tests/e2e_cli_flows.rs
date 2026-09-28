@@ -264,6 +264,20 @@ fn setup_pack_archive_fixture(tracker: &PhaseTracker) -> PackArchiveFixture {
         )
         .expect("insert remote pack conversation");
 
+    drop(storage);
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(home.join(".codex"));
+    // Structured pack is read-only. Publish the seeded archive's lexical
+    // assets explicitly before testing the handoff, just as its repair hint
+    // instructs an operator with an archive but no searchable generation.
+    base_cmd(&command_env)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
     tracker.end(
         "seed_pack_archive",
         Some("Seed real archive DB plus source log files for cass pack"),
@@ -420,8 +434,11 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
     }
     assert!(
         output.status.success(),
-        "cass pack e2e failed; artifacts in {}",
-        fixture.artifact_dir.display()
+        "cass pack e2e failed; artifacts in {}; status: {}; stdout:\n{}\nstderr:\n{}",
+        fixture.artifact_dir.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -442,7 +459,7 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
     )
     .expect("write scrubbed pack artifact");
 
-    assert_eq!(json["schema_version"], "cass.pack.v1");
+    assert_eq!(json["schema_version"], "cass.pack.v2");
     assert_eq!(json["query"]["text"], "checkout failure");
     assert_eq!(json["limits"]["max_tokens"], 4000);
     assert!(
@@ -673,45 +690,91 @@ fn search_returns_hits_with_expected_fields() {
 fn view_command_returns_session_detail() {
     let tracker = tracker_for("view_command_returns_session_detail");
     let command_env = tracker.command_environment();
-    let (tmp, data_dir) = setup_indexed_env();
-    let codex_session = tmp
-        .path()
-        .join(".codex/sessions/2024/12/01/rollout-test.jsonl");
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session.txt");
+    let source = "first\nsecond\nthird\n";
+    fs::write(&session, source).unwrap();
 
-    // View the session
-    let view_start = tracker.start("run_view", Some("Execute view command on session"));
-    let output = base_cmd(&command_env)
-        .args(["view", "--robot", "--data-dir"])
-        .arg(&data_dir)
-        .arg(&codex_session)
-        .env("HOME", tmp.path())
-        .output()
-        .unwrap();
-    let view_ms = view_start.elapsed().as_millis() as u64;
-    tracker.end("run_view", Some("View complete"), view_start);
-
-    // View may exit with 0 or non-zero depending on whether session is indexed
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if output.status.success() {
-        // Should be valid JSON
-        let json: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
-        // May have messages or error
-        assert!(
-            json.get("messages").is_some()
-                || json.get("error").is_some()
-                || json.get("conversation").is_some(),
-            "View should return messages or error. stdout: {}",
-            stdout
-        );
+    for target in 1usize..=3 {
+        for context in [0usize, 1, usize::MAX - 1, usize::MAX] {
+            let expected: Vec<Value> = source
+                .lines()
+                .enumerate()
+                .filter(|(index, _)| (index + 1).abs_diff(target) <= context)
+                .map(|(index, content)| {
+                    // #493: every line names its coordinate space and source.
+                    serde_json::json!({
+                        "line": index + 1,
+                        "file_line": index + 1,
+                        "coordinate_space": "file_line",
+                        "content_source": "file",
+                        "content": content,
+                        "is_target": index + 1 == target,
+                        "highlighted": index + 1 == target,
+                    })
+                })
+                .collect();
+            for robot in [false, true] {
+                let mut cmd = base_cmd(&command_env);
+                cmd.arg("--db")
+                    .arg(tmp.path().join("data/agent_search.db"))
+                    .args(["view", "--line"])
+                    .arg(target.to_string())
+                    .arg("--context")
+                    .arg(context.to_string())
+                    .arg(&session)
+                    .env("HOME", tmp.path())
+                    .env("CASS_OUTPUT_FORMAT", "");
+                if robot {
+                    cmd.arg("--robot");
+                }
+                let output = cmd.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "target={target} context={context} robot={robot}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                if robot {
+                    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(actual["lines"], serde_json::json!(expected));
+                    assert_eq!(actual["total_lines"], 3);
+                    assert_eq!(actual["target_line"], target);
+                    assert_eq!(actual["archive_only"], false);
+                } else {
+                    // #493 human layout: an `L<n>` header per line (`>>>` marks
+                    // the target), then that line's content.
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let lines: Vec<&str> = stdout.lines().collect();
+                    let actual: Vec<(bool, &str)> = lines
+                        .windows(2)
+                        .filter(|pair| {
+                            pair[0]
+                                .trim_start_matches(">>>")
+                                .trim_start()
+                                .strip_prefix('L')
+                                .and_then(|rest| rest.split_whitespace().next())
+                                .is_some_and(|number| {
+                                    number.chars().all(|digit| digit.is_ascii_digit())
+                                })
+                        })
+                        .map(|pair| (pair[0].starts_with(">>>"), pair[1]))
+                        .collect();
+                    let expected_text: Vec<(bool, &str)> = expected
+                        .iter()
+                        .map(|line| {
+                            (
+                                line["highlighted"] == true,
+                                line["content"].as_str().unwrap(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(actual, expected_text, "{stdout}");
+                }
+            }
+        }
     }
-
-    tracker.metrics(
-        "cass_view",
-        &E2ePerformanceMetrics::new()
-            .with_duration(view_ms)
-            .with_custom("operation", "view_session"),
-    );
+    assert_eq!(fs::read(&session).unwrap(), source.as_bytes());
     tracker.complete();
 }
 
@@ -719,36 +782,57 @@ fn view_command_returns_session_detail() {
 fn expand_command_with_context() {
     let tracker = tracker_for("expand_command_with_context");
     let command_env = tracker.command_environment();
-    let (tmp, data_dir) = setup_indexed_env();
-    let codex_session = tmp
-        .path()
-        .join(".codex/sessions/2024/12/01/rollout-test.jsonl");
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session.jsonl");
+    let source = concat!(
+        "{\"role\":\"user\",\"content\":\"first\"}\n",
+        "{\"role\":\"assistant\",\"content\":\"second\"}\n",
+        "{\"role\":\"user\",\"content\":\"third\"}\n",
+    );
+    fs::write(&session, source).unwrap();
 
-    // Expand with context
-    let output = base_cmd(&command_env)
-        .args(["expand", "--robot", "-n", "1", "-C", "2", "--data-dir"])
-        .arg(&data_dir)
-        .arg(&codex_session)
-        .env("HOME", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Expand may succeed or fail depending on line existence
-    if output.status.success() && !stdout.is_empty() {
-        let json: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
-        // Should have context or messages
-        assert!(
-            json.get("messages").is_some()
-                || json.get("context").is_some()
-                || json.get("lines").is_some(),
-            "Expand should return context. stdout: {}, stderr: {}",
-            stdout,
-            stderr
-        );
+    for target in 1usize..=3 {
+        for context in [0usize, 1, usize::MAX - 1, usize::MAX] {
+            let output = base_cmd(&command_env)
+                .arg("--db")
+                .arg(tmp.path().join("data/agent_search.db"))
+                .args(["expand", "--robot", "--line"])
+                .arg(target.to_string())
+                .arg("--context")
+                .arg(context.to_string())
+                .arg(&session)
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "target={target} context={context}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let expected: Vec<Value> = ["first", "second", "third"]
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| (index + 1).abs_diff(target) <= context)
+                .map(|(index, content)| {
+                    serde_json::json!({
+                        "line": index + 1,
+                        "file_line": index + 1,
+                        "coordinate_space": "file_line",
+                        "content_source": "file",
+                        "role": if index == 1 { "assistant" } else { "user" },
+                        "is_target": index + 1 == target,
+                        "highlighted": index + 1 == target,
+                        "content": content,
+                    })
+                })
+                .collect();
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(actual, serde_json::json!(expected));
+        }
     }
+    assert_eq!(fs::read(&session).unwrap(), source.as_bytes());
+    tracker.complete();
 }
 
 // =============================================================================
@@ -1579,5 +1663,90 @@ fn search_across_multiple_agents() {
         hits.is_some(),
         "Should have hits from multi-agent search. JSON: {}",
         json
+    );
+}
+
+/// GH#414: a `--sessions-from` filter that matches zero indexed sessions must
+/// be distinguishable from a genuine query miss — the robot payload reports
+/// how the filter resolved, warns when it provably matched nothing, and the
+/// broaden-the-query suggestion (which points at the one thing that was NOT
+/// the problem) is suppressed in exactly that case.
+#[test]
+fn search_sessions_from_reports_filter_resolution_and_suppresses_query_suggestions() {
+    let tracker = tracker_for(
+        "search_sessions_from_reports_filter_resolution_and_suppresses_query_suggestions",
+    );
+    let command_env = tracker.command_environment();
+    let fixture = setup_pack_archive_fixture(&tracker);
+
+    let run_search = |sessions_from: Option<&PathBuf>| -> Value {
+        let mut cmd = base_cmd(&command_env);
+        cmd.args(["search", "checkout", "--robot", "--data-dir"])
+            .arg(&fixture.data_dir)
+            .env("HOME", fixture.tmp.path());
+        if let Some(list) = sessions_from {
+            cmd.arg("--sessions-from").arg(list);
+        }
+        let output = cmd.output().expect("run cass search e2e");
+        assert!(
+            output.status.success(),
+            "search must exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("search stdout is valid JSON")
+    };
+
+    // Control: the query genuinely matches the fixture, and with no
+    // --sessions-from the payload carries no sessions_filter block.
+    let control = run_search(None);
+    let control_count = control["count"].as_u64().expect("count");
+    assert!(control_count > 0, "control query must hit the fixture");
+    assert!(
+        control.get("sessions_filter").is_none(),
+        "sessions_filter must be absent without --sessions-from"
+    );
+
+    // A filter naming an indexed session resolves matched=1 and still hits.
+    let good_list = fixture.artifact_dir.join("sessions-good.txt");
+    fs::write(
+        &good_list,
+        format!("{}\n", fixture.source_files[0].0.display()),
+    )
+    .expect("write good session list");
+    let filtered = run_search(Some(&good_list));
+    assert!(
+        filtered.get("sessions_filter").is_some(),
+        "payload missing sessions_filter with --sessions-from supplied: {filtered}"
+    );
+    assert_eq!(filtered["sessions_filter"]["requested"], 1);
+    assert_eq!(filtered["sessions_filter"]["matched"], 1);
+    assert!(
+        filtered.get("sessions_filter_warning").is_none(),
+        "a matched filter must not warn"
+    );
+
+    // The reported case: a filter naming a never-indexed path. Same query,
+    // same archive — the zero must be attributed to the filter.
+    let bogus_list = fixture.artifact_dir.join("sessions-bogus.txt");
+    fs::write(&bogus_list, "/nonexistent/path/never-indexed.jsonl\n")
+        .expect("write bogus session list");
+    let unmatched = run_search(Some(&bogus_list));
+    assert_eq!(unmatched["count"], 0, "bogus filter yields zero hits");
+    assert_eq!(unmatched["sessions_filter"]["requested"], 1);
+    assert_eq!(
+        unmatched["sessions_filter"]["matched"], 0,
+        "matched must be 0, not null: the resolution ran and proved the miss"
+    );
+    assert!(
+        unmatched["sessions_filter_warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("--sessions-from")),
+        "the payload must say the filter, not the query, explains the zero"
+    );
+    assert!(
+        unmatched.get("suggestions").is_none(),
+        "broaden-the-query suggestions must be suppressed when the filter \
+         provably matched no indexed session"
     );
 }

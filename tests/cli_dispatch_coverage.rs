@@ -1060,6 +1060,12 @@ fn context_json_with_nonexistent_path() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
+    drop(
+        coding_agent_search::storage::sqlite::FrankenStorage::open(
+            &data_dir.join("agent_search.db"),
+        )
+        .unwrap(),
+    );
 
     let mut cmd = base_cmd(tmp.path());
     cmd.args([
@@ -1070,10 +1076,194 @@ fn context_json_with_nonexistent_path() {
         data_dir.to_str().unwrap(),
     ]);
 
-    // May fail or return empty results - either is acceptable
-    let output = cmd.assert().get_output().clone();
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    // Test passes if command completes (success or failure with message)
+    cmd.timeout(Duration::from_secs(10))
+        .assert()
+        .code(4)
+        .stderr(contains("No session found at path"));
+}
+
+#[test]
+fn context_legacy_nulls_and_zero_limit_remain_readonly_before_migration() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+         INSERT INTO meta VALUES('schema_version', '20');
+         CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT);
+         INSERT INTO agents VALUES(1, NULL);
+         CREATE TABLE workspaces(id INTEGER PRIMARY KEY, path TEXT);
+         INSERT INTO workspaces VALUES(1, '/legacy-workspace');
+         CREATE TABLE conversations(
+             id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER,
+             source_path TEXT, title TEXT, started_at INTEGER, source_id TEXT, origin_host TEXT
+         );
+         INSERT INTO conversations VALUES
+             (1, NULL, 1, '/legacy/source.jsonl', NULL, 100, NULL, NULL),
+             (2, 1, 1, '/legacy/related.jsonl', NULL, 200, '   ', 'user@remote');",
+    )
+    .unwrap();
+    conn.close().unwrap();
+    let before = fs::read(&db_path).unwrap();
+    for limit in [1, 0] {
+        let output = base_cmd(tmp.path())
+            .args(["context", "/legacy/source.jsonl", "--json", "--limit"])
+            .arg(limit.to_string())
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["source"]["title"], "");
+        assert_eq!(payload["source"]["agent"], "unknown");
+        assert_eq!(payload["source"]["source_id"], "local");
+        assert_eq!(payload["counts"]["same_agent"], 0);
+        assert_eq!(payload["counts"]["same_workspace"], limit);
+        assert_eq!(payload["counts"]["same_day"], limit);
+        if limit == 1 {
+            let related = &payload["related"]["same_workspace"][0];
+            assert_eq!(related["path"], "/legacy/related.jsonl");
+            assert_eq!(related["agent"], "unknown");
+            assert_eq!(related["title"], "");
+            assert_eq!(related["source_id"], "user@remote");
+        }
+    }
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+}
+
+#[test]
+fn context_wide_archive_limit_one_is_bounded_and_readonly() {
+    use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage};
+
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let conn = storage.raw();
+    conn.execute_batch(
+        "DROP INDEX idx_conversations_context;
+         DELETE FROM _schema_migrations WHERE version >= 21;
+         UPDATE meta SET value = '20' WHERE key = 'schema_version';
+         INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+             VALUES(1, 'codex', 'Codex', 'cli', 0, 0),
+                   (2, 'claude', 'Claude', 'cli', 0, 0);
+         INSERT INTO workspaces(id, path) VALUES(1, '/context-workspace'), (2, '/elsewhere');
+         INSERT INTO sources(id, kind, created_at, updated_at)
+             VALUES('  local  ', 'local', 0, 0), ('   ', 'ssh', 0, 0);",
+    )
+    .unwrap();
+    // Reporter shape: 5,600 conversations with about 84 KiB metadata each.
+    // No message population is needed: context never queries messages.
+    let metadata = rmp_serde::to_vec_named(&json!({"padding": "x".repeat(84 * 1024)})).unwrap();
+    for batch in 0..56_i64 {
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        for offset in 1..=100_i64 {
+            let id = batch * 100 + offset;
+            conn.execute_compat(
+                "INSERT INTO conversations
+                 (id, agent_id, workspace_id, source_path, title, started_at, metadata_bin)
+                 VALUES(?1, 2, 2, ?2, 'wide archive session', ?3, ?4)",
+                fparams![
+                    id,
+                    format!("/wide/{id}.jsonl"),
+                    86_400_000_i64 + id,
+                    metadata.as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+    // The source and related sessions are older than all the unrelated rows,
+    // preventing a newest-first table walk from passing by stopping early.
+    conn.execute_batch(
+        "UPDATE conversations SET agent_id = 1, workspace_id = 1, started_at = 100,
+             title = 'source' WHERE id = 1;
+         UPDATE conversations SET workspace_id = 1, started_at = 300,
+             title = NULL, source_id = '  local  ' WHERE id = 2;
+         UPDATE conversations SET agent_id = 1, started_at = 200,
+             source_id = '   ', origin_host = 'user@remote' WHERE id = 3;",
+    )
+    .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(storage);
+    // Upgrade a populated file through the ordinary writable open, then prove
+    // every metadata payload survived the index build before invoking the CLI.
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    {
+        let rows = storage
+            .raw()
+            .query("SELECT metadata_bin FROM conversations")
+            .unwrap();
+        assert_eq!(rows.len(), 5600);
+        for row in rows {
+            assert_eq!(row.get_typed::<Vec<u8>>(0).unwrap(), metadata);
+        }
+    }
+    storage
+        .raw()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(storage);
+    let before = blake3::hash(&fs::read(&db_path).unwrap());
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let wal_before = wal_path.exists().then(|| fs::read(&wal_path).unwrap());
+    let started = std::time::Instant::now();
+    let output = base_cmd(tmp.path())
+        .args([
+            "context",
+            "/wide/1.jsonl",
+            "--json",
+            "--limit",
+            "1",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(30))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let elapsed = started.elapsed();
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["source"]["title"], "source");
+    assert_eq!(
+        payload["counts"],
+        json!({"same_workspace": 1, "same_day": 1, "same_agent": 1})
+    );
+    let workspace = &payload["related"]["same_workspace"][0];
+    assert_eq!(workspace["path"], "/wide/2.jsonl");
+    assert_eq!(workspace["title"], "");
+    assert_eq!(workspace["agent"], "claude");
+    assert_eq!(workspace["source_id"], "local");
+    assert_eq!(payload["related"]["same_day"][0], *workspace);
+    assert_eq!(payload["related"]["same_agent"][0]["path"], "/wide/3.jsonl");
+    assert_eq!(
+        payload["related"]["same_agent"][0]["source_id"],
+        "user@remote"
+    );
+    assert_eq!(
+        blake3::hash(&fs::read(&db_path).unwrap()),
+        before,
+        "context must not migrate or rewrite the archive"
+    );
+    assert_eq!(
+        wal_path.exists().then(|| fs::read(&wal_path).unwrap()),
+        wal_before,
+        "context must preserve the WAL too"
+    );
+    eprintln!(
+        "GH463: conversations=5600 metadata_bytes={} limit=1 elapsed_ms={}",
+        5600 * metadata.len(),
+        elapsed.as_millis()
+    );
 }
 
 #[test]
@@ -1400,9 +1590,14 @@ fn expand_requires_path_and_line() {
 fn expand_help_shows_options() {
     let mut cmd = simple_cmd();
     cmd.args(["expand", "--help"]);
+    // Since #493 (aa5d5068) expand is described by its two coordinate systems
+    // instead of "messages around": a hit's canonical ordinal or a raw line.
     cmd.assert()
         .success()
-        .stdout(contains("messages around"))
+        .stdout(contains(
+            "Expand a search hit with --message-index, or inspect raw JSONL with --line",
+        ))
+        .stdout(contains("--message-index"))
         .stdout(contains("--line"))
         .stdout(contains("--context"))
         .stdout(contains("--json"));
@@ -2065,7 +2260,7 @@ fn parse_expand_with_context() {
             ..
         }) => {
             assert_eq!(path.to_str().unwrap(), "/path/to/session.jsonl");
-            assert_eq!(line, 100);
+            assert_eq!(line, Some(100));
             assert_eq!(context, 5);
         }
         other => panic!("expected expand command, got {other:?}"),
@@ -2987,14 +3182,12 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
         .expect("create cass db");
     drop(storage);
 
-    let shared: Vec<&str> = vec![
+    let shared_query: Vec<&str> = vec![
         "--json",
         "--since",
         "2026-01-01",
         "--until",
         "2026-01-31",
-        "--days",
-        "7",
         "--agent",
         "claude",
         "--workspace",
@@ -3020,7 +3213,7 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
             vec!["analytics", "models", "--group-by", "month"],
         ),
         ("analytics/incidents", vec!["analytics", "incidents"]),
-        ("analytics/rebuild", vec!["analytics", "rebuild", "--force"]),
+        ("analytics/rebuild", vec!["analytics", "rebuild"]),
         ("analytics/validate", vec!["analytics", "validate", "--fix"]),
     ];
 
@@ -3028,7 +3221,22 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
     let lock_sensitive_commands = ["analytics/rebuild"];
 
     for (expected_command, mut args) in cases {
-        args.extend_from_slice(&shared);
+        match expected_command {
+            // Rebuild is a whole-rollup operation. It supports a lower time
+            // bound for Track A but rejects query-only dimensional filters.
+            "analytics/rebuild" => args.extend_from_slice(&[
+                "--json",
+                "--since",
+                "2026-01-01",
+                "--data-dir",
+                data_dir_str.as_str(),
+            ]),
+            // Validation checks global invariants and cannot apply query filters.
+            "analytics/validate" => {
+                args.extend_from_slice(&["--json", "--data-dir", data_dir_str.as_str()])
+            }
+            _ => args.extend_from_slice(&shared_query),
+        }
         let mut cmd = base_cmd(tmp_home.path());
         cmd.args(&args);
         let output = cmd.output().expect("failed to execute command");
@@ -3145,10 +3353,17 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
         let filters = json["_meta"]["filters_applied"]
             .as_array()
             .expect("filters_applied array");
-        assert!(
-            !filters.is_empty(),
-            "filters_applied should include shared filters for {expected_command}"
-        );
+        if expected_command == "analytics/validate" {
+            assert!(
+                filters.is_empty(),
+                "analytics/validate must not claim query filters were applied: {json}"
+            );
+        } else {
+            assert!(
+                !filters.is_empty(),
+                "filters_applied should include supported filters for {expected_command}"
+            );
+        }
     }
 }
 
@@ -4295,30 +4510,34 @@ fn analytics_validate_fix_refuses_when_source_schema_is_missing() {
     );
 }
 
+/// 2l1b0.68: help no longer advertises the removed `--force`.
 #[test]
-fn analytics_rebuild_help_shows_force_flag() {
+fn analytics_rebuild_help_omits_the_removed_force_flag() {
     let mut cmd = simple_cmd();
     cmd.args(["analytics", "rebuild", "--help"]);
     cmd.assert()
         .success()
-        .stdout(contains("--force"))
+        .stdout(contains("--force").not())
         .stdout(contains("--json"));
 }
 
+/// 2l1b0.68: `analytics rebuild` always rebuilds, so the former `--force`
+/// (parsed, then ignored) is gone rather than accepted as a silent no-op.
 #[test]
-fn analytics_rebuild_parses_force_and_json_flags() {
-    let cli = parse_cli_ok(
+fn analytics_rebuild_parses_json_and_rejects_force() {
+    let err = parse_cli_err(
         ["cass", "analytics", "rebuild", "--force", "--json"],
-        "parse analytics rebuild with force+json",
+        "analytics rebuild --force must be rejected",
+    );
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "rebuild", "--json"],
+        "parse analytics rebuild with json",
     );
 
     match cli.command {
-        Some(Commands::Analytics(AnalyticsCommand::Rebuild {
-            common,
-            force,
-            track,
-        })) => {
-            assert!(force, "--force should be true");
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, track })) => {
             assert!(common.json, "--json should be true");
             assert_eq!(
                 track,

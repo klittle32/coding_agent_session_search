@@ -286,8 +286,9 @@ const INVALID_CHARS: &[char] = &[
 
 /// Reserved filenames on Windows.
 const RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
 ];
 
 /// Check if a filename is valid across platforms.
@@ -296,15 +297,18 @@ pub fn is_valid_filename(name: &str) -> bool {
         return false;
     }
 
-    // Check for invalid characters
-    if name.chars().any(|c| INVALID_CHARS.contains(&c)) {
+    // Windows rejects the full ASCII control range, not only tab/newline/NUL.
+    // Reject all Unicode control characters as well so custom export names
+    // cannot contain invisible terminal-control bytes on other platforms.
+    if name
+        .chars()
+        .any(|c| INVALID_CHARS.contains(&c) || c.is_control())
+    {
         return false;
     }
 
     // Check for reserved names (Windows)
-    let upper = name.to_ascii_uppercase();
-    let base_name = upper.split('.').next().unwrap_or(&upper);
-    if RESERVED_NAMES.contains(&base_name) {
+    if is_reserved_basename(name) {
         return false;
     }
 
@@ -529,11 +533,26 @@ fn sanitize_extension(extension: &str) -> String {
 // Agent slug normalization
 // ============================================================================
 
+/// Return whether an agent label is an accepted Oh My Pi identity.
+///
+/// Keep this exact alias set shared by filename, styling, and display-name
+/// normalization so every HTML export surface identifies OMP consistently.
+pub(super) fn is_omp_agent_alias(agent: &str) -> bool {
+    matches!(
+        agent.trim().to_ascii_lowercase().as_str(),
+        "omp" | "oh my pi" | "oh-my-pi" | "oh_my_pi" | "ohmypi"
+    )
+}
+
 /// Normalize agent name to canonical slug.
 ///
 /// Maps various agent name formats to a consistent short form.
 pub fn agent_slug(agent: &str) -> String {
-    match agent.to_lowercase().replace(['-', '_'], "").as_str() {
+    if is_omp_agent_alias(agent) {
+        return "omp".to_string();
+    }
+
+    match agent.trim().to_lowercase().replace(['-', '_'], "").as_str() {
         "claudecode" | "claude" => "claude".to_string(),
         "cursor" | "cursorai" => "cursor".to_string(),
         "chatgpt" | "gpt" | "openai" => "chatgpt".to_string(),
@@ -541,7 +560,7 @@ pub fn agent_slug(agent: &str) -> String {
         "antigravity" | "antigravitycli" | "agy" => "antigravity".to_string(),
         "codex" | "codexcli" => "codex".to_string(),
         "aider" => "aider".to_string(),
-        "piagent" | "pi" => "piagent".to_string(),
+        "piagent" | "pi" => "pi_agent".to_string(),
         "primeagent" | "prime" => "prime_agent".to_string(),
         "factory" | "droid" => "factory".to_string(),
         "opencode" => "opencode".to_string(),
@@ -845,7 +864,12 @@ mod tests {
 
         assert!(!is_valid_filename(""));
         assert!(!is_valid_filename("file<name"));
+        assert!(!is_valid_filename("invisible\u{0007}bell.html"));
         assert!(!is_valid_filename("CON")); // Reserved on Windows
+        assert!(!is_valid_filename("conin$.txt"));
+        assert!(!is_valid_filename("CONOUT$"));
+        assert!(!is_valid_filename("COM¹.log"));
+        assert!(!is_valid_filename("lpt³.tar.gz"));
         assert!(!is_valid_filename(".hidden")); // Leading dot
     }
 
@@ -985,10 +1009,16 @@ mod tests {
         assert_eq!(agent_slug("ChatGPT"), "chatgpt");
         assert_eq!(agent_slug("gemini-cli"), "gemini");
         assert_eq!(agent_slug("github_copilot"), "copilot");
+        for alias in ["pi_agent", "pi-agent", "piagent", "pi", "  PI Agent  "] {
+            assert_eq!(agent_slug(alias), "pi_agent", "Pi Agent alias {alias:?}");
+        }
+        for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            assert_eq!(agent_slug(alias), "omp", "OMP alias {alias:?}");
+        }
+        assert_ne!(agent_slug("oh_my_pipeline"), "omp");
         assert_eq!(agent_slug("prime_agent"), "prime_agent");
         assert_eq!(agent_slug("prime-agent"), "prime_agent");
         assert_eq!(agent_slug("prime"), "prime_agent");
-        assert_eq!(agent_slug("pi"), "piagent");
         assert_ne!(agent_slug("prime"), agent_slug("pi"));
     }
 
@@ -1122,6 +1152,14 @@ mod tests {
         assert_eq!(
             unique_filename(dir, "bad<name>.HTML"),
             PathBuf::from("/exports/badname.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "CONIN$.html"),
+            PathBuf::from("/exports/conin.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "COM¹.html"),
+            PathBuf::from("/exports/com.html")
         );
         assert_eq!(
             unique_filename(dir, "../../"),

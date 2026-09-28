@@ -3,7 +3,7 @@ commands:
   (global) --verbose/-v  Enable debug logs (overrides auto-quiet)
   Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.
   cass search <query> [OPTIONS]
-    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity, letta_code; run `cass capabilities --json | jq .connectors` for the full 26-connector inventory)
+    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, omp, antigravity; run `cass capabilities --json | jq .connectors` for the full 26-connector inventory)
     --workspace W     Filter by workspace path
     --limit N         Max results (default: 0 = no limit)
     --offset N        Pagination offset (default: 0)
@@ -22,16 +22,18 @@ commands:
     --aggregate F1,F2 Server-side aggregation by fields (agent,workspace,date,match_type)
                       Returns buckets with counts. Reduces tokens by ~99% for overview queries
     --mode lexical|semantic|hybrid  Search mode (default: hybrid; hybrid fails open to lexical when semantic assets are unavailable)
+    --no-maintenance  Strict read-only search: never joins/spawns index maintenance or a daemon; conflicts with --refresh and --daemon
     --robot-meta     Include readiness, requested/realized mode, semantic refinement, fallback tier/reason, cursor, and timing metadata
   cass pack <query> [--robot] [--max-tokens N] [--limit N]
     Build a deterministic, cited answer pack for agent handoffs without external summarization.
     --sessions-from FILE|-  Restrict evidence to newline-delimited session paths; '-' reads stdin.
-    --fields minimal|summary|all,F1,F2  Select top-level pack fields for JSON/TOON output.
+    --field-mask minimal|standard|full|summary|all,F1,F2  Select pack fields for JSON/TOON output (--fields also works).
     --max-sessions N  Cap how many sessions can contribute evidence to the pack.
     --max-evidence N  Cap cited evidence items selected into the pack.
     --max-excerpt-chars N  Bound each excerpt before token estimation.
     --freshness-policy prefer-recent|strict|allow-stale  Evidence freshness policy.
     --freshness-window-seconds N  Freshness window used for stale-evidence warnings and strict filtering.
+    --include-skill-content  Include skill payload excerpts; credentials remain redacted.
     --require-evidence  Return a JSON error envelope instead of an empty successful pack.
     --explain-selection  Include score components and omission diagnostics for audits.
     Output includes health, freshness, privacy, evidence, omitted, and warnings fields.
@@ -67,7 +69,8 @@ commands:
   cass robot-docs <topic>
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
-    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).
+    --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.
+  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.
   cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are
                     source coverage/prune-risk warnings, not proof that archived cass rows are lost.
@@ -103,12 +106,13 @@ commands:
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).
   cass models status [--json]      Semantic model acquisition + cache state.
-  cass models install [--from-file DIR] [--model minilm]  Download + install the MiniLM embedder.
+  cass models install [--from-file DIR] [--model minilm|multilingual-minilm]  Download + install an explicit native embedder.
   cass models remove [--model NAME]  Remove an installed semantic model from disk.
-  cass models verify [--json]      Per-file SHA-256 verification of the installed model.
-  cass models check-update [--json]  Compare installed revision against the pinned registry revision.
+  cass models verify [--model NAME] [--json]  Per-file SHA-256 verification of an explicit installed model.
+  cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.
   cass models backfill             Re-embed conversations against a newly acquired model.
-  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.
+  cass models build-hnsw [--tier fast|quality] [--check] [--force] [--json]  Build/verify the HNSW accelerator for a published semantic artifact (no archive open, no embedding).
+  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
   cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.
@@ -121,5 +125,6 @@ commands:
   cass analytics [status|tokens|tools|models|rebuild|validate] [--json]  Token / tool / model analytics.
   cass import [...]                Import conversation data from external sources.
   cass daemon [...]                Run the semantic model daemon (Unix only).
+  cass schedule [install|uninstall|status|run] [--json]  Keep the index fresh via launchd / systemd user timers (incremental every 15 min + nightly full index & semantic backfill at low priority).
   cass completions <shell>         Emit shell completion script for bash | zsh | fish | powershell.
   cass man                         Emit man page (roff) for the cass binary.

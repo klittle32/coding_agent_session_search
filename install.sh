@@ -14,6 +14,21 @@ QUIET=0
 VERIFY=0
 QUICKSTART=0
 FROM_SOURCE=0
+# Linux prebuilt binaries are cross-built with `cargo zigbuild --target
+# <arch>-unknown-linux-gnu.2.28`, so their glibc ABI floor is PINNED at 2.28
+# rather than inherited from whatever the build host happens to run. This value
+# must track the floor actually measured on the shipped artifacts:
+#
+#   objdump -p cass | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1
+#
+# v0.8.0 measures GLIBC_2.28 on both linux/amd64 and linux/arm64. It was 2.38
+# here while the binaries were built natively, which was both too high (it
+# refused Debian 12 / Ubuntu 22.04 / RHEL 9 / Amazon Linux 2023, whose glibc
+# runs 2.34-2.36 and which the artifacts actually support) and too low (a
+# native build on the current 2.43 hosts needs GLIBC_2.43 for acosf/asinf/
+# coshf/log10f/sinhf, so 2.38-2.42 hosts passed this probe and then failed at
+# load). Probed below.
+MIN_GLIBC="2.28"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -23,8 +38,8 @@ LOCK_FILE=""
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
-warn() { log "\033[1;33m⚠\033[0m $*"; }
-err() { log "\033[0;31m✗\033[0m $*"; }
+warn() { [ "$QUIET" -eq 1 ] && return 0; echo -e "\033[1;33m⚠\033[0m $*" >&2; }
+err() { echo -e "\033[0;31m✗\033[0m $*" >&2; }
 
 strip_url_suffix() {
   local value="$1"
@@ -104,7 +119,7 @@ checksum_matches() {
 }
 
 # Member-safety check for archive validation. Its job is path-traversal /
-# zip-slip defense ONLY: reject absolute paths and any ".." path component.
+# zip-slip defense: reject absolute paths and any ".." path component.
 # It deliberately does NOT restrict membership to the binary name. The
 # installer extracts to a temp dir and copies ONLY the binary to the
 # destination (see `install -m 0755 "$BIN" ...`), so benign siblings bundled
@@ -154,14 +169,29 @@ archive_member_is_installable_binary() {
 validate_archive_members() {
   local archive="$1"
   local member_list="$TMP/archive-members.txt"
+  local metadata_list="$TMP/archive-metadata.txt"
   local member
+  local metadata
+  local entry_type
   local saw_binary=0
 
   case "$TAR" in
-    *.zip) unzip -Z1 "$archive" > "$member_list" ;;
-    *.tar.gz) tar -tzf "$archive" > "$member_list" ;;
-    *.tar.xz) tar -tJf "$archive" > "$member_list" ;;
-    *) tar -tf "$archive" > "$member_list" ;;
+    *.zip)
+      unzip -Z1 "$archive" > "$member_list"
+      unzip -Z -l "$archive" > "$metadata_list"
+      ;;
+    *.tar.gz)
+      tar -tzf "$archive" > "$member_list"
+      tar -tvzf "$archive" > "$metadata_list"
+      ;;
+    *.tar.xz)
+      tar -tJf "$archive" > "$member_list"
+      tar -tvJf "$archive" > "$metadata_list"
+      ;;
+    *)
+      tar -tf "$archive" > "$member_list"
+      tar -tvf "$archive" > "$metadata_list"
+      ;;
   esac || { err "Could not list archive members"; exit 1; }
 
   if [ ! -s "$member_list" ]; then
@@ -179,6 +209,31 @@ validate_archive_members() {
       saw_binary=1
     fi
   done < "$member_list"
+
+  # A safe-looking member name is not enough. Tar and Unix-origin zip files
+  # can encode symlinks, hard links, devices, FIFOs, or sockets. Extracting
+  # those entries before selecting the binary can escape the temporary tree or
+  # create filesystem objects the installer never intended. Official release
+  # archives contain only regular files (and, if packaging grows, directories),
+  # so fail closed on every other entry type.
+  if [[ "$TAR" == *.zip ]]; then
+    if grep -Eq '^[lbcpso][rwxStTs-]{9}[[:space:]]' "$metadata_list"; then
+      err "Archive contains a link or special filesystem entry"
+      exit 1
+    fi
+  else
+    while IFS= read -r metadata; do
+      [ -n "$metadata" ] || continue
+      entry_type="${metadata:0:1}"
+      case "$entry_type" in
+        -|d) ;;
+        *)
+          err "Archive contains unsupported entry type: $entry_type"
+          exit 1
+          ;;
+      esac
+    done < "$metadata_list"
+  fi
 
   if [ "$saw_binary" -ne 1 ]; then
     err "Archive does not contain a cass binary"
@@ -239,47 +294,81 @@ maybe_add_path() {
 }
 
 ensure_rust() {
+  local source_dir="$1"
+
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
-    info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
+    info "Skipping repository toolchain bootstrap (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-  # Require Rust 1.85+ (edition 2024 support) or any future major version (2.x+)
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -qE 'rustc ([2-9]+|1\.(8[5-9]|9[0-9]|[1-9][0-9]{2,}))\.'; then return 0; fi
+
+  # Prefer an existing rustup installation even when the current shell has not
+  # picked up ~/.cargo/bin yet. The checkout's rust-toolchain.toml is the sole
+  # source of truth for the compiler channel and required components.
+  if ! command -v rustup >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  if command -v rustup >/dev/null 2>&1 \
+    && (unset RUSTUP_TOOLCHAIN; cd "$source_dir" && rustup show active-toolchain >/dev/null 2>&1); then
+    return 0
+  fi
+
   if [ "$EASY" -ne 1 ]; then
     if [ -t 0 ]; then
-      echo -n "Install Rust stable via rustup? (y/N): "
+      echo -n "Install the repository-pinned Rust toolchain via rustup? (y/N): "
       read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
+      case "$ans" in
+        y|Y) :;;
+        *) err "The repository-pinned Rust toolchain is required for a source build"; return 1;;
+      esac
     fi
   fi
-  info "Installing rustup (stable)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup component add rustfmt clippy || true
+
+  if ! command -v rustup >/dev/null 2>&1; then
+    info "Installing rustup (without an unrelated default toolchain)"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain none --profile minimal
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+
+  info "Installing the Rust toolchain pinned by rust-toolchain.toml"
+  (unset RUSTUP_TOOLCHAIN; cd "$source_dir" && rustup toolchain install)
 }
 
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] [--quickstart] \
-                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet]
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--from-source] [--quiet]
 EOFU
+}
+
+require_option_value() {
+  if [ "$#" -ge 2 ]; then
+    case "$2" in
+      ""|-h|-q|--*) :;;
+      *) return 0;;
+    esac
+  fi
+  err "$1 requires a value"
+  usage >&2
+  exit 2
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
+    --version) require_option_value "$@"; VERSION="$2"; shift 2;;
+    --dest) require_option_value "$@"; DEST="$2"; shift 2;;
     --system) DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
     --quickstart) QUICKSTART=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+    --artifact-url) require_option_value "$@"; ARTIFACT_URL="$2"; shift 2;;
+    --checksum) require_option_value "$@"; CHECKSUM="$2"; shift 2;;
+    --checksum-url) require_option_value "$@"; CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
     -h|--help) usage; exit 0;;
-    *) shift;;
+    --*) err "Unknown option: $1"; usage >&2; exit 2;;
+    *) err "Unexpected argument: $1"; usage >&2; exit 2;;
   esac
 done
 
@@ -327,6 +416,59 @@ case "$TARGET" in
 esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
+# glibc probe (WS-G.2): a prebuilt Linux binary on a host older than
+# MIN_GLIBC fails at load time with a linker error after a successful-looking
+# install. Detect it here and take the source route instead. An explicit
+# --artifact-url is honored as written (the operator asked for that file).
+last_major_minor_in_line() {
+  # Print the LAST `<digits>.<digits>` token of the first line of $1, or
+  # nothing. Builtins only: no pipeline, so nothing can close early.
+  local first="${1%%$'\n'*}" rest version=""
+  rest="$first"
+  while [[ "$rest" =~ ([0-9]+\.[0-9]+)(.*) ]]; do
+    version="${BASH_REMATCH[1]}"
+    rest="${BASH_REMATCH[2]}"
+  done
+  printf '%s' "$version"
+}
+host_glibc_version() {
+  # GH #444: `ldd --version` is a shell script on glibc that prints its banner
+  # with several separate writes. The old `ldd | head -n 1 | grep | tail`
+  # pipeline let `head` close its end after the first line, `ldd` then took
+  # SIGPIPE (exit 141), and `set -o pipefail` turned that race into an
+  # installer failure roughly half the time. Capture the whole banner once
+  # (no early-closing reader), then parse it in-process; fall back to
+  # `getconf GNU_LIBC_VERSION` when ldd is absent or prints nothing usable
+  # (e.g. musl's ldd, which prints usage to stderr and exits non-zero).
+  local banner="" version=""
+  banner=$(LC_ALL=C ldd --version 2>/dev/null) || banner=""
+  version=$(last_major_minor_in_line "$banner")
+  if [ -z "$version" ]; then
+    banner=$(LC_ALL=C getconf GNU_LIBC_VERSION 2>/dev/null) || banner=""
+    version=$(last_major_minor_in_line "$banner")
+  fi
+  printf '%s' "$version"
+}
+glibc_at_least() {
+  # $1 = required, $2 = host; true when host >= required (numeric major.minor)
+  req_major=${1%%.*}; req_minor=${1#*.}
+  host_major=${2%%.*}; host_minor=${2#*.}
+  [ "$host_major" -gt "$req_major" ] 2>/dev/null && return 0
+  [ "$host_major" -eq "$req_major" ] 2>/dev/null && [ "$host_minor" -ge "$req_minor" ] 2>/dev/null
+}
+if [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
+  case "$TARGET" in
+    linux-*musl*) : ;;
+    linux-*)
+      HOST_GLIBC=$(host_glibc_version)
+      if [ -n "$HOST_GLIBC" ] && ! glibc_at_least "$MIN_GLIBC" "$HOST_GLIBC"; then
+        warn "Host glibc ${HOST_GLIBC} is older than ${MIN_GLIBC}, which the prebuilt Linux binary requires; falling back to build-from-source (pass --artifact-url to force a prebuilt artifact)"
+        FROM_SOURCE=1
+      fi
+      ;;
+    *) : ;;
+  esac
+fi
 TAR=""
 URL=""
 if [ "$FROM_SOURCE" -eq 0 ]; then
@@ -384,28 +526,38 @@ trap cleanup EXIT
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+    if [ -n "$ARTIFACT_URL" ]; then
+      err "Could not download explicitly requested artifact: $ARTIFACT_URL"
+      exit 1
+    fi
     warn "Artifact download failed; falling back to build-from-source"
     FROM_SOURCE=1
   fi
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git and a working Rust stable toolchain)"
-  ensure_rust
+  info "Building from source (requires git and the repository-pinned Rust toolchain)"
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (cd "$TMP/src" && cargo build --locked --release)
+  ensure_rust "$TMP/src"
+  (unset RUSTUP_TOOLCHAIN; cd "$TMP/src" && cargo build --locked --release)
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
-  if [ ! -x "$BIN" ]; then
+  if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass"
   fi
-  if [ ! -x "$BIN" ]; then
+  if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass.exe"
   fi
-  [ -x "$BIN" ] || { err "Build failed"; exit 1; }
+  [ -f "$BIN" ] && [ -x "$BIN" ] || { err "Build failed"; exit 1; }
   install -m 0755 "$BIN" "$DEST/$INSTALL_BASENAME"
   ok "Installed to $DEST/$INSTALL_BASENAME (source build)"
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then "$DEST/$INSTALL_BASENAME" --version || true; ok "Self-test complete"; fi
+  if [ "$VERIFY" -eq 1 ]; then
+    if ! "$DEST/$INSTALL_BASENAME" --version; then
+      err "Self-test failed: $DEST/$INSTALL_BASENAME --version exited non-zero"
+      exit 1
+    fi
+    ok "Self-test complete"
+  fi
   if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/$INSTALL_BASENAME" index --full || warn "index --full failed"; fi
   ok "Done. Run: cass"
   exit 0
@@ -455,38 +607,41 @@ case "$TAR" in
   *) tar -xf "$TMP/$TAR" -C "$TMP" ;;
 esac
 BIN="$TMP/$INSTALL_BASENAME"
-if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ -n "$TARGET" ]; then
   BIN="$TMP/cass-${TARGET}/$INSTALL_BASENAME"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
   BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -f "$TMP/cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -f "$TMP/cass.exe" ]; then
   BIN="$TMP/cass.exe"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
   BIN="$TMP/cass-${TARGET}/cass.exe"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search.exe" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
+   if [ -f "$BIN" ] && [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search.exe' binary instead of 'cass.exe'; installing it as 'cass.exe'"
    fi
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
+   if [ -f "$BIN" ] && [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
    fi
 fi
 
-[ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
+[ -f "$BIN" ] && [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 install -m 0755 "$BIN" "$DEST/$INSTALL_BASENAME"
 ok "Installed to $DEST/$INSTALL_BASENAME"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/$INSTALL_BASENAME" --version || true
+  if ! "$DEST/$INSTALL_BASENAME" --version; then
+    err "Self-test failed: $DEST/$INSTALL_BASENAME --version exited non-zero"
+    exit 1
+  fi
   ok "Self-test complete"
 fi
 

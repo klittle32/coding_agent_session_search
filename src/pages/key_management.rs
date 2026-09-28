@@ -17,9 +17,11 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, MIN_RECOVERY_SECRET_BYTES, SlotType,
+    decompress_archive_chunk, load_config, max_archive_ciphertext_chunk_size,
     validate_supported_payload_format,
 };
+use crate::pages::errors::DecryptError;
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -29,13 +31,17 @@ use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
-use serde::Serialize;
-use std::fs::File;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tracing::info;
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Argon2id default parameters
 #[cfg(not(test))]
@@ -54,6 +60,10 @@ const ARGON2_PARALLELISM: u32 = 1;
 /// Schema version for encryption
 const SCHEMA_VERSION: u8 = 2;
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
+const KEY_MUTATION_JOURNAL_FORMAT: &str = "cass-pages-key-mutation-v1";
+const KEY_MUTATION_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
+const KEY_MUTATION_TREE_ENTRY_LIMIT: usize = 1_000_000;
+const KEY_MUTATION_TREE_DEPTH_LIMIT: usize = 128;
 const REQUIRED_SITE_FILES: &[&str] = &[
     "index.html",
     "config.json",
@@ -64,6 +74,60 @@ const REQUIRED_SITE_FILES: &[&str] = &[
     "robots.txt",
     ".nojekyll",
 ];
+
+#[derive(Debug, Clone)]
+struct KeyMutationTarget {
+    live_root: PathBuf,
+    site_relative: PathBuf,
+    lock_path: PathBuf,
+    journal_path: PathBuf,
+}
+
+impl KeyMutationTarget {
+    fn live_site_dir(&self) -> PathBuf {
+        self.live_root.join(&self.site_relative)
+    }
+
+    fn staged_site_dir(&self, staged_root: &Path) -> PathBuf {
+        staged_root.join(&self.site_relative)
+    }
+}
+
+struct KeyMutationGuard {
+    target: KeyMutationTarget,
+    lock_identity: crate::franken_sync::FileIdentity,
+    lock_file: File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEvidence {
+    digest: String,
+    entries: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyMutationJournal {
+    format: String,
+    staged_file_name: String,
+    backup_file_name: String,
+    prior_digest: String,
+    candidate_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredKeyMutation {
+    None,
+    RolledBack,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMutationStageMode {
+    PreserveSite,
+    ReplaceEncryptedPayload,
+}
 
 fn max_encryptable_plaintext_bytes(chunk_size: usize) -> u64 {
     MAX_ARCHIVE_CHUNKS.saturating_mul(chunk_size as u64)
@@ -89,6 +153,1241 @@ fn ensure_can_write_archive_chunk(chunk_index: u32, chunk_size: usize) -> Result
         );
     }
     Ok(())
+}
+
+fn validate_password_input(password: &str) -> Result<()> {
+    if password.is_empty() || password.trim().is_empty() {
+        bail!("Password cannot be empty or whitespace-only");
+    }
+    Ok(())
+}
+
+fn key_mutation_sidecar_path(root: &Path, suffix: &str) -> PathBuf {
+    let root_name = root
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages-archive"));
+    let mut sidecar_name = std::ffi::OsString::from(".");
+    sidecar_name.push(root_name);
+    sidecar_name.push(suffix);
+    root.with_file_name(sidecar_name)
+}
+
+fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget> {
+    let (live_root, site_relative) = if requested_path
+        .file_name()
+        .is_some_and(|name| name == "site")
+    {
+        let parent = requested_path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "site directory has no parent publication root: {}",
+                requested_path.display()
+            )
+        })?;
+        (parent.to_path_buf(), PathBuf::from("site"))
+    } else {
+        match std::fs::symlink_metadata(requested_path.join("site")) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                (requested_path.to_path_buf(), PathBuf::from("site"))
+            }
+            Ok(_) => (requested_path.to_path_buf(), PathBuf::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (requested_path.to_path_buf(), PathBuf::new())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed inspecting Pages key-mutation site under {}",
+                        requested_path.display()
+                    )
+                });
+            }
+        }
+    };
+
+    Ok(KeyMutationTarget {
+        lock_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation.lock"),
+        journal_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation-in-progress.json"),
+        live_root,
+        site_relative,
+    })
+}
+
+fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
+    let lock_exists = match std::fs::symlink_metadata(&target.lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            {
+                if metadata.nlink() != 1 {
+                    bail!(
+                        "Pages key-mutation lock {} has {} hard links; exclusive pathname ownership is not provable",
+                        target.lock_path.display(),
+                        metadata.nlink()
+                    );
+                }
+                if key_publication_mode(&metadata) & 0o077 != 0 {
+                    bail!(
+                        "Pages key-mutation lock is not owner-only: {}",
+                        target.lock_path.display()
+                    );
+                }
+            }
+            true
+        }
+        Ok(_) => bail!(
+            "Pages key-mutation lock is not a regular file: {}",
+            target.lock_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages key-mutation lock {}",
+                    target.lock_path.display()
+                )
+            });
+        }
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if lock_exists {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock_file = options.open(&target.lock_path).with_context(|| {
+        format!(
+            "failed opening Pages key-mutation lock {}",
+            target.lock_path.display()
+        )
+    })?;
+    let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
+        .with_context(|| {
+            format!(
+                "failed identifying Pages key-mutation lock {}",
+                target.lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for Pages key-mutation lock {}",
+                target.lock_path.display()
+            )
+        })?;
+
+    // std's try_lock reports contention as WouldBlock on every platform; fs2
+    // surfaced Windows contention as raw ERROR_LOCK_VIOLATION (2l1b0.74).
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another Pages key mutation is already active for {}; lock contention at {}",
+            target.live_root.display(),
+            target.lock_path.display()
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed acquiring Pages key-mutation lock {}",
+                    target.lock_path.display()
+                )
+            });
+        }
+    }
+
+    let guard = KeyMutationGuard {
+        target,
+        lock_identity,
+        lock_file,
+    };
+    require_key_mutation_guard(&guard)?;
+    Ok(guard)
+}
+
+fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
+    let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
+        .context("failed re-identifying held Pages key-mutation lock")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for held Pages key-mutation lock {}",
+                guard.target.lock_path.display()
+            )
+        })?;
+    if held_identity != guard.lock_identity {
+        bail!(
+            "held Pages key-mutation lock {} changed identity",
+            guard.target.lock_path.display()
+        );
+    }
+
+    let metadata = std::fs::symlink_metadata(&guard.target.lock_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages key-mutation lock {}",
+            guard.target.lock_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages key-mutation lock {} is no longer a regular file",
+            guard.target.lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-mutation lock {} has {} hard links; refused publication",
+                guard.target.lock_path.display(),
+                metadata.nlink()
+            );
+        }
+        if key_publication_mode(&metadata) & 0o077 != 0 {
+            bail!(
+                "Pages key-mutation lock is no longer owner-only: {}",
+                guard.target.lock_path.display()
+            );
+        }
+    }
+    let probe = File::open(&guard.target.lock_path).with_context(|| {
+        format!(
+            "failed re-opening Pages key-mutation lock {}",
+            guard.target.lock_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
+        .context("failed re-identifying Pages key-mutation lock pathname")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable pathname identity for Pages key-mutation lock {}",
+                guard.target.lock_path.display()
+            )
+        })?;
+    if path_identity != guard.lock_identity {
+        bail!(
+            "Pages key-mutation lock {} was replaced after acquisition",
+            guard.target.lock_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn random_key_mutation_sidecar_path(root: &Path, role: &str) -> PathBuf {
+    let mut random = [0_u8; 16];
+    rand::rng().fill_bytes(&mut random);
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages-archive");
+    root.with_file_name(format!(
+        ".{root_name}.pages-key-{role}.{}",
+        hex::encode(random)
+    ))
+}
+
+#[cfg(unix)]
+fn key_publication_mode(metadata: &std::fs::Metadata) -> u32 {
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn key_publication_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0
+}
+
+fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
+    let root_metadata = std::fs::symlink_metadata(root).with_context(|| {
+        format!(
+            "failed inspecting Pages key-publication tree {}",
+            root.display()
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        bail!(
+            "Pages key-publication tree must be a real directory: {}",
+            root.display()
+        );
+    }
+    let root_handle = File::open(root).with_context(|| {
+        format!(
+            "failed opening Pages key-publication root {}",
+            root.display()
+        )
+    })?;
+    let root_identity =
+        crate::franken_sync::FileIdentity::from_file(&root_handle)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for Pages key-publication root {}",
+                root.display()
+            )
+        })?;
+    let root_mode = key_publication_mode(&root_metadata);
+
+    let mut paths = Vec::new();
+    collect_key_publication_paths(root, root, &mut paths)?;
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut digest = Sha256::new();
+    digest.update(b"root\0");
+    digest.update(root_mode.to_be_bytes());
+    let mut total_bytes = 0_u64;
+    for (relative, path) in &paths {
+        let metadata = std::fs::symlink_metadata(path).with_context(|| {
+            format!("failed inspecting key-publication entry {}", path.display())
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            bail!(
+                "Pages key-publication tree must not contain symlinks: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            digest.update(b"directory\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(key_publication_mode(&metadata).to_be_bytes());
+            continue;
+        }
+        if !file_type.is_file() {
+            bail!(
+                "Pages key-publication tree contains a non-regular entry: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-publication file {} has {} hard links; exact ownership is not provable",
+                path.display(),
+                metadata.nlink()
+            );
+        }
+
+        let mut file = File::open(path)
+            .with_context(|| format!("failed opening key-publication file {}", path.display()))?;
+        let identity = crate::franken_sync::FileIdentity::from_file(&file)
+            .with_context(|| format!("failed identifying key-publication file {}", path.display()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem does not expose a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        let opened_metadata = file.metadata()?;
+        let mut file_digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            file_digest.update(&buffer[..read]);
+        }
+        let hashed_metadata = file.metadata()?;
+        if hashed_metadata.len() != opened_metadata.len() {
+            bail!(
+                "key-publication file changed size while hashing: {}",
+                path.display()
+            );
+        }
+        let probe = File::open(path)?;
+        let path_identity =
+            crate::franken_sync::FileIdentity::from_file(&probe)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem stopped exposing a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        if path_identity != identity {
+            bail!(
+                "key-publication file changed identity while hashing: {}",
+                path.display()
+            );
+        }
+
+        total_bytes = total_bytes
+            .checked_add(opened_metadata.len())
+            .context("Pages key-publication byte count overflowed u64")?;
+        digest.update(b"file\0");
+        digest.update(relative.as_bytes());
+        digest.update(b"\0");
+        digest.update(key_publication_mode(&metadata).to_be_bytes());
+        digest.update(opened_metadata.len().to_be_bytes());
+        digest.update(file_digest.finalize());
+    }
+
+    let final_root_metadata = std::fs::symlink_metadata(root)?;
+    if final_root_metadata.file_type().is_symlink()
+        || !final_root_metadata.file_type().is_dir()
+        || key_publication_mode(&final_root_metadata) != root_mode
+    {
+        bail!(
+            "Pages key-publication root changed type or permissions while inspected: {}",
+            root.display()
+        );
+    }
+    let final_root_handle = File::open(root)?;
+    let final_root_identity = crate::franken_sync::FileIdentity::from_file(&final_root_handle)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for Pages key-publication root {}",
+                root.display()
+            )
+        })?;
+    if final_root_identity != root_identity {
+        bail!(
+            "Pages key-publication root changed identity while inspected: {}",
+            root.display()
+        );
+    }
+
+    Ok(TreeEvidence {
+        digest: hex::encode(digest.finalize()),
+        entries: paths.len(),
+        bytes: total_bytes,
+    })
+}
+
+fn collect_key_publication_paths(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    let mut directories = vec![(directory.to_path_buf(), 0_usize)];
+    while let Some((directory, depth)) = directories.pop() {
+        if depth > KEY_MUTATION_TREE_DEPTH_LIMIT {
+            bail!(
+                "Pages key-publication tree exceeds the {}-directory depth bound at {}",
+                KEY_MUTATION_TREE_DEPTH_LIMIT,
+                directory.display()
+            );
+        }
+        for entry in std::fs::read_dir(&directory).with_context(|| {
+            format!(
+                "failed reading key-publication tree {}",
+                directory.display()
+            )
+        })? {
+            if paths.len() >= KEY_MUTATION_TREE_ENTRY_LIMIT {
+                bail!(
+                    "Pages key-publication tree exceeds the {}-entry validation bound",
+                    KEY_MUTATION_TREE_ENTRY_LIMIT
+                );
+            }
+            let entry = entry?;
+            let path = entry.path();
+            let relative_path = path.strip_prefix(root)?;
+            let relative = relative_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Pages key-publication entry is not valid UTF-8: {}",
+                    relative_path.display()
+                )
+            })?;
+            paths.push((relative.replace('\\', "/"), path.clone()));
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                directories.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allocate_key_mutation_staging_root(live_root: &Path) -> Result<PathBuf> {
+    for _ in 0..64 {
+        let path = random_key_mutation_sidecar_path(live_root, "staged");
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        match builder.create(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed creating Pages key-mutation staging root {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed allocating a unique Pages key-mutation staging root")
+}
+
+fn is_private_key_artifact_path(target: &KeyMutationTarget, relative: &Path) -> bool {
+    !target.site_relative.as_os_str().is_empty() && relative.starts_with("private")
+}
+
+fn rotation_replaces_site_entry(target: &KeyMutationTarget, relative: &Path) -> bool {
+    let site_relative = if target.site_relative.as_os_str().is_empty() {
+        relative
+    } else {
+        let Ok(relative) = relative.strip_prefix(&target.site_relative) else {
+            return false;
+        };
+        relative
+    };
+    site_relative.components().count() == 1
+        && matches!(
+            site_relative.to_str(),
+            Some("payload" | "blobs" | "config.json" | "integrity.json")
+        )
+}
+
+fn stage_key_mutation_tree(
+    target: &KeyMutationTarget,
+    mode: KeyMutationStageMode,
+) -> Result<(PathBuf, TreeEvidence)> {
+    let prior_evidence = inspect_key_publication_tree(&target.live_root)?;
+    let staged_root = allocate_key_mutation_staging_root(&target.live_root)?;
+    let canonical_live_root = target.live_root.canonicalize().with_context(|| {
+        format!(
+            "failed resolving Pages key-mutation root {}",
+            target.live_root.display()
+        )
+    })?;
+
+    let copy_result = copy_key_mutation_tree_recursive(
+        target,
+        &target.live_root,
+        &staged_root,
+        &target.live_root,
+        &canonical_live_root,
+        mode,
+        0,
+    );
+    if let Err(error) = copy_result {
+        let cleanup_error = remove_owned_key_mutation_tree(&staged_root, None).err();
+        return match cleanup_error {
+            Some(cleanup_error) => Err(error.context(format!(
+                "failed cleaning rejected key-mutation staging root: {cleanup_error:#}"
+            ))),
+            None => Err(error),
+        };
+    }
+
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &staged_root,
+        std::fs::Permissions::from_mode(key_publication_mode(&std::fs::metadata(
+            &target.live_root,
+        )?)),
+    )?;
+
+    Ok((staged_root, prior_evidence))
+}
+
+fn copy_key_mutation_tree_recursive(
+    target: &KeyMutationTarget,
+    source_directory: &Path,
+    staged_root: &Path,
+    source_root: &Path,
+    canonical_source_root: &Path,
+    mode: KeyMutationStageMode,
+    depth: usize,
+) -> Result<()> {
+    if depth > KEY_MUTATION_TREE_DEPTH_LIMIT {
+        bail!(
+            "Pages key-mutation source exceeds the {}-directory depth bound at {}",
+            KEY_MUTATION_TREE_DEPTH_LIMIT,
+            source_directory.display()
+        );
+    }
+    for entry in std::fs::read_dir(source_directory).with_context(|| {
+        format!(
+            "failed reading Pages key-mutation source {}",
+            source_directory.display()
+        )
+    })? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path.strip_prefix(source_root)?;
+        if mode == KeyMutationStageMode::ReplaceEncryptedPayload
+            && rotation_replaces_site_entry(target, relative)
+        {
+            continue;
+        }
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            bail!(
+                "refusing to stage unsafe Pages key-mutation path {}",
+                relative.display()
+            );
+        }
+        let destination = staged_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&source_path)?;
+        let file_type = metadata.file_type();
+        let is_private = is_private_key_artifact_path(target, relative);
+
+        if file_type.is_symlink() {
+            if is_private {
+                bail!(
+                    "private key artifact must not be a symlink: {}",
+                    source_path.display()
+                );
+            }
+            let canonical_target = source_path.canonicalize().with_context(|| {
+                format!(
+                    "failed resolving symlinked Pages key-mutation source {}",
+                    source_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_source_root) {
+                bail!(
+                    "refusing to stage Pages key-mutation symlink outside archive root: {}",
+                    source_path.display()
+                );
+            }
+            if !std::fs::metadata(&canonical_target)?.file_type().is_file() {
+                bail!(
+                    "Pages key-mutation symlink must resolve to a regular file: {}",
+                    source_path.display()
+                );
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&canonical_target, &destination)?;
+            continue;
+        }
+
+        if file_type.is_dir() {
+            std::fs::create_dir(&destination).with_context(|| {
+                format!(
+                    "failed creating staged key-mutation directory {}",
+                    destination.display()
+                )
+            })?;
+            #[cfg(unix)]
+            std::fs::set_permissions(
+                &destination,
+                std::fs::Permissions::from_mode(if is_private {
+                    0o700
+                } else {
+                    key_publication_mode(&metadata)
+                }),
+            )?;
+            copy_key_mutation_tree_recursive(
+                target,
+                &source_path,
+                staged_root,
+                source_root,
+                canonical_source_root,
+                mode,
+                depth + 1,
+            )?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            bail!(
+                "Pages key-mutation source contains a non-regular entry: {}",
+                source_path.display()
+            );
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-mutation source file {} has {} hard links; exact ownership is not provable",
+                source_path.display(),
+                metadata.nlink()
+            );
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source_path, &destination).with_context(|| {
+            format!(
+                "failed copying Pages key-mutation source {} to {}",
+                source_path.display(),
+                destination.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &destination,
+            std::fs::Permissions::from_mode(if is_private {
+                0o600
+            } else {
+                key_publication_mode(&metadata)
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn direct_child_from_journal(
+    root: &Path,
+    file_name: &str,
+    role: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let candidate = Path::new(file_name);
+    let mut components = candidate.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        bail!("{label} is not a plain file name: {file_name}");
+    };
+    if components.next().is_some() {
+        bail!("{label} contains path separators: {file_name}");
+    }
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages-archive");
+    let expected_prefix = format!(".{root_name}.pages-key-{role}.");
+    let Some(nonce) = file_name.strip_prefix(&expected_prefix) else {
+        bail!("{label} does not carry the owned {role} prefix: {file_name}");
+    };
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} does not carry a 128-bit lowercase hexadecimal nonce");
+    }
+    Ok(root.with_file_name(name))
+}
+
+fn write_key_mutation_journal(
+    guard: &KeyMutationGuard,
+    staged_root: &Path,
+    backup_root: &Path,
+    prior: &TreeEvidence,
+    candidate: &TreeEvidence,
+) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(_) => bail!(
+            "Pages key-mutation recovery journal already exists: {}",
+            guard.target.journal_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let staged_file_name = staged_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("key-mutation staging name is not UTF-8"))?;
+    let backup_file_name = backup_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("key-mutation backup name is not UTF-8"))?;
+    let journal = KeyMutationJournal {
+        format: KEY_MUTATION_JOURNAL_FORMAT.to_string(),
+        staged_file_name: staged_file_name.to_string(),
+        backup_file_name: backup_file_name.to_string(),
+        prior_digest: prior.digest.clone(),
+        candidate_digest: candidate.digest.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&journal)?;
+    if bytes.len() as u64 > KEY_MUTATION_JOURNAL_MAX_BYTES {
+        bail!("Pages key-mutation recovery journal exceeds its size bound");
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&guard.target.journal_path).with_context(|| {
+        format!(
+            "failed creating Pages key-mutation recovery journal {}",
+            guard.target.journal_path.display()
+        )
+    })?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_parent_directory(&guard.target.journal_path)
+}
+
+fn read_key_mutation_journal(guard: &KeyMutationGuard) -> Result<Option<KeyMutationJournal>> {
+    require_key_mutation_guard(guard)?;
+    let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages key-mutation recovery journal is not a regular file: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-mutation recovery journal {} has {} hard links",
+                guard.target.journal_path.display(),
+                metadata.nlink()
+            );
+        }
+        if key_publication_mode(&metadata) & 0o077 != 0 {
+            bail!(
+                "Pages key-mutation recovery journal is not owner-only: {}",
+                guard.target.journal_path.display()
+            );
+        }
+    }
+    if metadata.len() > KEY_MUTATION_JOURNAL_MAX_BYTES {
+        bail!(
+            "Pages key-mutation recovery journal exceeds its {} byte limit: {}",
+            KEY_MUTATION_JOURNAL_MAX_BYTES,
+            guard.target.journal_path.display()
+        );
+    }
+    let mut file = File::open(&guard.target.journal_path)?;
+    let identity = crate::franken_sync::FileIdentity::from_file(&file)?
+        .ok_or_else(|| anyhow::anyhow!("filesystem does not expose a stable journal identity"))?;
+    let opened_metadata = file.metadata()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(KEY_MUTATION_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let hashed_metadata = file.metadata()?;
+    if hashed_metadata.len() != opened_metadata.len() || bytes.len() as u64 != metadata.len() {
+        bail!(
+            "Pages key-mutation recovery journal changed size while read: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    let path_probe = File::open(&guard.target.journal_path)?;
+    let path_identity =
+        crate::franken_sync::FileIdentity::from_file(&path_probe)?.ok_or_else(|| {
+            anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
+        })?;
+    if path_identity != identity {
+        bail!(
+            "Pages key-mutation recovery journal changed identity while read: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    let journal: KeyMutationJournal = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed parsing Pages key-mutation recovery journal {}",
+            guard.target.journal_path.display()
+        )
+    })?;
+    if journal.format != KEY_MUTATION_JOURNAL_FORMAT {
+        bail!(
+            "unrecognized Pages key-mutation recovery journal format at {}",
+            guard.target.journal_path.display()
+        );
+    }
+    for (label, digest) in [
+        ("prior", journal.prior_digest.as_str()),
+        ("candidate", journal.candidate_digest.as_str()),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("Pages key-mutation journal {label} digest is not canonical SHA-256");
+        }
+    }
+    Ok(Some(journal))
+}
+
+fn optional_key_tree_evidence(path: &Path) -> Result<Option<TreeEvidence>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            inspect_key_publication_tree(path).map(Some)
+        }
+        Ok(_) => bail!(
+            "Pages key-mutation recovery path is not a real directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_owned_key_mutation_tree(path: &Path, expected_digest: Option<&str>) -> Result<()> {
+    let Some(evidence) = optional_key_tree_evidence(path)? else {
+        return Ok(());
+    };
+    if let Some(expected_digest) = expected_digest
+        && evidence.digest != expected_digest
+    {
+        bail!(
+            "refusing to remove key-mutation tree {} because its digest drifted",
+            path.display()
+        );
+    }
+    std::fs::remove_dir_all(path).with_context(|| {
+        format!(
+            "failed removing owned Pages key-mutation tree {}",
+            path.display()
+        )
+    })?;
+    sync_parent_directory(path)
+}
+
+fn remove_key_mutation_journal(guard: &KeyMutationGuard) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to remove non-file key-mutation journal {}",
+            guard.target.journal_path.display()
+        );
+    }
+    std::fs::remove_file(&guard.target.journal_path)?;
+    sync_parent_directory(&guard.target.journal_path)
+}
+
+fn evidence_has_digest(evidence: &Option<TreeEvidence>, digest: &str) -> bool {
+    evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.digest == digest)
+}
+
+fn recover_interrupted_key_mutation(guard: &KeyMutationGuard) -> Result<RecoveredKeyMutation> {
+    let Some(journal) = read_key_mutation_journal(guard)? else {
+        return Ok(RecoveredKeyMutation::None);
+    };
+    let staged_root = direct_child_from_journal(
+        &guard.target.live_root,
+        &journal.staged_file_name,
+        "staged",
+        "key-mutation staged path",
+    )?;
+    let backup_root = direct_child_from_journal(
+        &guard.target.live_root,
+        &journal.backup_file_name,
+        "backup",
+        "key-mutation backup path",
+    )?;
+    if staged_root == guard.target.live_root
+        || backup_root == guard.target.live_root
+        || staged_root == backup_root
+    {
+        bail!("Pages key-mutation recovery journal aliases publication paths");
+    }
+
+    let live = optional_key_tree_evidence(&guard.target.live_root)?;
+    let staged = optional_key_tree_evidence(&staged_root)?;
+    let backup = optional_key_tree_evidence(&backup_root)?;
+
+    if evidence_has_digest(&live, &journal.prior_digest)
+        && evidence_has_digest(&staged, &journal.candidate_digest)
+        && backup.is_none()
+    {
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::RolledBack);
+    }
+
+    if evidence_has_digest(&live, &journal.candidate_digest) {
+        let linux_prior = evidence_has_digest(&staged, &journal.prior_digest) && backup.is_none();
+        let rename_pair_prior =
+            staged.is_none() && evidence_has_digest(&backup, &journal.prior_digest);
+        if linux_prior {
+            remove_owned_key_mutation_tree(&staged_root, Some(&journal.prior_digest))?;
+        } else if rename_pair_prior {
+            remove_owned_key_mutation_tree(&backup_root, Some(&journal.prior_digest))?;
+        } else {
+            bail!(
+                "ambiguous completed Pages key mutation: live candidate is present but its exact prior generation is not owned by the recovery journal"
+            );
+        }
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::Committed);
+    }
+
+    if live.is_none()
+        && evidence_has_digest(&backup, &journal.prior_digest)
+        && evidence_has_digest(&staged, &journal.candidate_digest)
+    {
+        std::fs::rename(&backup_root, &guard.target.live_root).with_context(|| {
+            format!(
+                "failed restoring prior Pages archive {} from key-mutation backup {}",
+                guard.target.live_root.display(),
+                backup_root.display()
+            )
+        })?;
+        sync_parent_directory(&guard.target.live_root)?;
+        let restored = inspect_key_publication_tree(&guard.target.live_root)?;
+        if restored.digest != journal.prior_digest {
+            bail!(
+                "restored Pages key-mutation generation at {} failed exact digest verification",
+                guard.target.live_root.display()
+            );
+        }
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::RolledBack);
+    }
+
+    bail!(
+        "ambiguous interrupted Pages key mutation at {}; live, staged, and backup trees were preserved for inspection",
+        guard.target.live_root.display()
+    )
+}
+
+fn begin_key_mutation(requested_path: &Path) -> Result<KeyMutationGuard> {
+    let target = derive_key_mutation_target(requested_path)?;
+    let mut guard = open_key_mutation_lock(target)?;
+    let recovered = recover_interrupted_key_mutation(&guard)?;
+
+    if guard.target.site_relative.as_os_str().is_empty() {
+        match std::fs::symlink_metadata(guard.target.live_root.join("site")) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                guard.target.site_relative = PathBuf::from("site");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let resolved_site = super::resolve_site_dir(&guard.target.live_root)?;
+    if resolved_site != guard.target.live_site_dir() {
+        bail!(
+            "Pages key-mutation target resolved inconsistently: expected {}, got {}",
+            guard.target.live_site_dir().display(),
+            resolved_site.display()
+        );
+    }
+    if recovered == RecoveredKeyMutation::Committed {
+        bail!(
+            "Recovered a previously committed Pages key mutation at {}; inspect the current key slots before requesting another mutation",
+            guard.target.live_root.display()
+        );
+    }
+    Ok(guard)
+}
+
+fn verify_published_key_tree(path: &Path, expected: &TreeEvidence) -> Result<()> {
+    let actual = inspect_key_publication_tree(path)?;
+    if &actual != expected {
+        bail!(
+            "published Pages key-mutation tree failed exact verification: expected digest {} ({} entries, {} bytes), got {} ({} entries, {} bytes)",
+            expected.digest,
+            expected.entries,
+            expected.bytes,
+            actual.digest,
+            actual.entries,
+            actual.bytes
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_committed_key_mutation(guard: &KeyMutationGuard, prior_path: &Path, prior_digest: &str) {
+    if let Err(error) = remove_owned_key_mutation_tree(prior_path, Some(prior_digest)) {
+        tracing::warn!(
+            live_root = %guard.target.live_root.display(),
+            retained_prior = %prior_path.display(),
+            error = %format!("{error:#}"),
+            "Pages key mutation committed and verified, but its prior generation remains retained"
+        );
+        return;
+    }
+    if let Err(error) = remove_key_mutation_journal(guard) {
+        tracing::warn!(
+            live_root = %guard.target.live_root.display(),
+            journal = %guard.target.journal_path.display(),
+            error = %format!("{error:#}"),
+            "Pages key mutation committed and verified, but its recovery journal remains retained"
+        );
+    }
+}
+
+fn publish_staged_key_mutation(
+    guard: &KeyMutationGuard,
+    staged_root: &Path,
+    prior: &TreeEvidence,
+    candidate: &TreeEvidence,
+) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    let current = inspect_key_publication_tree(&guard.target.live_root)?;
+    if &current != prior {
+        bail!(
+            "Pages archive changed while its key mutation was staged; live generation was preserved"
+        );
+    }
+    verify_published_key_tree(staged_root, candidate)?;
+
+    let backup_root = random_key_mutation_sidecar_path(&guard.target.live_root, "backup");
+    if std::fs::symlink_metadata(&backup_root).is_ok() {
+        bail!(
+            "fresh Pages key-mutation backup path unexpectedly exists: {}",
+            backup_root.display()
+        );
+    }
+    write_key_mutation_journal(guard, staged_root, &backup_root, prior, candidate)?;
+    require_key_mutation_guard(guard)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        match crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root).with_context(|| {
+                    format!(
+                        "Pages key mutation is live at {}, but its atomic exchange could not be durably synced; prior generation retained at {}",
+                        guard.target.live_root.display(),
+                        staged_root.display()
+                    )
+                })?;
+                if let Err(verification_error) =
+                    verify_published_key_tree(&guard.target.live_root, candidate)
+                {
+                    crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root)
+                        .context(
+                            "published Pages key tree failed verification and atomic rollback failed",
+                        )?;
+                    sync_parent_directory(&guard.target.live_root)?;
+                    verify_published_key_tree(&guard.target.live_root, prior)?;
+                    remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                    remove_key_mutation_journal(guard)?;
+                    return Err(verification_error.context(
+                        "published Pages key tree failed verification; restored prior generation",
+                    ));
+                }
+                cleanup_committed_key_mutation(guard, staged_root, &prior.digest);
+                return Ok(());
+            }
+            Err(error) if crate::indexer::linux_atomic_exchange_is_unsupported(&error) => {
+                tracing::info!(
+                    live_root = %guard.target.live_root.display(),
+                    "atomic Pages key-mutation exchange is unsupported; using recoverable rename-pair publication"
+                );
+            }
+            Err(error) => {
+                return Err(error.context("failed atomically publishing Pages key mutation"));
+            }
+        }
+    }
+
+    std::fs::rename(&guard.target.live_root, &backup_root).with_context(|| {
+        format!(
+            "failed parking prior Pages archive {} at {}",
+            guard.target.live_root.display(),
+            backup_root.display()
+        )
+    })?;
+    if let Err(sync_error) = sync_parent_directory(&guard.target.live_root) {
+        match std::fs::rename(&backup_root, &guard.target.live_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root)?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
+                return Err(sync_error.context(
+                    "failed durably parking prior Pages archive; restored prior generation",
+                ));
+            }
+            Err(restore_error) => bail!(
+                "failed syncing parked prior Pages archive: {sync_error}; restore also failed: {restore_error}; prior retained at {} and candidate at {}",
+                backup_root.display(),
+                staged_root.display()
+            ),
+        }
+    }
+
+    if let Err(publish_error) = std::fs::rename(staged_root, &guard.target.live_root) {
+        return match std::fs::rename(&backup_root, &guard.target.live_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root)?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
+                Err(publish_error).context(
+                    "failed publishing staged Pages key mutation; restored prior generation",
+                )
+            }
+            Err(restore_error) => bail!(
+                "failed publishing staged Pages key mutation: {publish_error}; restore also failed: {restore_error}; prior retained at {} and candidate at {}",
+                backup_root.display(),
+                staged_root.display()
+            ),
+        };
+    }
+    sync_parent_directory(&guard.target.live_root).with_context(|| {
+        format!(
+            "Pages key mutation is live at {}, but publication could not be durably synced; prior generation retained at {}",
+            guard.target.live_root.display(),
+            backup_root.display()
+        )
+    })?;
+
+    if let Err(verification_error) = verify_published_key_tree(&guard.target.live_root, candidate) {
+        std::fs::rename(&guard.target.live_root, staged_root).with_context(|| {
+            format!(
+                "published Pages key tree failed verification and candidate could not be parked at {}",
+                staged_root.display()
+            )
+        })?;
+        std::fs::rename(&backup_root, &guard.target.live_root)
+            .context("published Pages key tree failed verification and prior restore failed")?;
+        sync_parent_directory(&guard.target.live_root)?;
+        verify_published_key_tree(&guard.target.live_root, prior)?;
+        remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Err(verification_error
+            .context("published Pages key tree failed verification; restored prior generation"));
+    }
+
+    cleanup_committed_key_mutation(guard, &backup_root, &prior.digest);
+    Ok(())
+}
+
+fn publish_key_config_mutation(
+    guard: &KeyMutationGuard,
+    config: &EncryptionConfig,
+    recovery_secret: Option<&[u8]>,
+    remove_recovery_artifacts: bool,
+) -> Result<()> {
+    let (staged_root, prior) =
+        stage_key_mutation_tree(&guard.target, KeyMutationStageMode::PreserveSite)?;
+    let staged_site = guard.target.staged_site_dir(&staged_root);
+    let prepare_result = (|| -> Result<TreeEvidence> {
+        materialize_safe_required_file_symlinks(&staged_site)?;
+        write_json_pretty_atomically(&staged_site.join("config.json"), config)?;
+        let manifest = regenerate_integrity_manifest(&staged_site)?;
+        refresh_private_artifacts(
+            &staged_site,
+            config,
+            manifest.as_ref(),
+            recovery_secret,
+            remove_recovery_artifacts,
+        )?;
+        let verification = crate::pages::verify::verify_bundle(&staged_site, false)?;
+        if verification.status != "valid" {
+            bail!(
+                "staged Pages key mutation failed bundle verification with status {}",
+                verification.status
+            );
+        }
+        sync_tree(&staged_root)?;
+        inspect_key_publication_tree(&staged_root)
+    })();
+    let candidate = match prepare_result {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed cleaning rejected key-mutation candidate: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    publish_staged_key_mutation(guard, &staged_root, &prior, &candidate)
 }
 
 /// Result of listing key slots
@@ -172,28 +1471,22 @@ pub fn key_add_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<u8> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    validate_password_input(new_password)?;
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
     // Unlock with current password to get DEK
     let dek = zeroize::Zeroizing::new(unwrap_dek_with_password(&config, current_password)?);
 
-    // Create new slot (use max ID + 1 since IDs are stable after revocation)
-    // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = next_key_slot_id(&config.key_slots)?;
+    // IDs are part of the slot's AAD binding and are never reused.
+    let slot_id = next_key_slot_id(&config)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
-    refresh_private_artifacts(&archive_dir, &config, manifest.as_ref(), None, false)?;
+    config.next_slot_id = Some(u16::from(slot_id) + 1);
+    publish_key_config_mutation(&guard, &config, None, false)?;
 
     info!(slot_id, "Added password key slot");
     Ok(slot_id)
@@ -204,8 +1497,8 @@ pub fn key_add_recovery(
     archive_dir: &Path,
     current_password: &str,
 ) -> Result<(u8, RecoverySecret)> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
@@ -215,38 +1508,36 @@ pub fn key_add_recovery(
     // Generate recovery secret
     let secret = RecoverySecret::generate();
 
-    // Create new slot (use max ID + 1 since IDs are stable after revocation)
-    // If no slots exist, start at 0; otherwise use max + 1
-    let slot_id = next_key_slot_id(&config.key_slots)?;
+    // IDs are part of the slot's AAD binding and are never reused.
+    let slot_id = next_key_slot_id(&config)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
-    refresh_private_artifacts(
-        &archive_dir,
-        &config,
-        manifest.as_ref(),
-        Some(secret.as_bytes()),
-        false,
-    )?;
+    config.next_slot_id = Some(u16::from(slot_id) + 1);
+    publish_key_config_mutation(&guard, &config, Some(secret.as_bytes()), false)?;
 
     info!(slot_id, "Added recovery key slot");
     Ok((slot_id, secret))
 }
 
-fn next_key_slot_id(key_slots: &[KeySlot]) -> Result<u8> {
-    match key_slots.iter().map(|s| s.id).max() {
-        Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached")
-        }),
-        None => Ok(0),
-    }
+/// The export's slot-id high-water mark: one past every id it has ever held,
+/// including revoked ones recorded in `next_slot_id`.
+fn slot_id_high_water(config: &EncryptionConfig) -> u16 {
+    config
+        .key_slots
+        .iter()
+        .map(|slot| u16::from(slot.id) + 1)
+        .max()
+        .unwrap_or(0)
+        .max(config.next_slot_id.unwrap_or(0))
+}
+
+/// Id for a new slot. RECOVERY.md promises revoked ids are never reused, so
+/// this is the high-water mark, not `max(live ids) + 1`: revoking the highest
+/// slot and adding another used to hand its id out again (2l1b0.61).
+fn next_key_slot_id(config: &EncryptionConfig) -> Result<u8> {
+    u8::try_from(slot_id_high_water(config))
+        .map_err(|_| anyhow::anyhow!("Cannot add more key slots: maximum slot ID (255) reached"))
 }
 
 /// Revoke a key slot
@@ -255,8 +1546,8 @@ pub fn key_revoke(
     current_password: &str,
     slot_id_to_revoke: u8,
 ) -> Result<RevokeResult> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
@@ -289,24 +1580,18 @@ pub fn key_revoke(
         .map(|s| s.slot_type == SlotType::Recovery)
         .unwrap_or(false);
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
-
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
+    // and record the high-water mark first, so the revoked id (possibly the
+    // highest one) is never handed out again.
+    config.next_slot_id = Some(slot_id_high_water(&config));
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
     let has_recovery_slot = config
         .key_slots
         .iter()
         .any(|slot| slot.slot_type == SlotType::Recovery);
-    refresh_private_artifacts(
-        &archive_dir,
+    publish_key_config_mutation(
+        &guard,
         &config,
-        manifest.as_ref(),
         None,
         revoked_slot_is_recovery || !has_recovery_slot,
     )?;
@@ -326,7 +1611,9 @@ pub fn key_rotate(
     keep_recovery: bool,
     progress: impl Fn(f32),
 ) -> Result<RotateResult> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
+    validate_password_input(new_password)?;
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
     let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
@@ -357,30 +1644,7 @@ pub fn key_rotate(
     rng.fill_bytes(&mut new_export_id);
     rng.fill_bytes(&mut new_base_nonce);
 
-    let staged_site_dir = unique_atomic_sidecar_path(&archive_dir, "rotate", "site");
-    copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
-
-    // 3. Re-encrypt payload with new DEK into the staged site
-    let chunk_count = encrypt_all_chunks(
-        &plaintext,
-        &new_dek,
-        &new_export_id,
-        &new_base_nonce,
-        config.payload.chunk_size,
-        &staged_site_dir.join("payload"),
-        |p| progress(0.5 + p * 0.5),
-    )?;
-
-    reencrypt_blobs_into_dir(
-        &archive_dir,
-        &staged_site_dir,
-        &old_dek,
-        &old_export_id,
-        &new_dek,
-        &new_export_id,
-    )?;
-
-    // 4. Create new key slots
+    // 3. Create replacement key slots before staging any publishable bytes.
     let mut new_slots = vec![create_password_slot(
         new_password,
         &new_dek,
@@ -402,39 +1666,82 @@ pub fn key_rotate(
         recovery_secret_encoded = Some(secret.encoded().to_string());
     }
 
-    // 5. Write new config
-    let new_config = EncryptionConfig {
-        version: config.version,
-        export_id: BASE64_STANDARD.encode(new_export_id),
-        base_nonce: BASE64_STANDARD.encode(new_base_nonce),
-        compression: config.compression,
-        kdf_defaults: Argon2Params::default(),
-        payload: crate::pages::encrypt::PayloadMeta {
-            chunk_size: config.payload.chunk_size,
-            chunk_count,
-            total_compressed_size: 0, // Recalculated
-            total_plaintext_size: plaintext.len() as u64,
-            files: (0..chunk_count)
-                .map(|i| format!("payload/chunk-{:05}.bin", i))
-                .collect(),
-        },
-        key_slots: new_slots.clone(),
+    // 4. Stage the complete site/private generation and publish it through
+    // the same journaled transaction as add/revoke. Old payload and blob
+    // ciphertext are deliberately omitted from the staged copy.
+    let (staged_root, prior) =
+        stage_key_mutation_tree(&guard.target, KeyMutationStageMode::ReplaceEncryptedPayload)?;
+    let staged_site_dir = guard.target.staged_site_dir(&staged_root);
+    let prepare_result = (|| -> Result<TreeEvidence> {
+        let (chunk_count, total_compressed_size) = encrypt_all_chunks(
+            &plaintext,
+            &new_dek,
+            &new_export_id,
+            &new_base_nonce,
+            config.payload.chunk_size,
+            &staged_site_dir.join("payload"),
+            |p| progress(0.5 + p * 0.5),
+        )?;
+        reencrypt_blobs_into_dir(
+            &archive_dir,
+            &staged_site_dir,
+            &old_dek,
+            &old_export_id,
+            &new_dek,
+            &new_export_id,
+        )?;
+
+        let new_config = EncryptionConfig {
+            version: config.version,
+            export_id: BASE64_STANDARD.encode(new_export_id),
+            base_nonce: BASE64_STANDARD.encode(new_base_nonce),
+            compression: config.compression.clone(),
+            kdf_defaults: Argon2Params::default(),
+            payload: crate::pages::encrypt::PayloadMeta {
+                chunk_size: config.payload.chunk_size,
+                chunk_count,
+                total_compressed_size,
+                total_plaintext_size: plaintext.len() as u64,
+                files: (0..chunk_count)
+                    .map(|i| format!("payload/chunk-{i:05}.bin"))
+                    .collect(),
+            },
+            key_slots: new_slots.clone(),
+            // Rotation mints a new export id and DEK: a fresh id space.
+            next_slot_id: None,
+        };
+        write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
+        let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
+        write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
+        refresh_private_artifacts(
+            &staged_site_dir,
+            &new_config,
+            Some(&manifest),
+            recovery_secret_bytes.as_deref(),
+            !keep_recovery,
+        )?;
+        let verification = crate::pages::verify::verify_bundle(&staged_site_dir, false)?;
+        if verification.status != "valid" {
+            bail!(
+                "staged Pages key rotation failed bundle verification with status {}",
+                verification.status
+            );
+        }
+        sync_tree(&staged_root)?;
+        inspect_key_publication_tree(&staged_root)
+    })();
+    let candidate = match prepare_result {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed cleaning rejected key-rotation candidate: {cleanup_error:#}"
+                ))),
+            };
+        }
     };
-
-    write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
-
-    // 6. Regenerate integrity.json for the staged site, then swap atomically
-    let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
-    write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
-    sync_tree(&staged_site_dir)?;
-    replace_dir_from_temp(&staged_site_dir, &archive_dir)?;
-    refresh_private_artifacts(
-        &archive_dir,
-        &new_config,
-        Some(&manifest),
-        recovery_secret_bytes.as_deref(),
-        !keep_recovery,
-    )?;
+    publish_staged_key_mutation(&guard, &staged_root, &prior, &candidate)?;
 
     Ok(RotateResult {
         new_dek_created_at: chrono::Utc::now(),
@@ -449,12 +1756,18 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -468,17 +1781,27 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -492,7 +1815,11 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Derive KEK from password using Argon2id
@@ -561,7 +1888,7 @@ fn unwrap_key(
 
     let dek = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: wrapped,
                 aad: &aad,
@@ -607,6 +1934,7 @@ fn create_password_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
@@ -640,6 +1968,9 @@ fn create_recovery_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
+    if secret.len() < MIN_RECOVERY_SECRET_BYTES {
+        bail!("Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)");
+    }
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
@@ -686,7 +2017,7 @@ fn wrap_key(
 
     let wrapped = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: dek,
                 aad: &aad,
@@ -695,6 +2026,12 @@ fn wrap_key(
         .map_err(|e| anyhow::anyhow!("Key wrapping failed: {}", e))?;
 
     Ok((wrapped, nonce))
+}
+
+fn corrupt_decrypt_payload(detail: impl Into<String>) -> anyhow::Error {
+    let detail = detail.into();
+    anyhow::Error::new(DecryptError::CorruptPayload(detail.clone()))
+        .context(format!("Encrypted archive payload is corrupt: {detail}"))
 }
 
 /// Decrypt all chunks and return plaintext
@@ -731,6 +2068,8 @@ fn decrypt_all_chunks(
     })?;
 
     let mut plaintext = Vec::new();
+    let mut total_ciphertext_size = 0u64;
+    let mut total_plaintext_size = 0u64;
 
     if config.payload.chunk_count != config.payload.files.len() {
         bail!(
@@ -780,7 +2119,22 @@ fn decrypt_all_chunks(
             );
         }
 
-        let ciphertext = std::fs::read(&canonical_chunk_path)?;
+        let max_ciphertext_size = max_archive_ciphertext_chunk_size(config.payload.chunk_size);
+        let chunk_file = File::open(&canonical_chunk_path)?;
+        let mut ciphertext = Vec::new();
+        chunk_file
+            .take(max_ciphertext_size.saturating_add(1))
+            .read_to_end(&mut ciphertext)?;
+        if ciphertext.len() as u64 > max_ciphertext_size {
+            bail!(
+                "Encrypted chunk {} exceeds the maximum size of {} bytes",
+                chunk_index,
+                max_ciphertext_size
+            );
+        }
+        total_ciphertext_size = total_ciphertext_size
+            .checked_add(ciphertext.len() as u64)
+            .context("Encrypted payload byte count overflowed u64")?;
 
         // Derive nonce
         let nonce = derive_chunk_nonce(&base_nonce, chunk_index as u32);
@@ -791,34 +2145,40 @@ fn decrypt_all_chunks(
         // Decrypt
         let compressed = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &ciphertext,
                     aad: &aad,
                 },
             )
-            .map_err(|err| {
-                // [coding_agent_session_search-htiim] Chain the aead error
-                // so operators can correlate: which chunk failed, how
-                // big the ciphertext was, and what the cipher layer
-                // reported. The aead crate keeps the sub-failure type
-                // opaque (timing-attack hardening) but the source is
-                // preserved in the error chain. Mirrors encrypt.rs::
-                // decrypt_all_chunks fix landed in 0b81b601.
-                anyhow::anyhow!(
-                    "Decryption failed for chunk {} ({} bytes ciphertext): {}",
-                    chunk_index,
-                    ciphertext.len(),
-                    err
-                )
+            .map_err(|error| {
+                corrupt_decrypt_payload(format!(
+                    "chunk {chunk_index} authentication failed for {} ciphertext bytes: {error}",
+                    ciphertext.len()
+                ))
             })?;
 
-        // Decompress
-        let mut decoder = DeflateDecoder::new(&compressed[..]);
-        let mut chunk_plaintext = Vec::new();
-        decoder.read_to_end(&mut chunk_plaintext)?;
+        let chunk_plaintext =
+            decompress_archive_chunk(&compressed, config.payload.chunk_size, chunk_index)?;
+        total_plaintext_size = total_plaintext_size
+            .checked_add(chunk_plaintext.len() as u64)
+            .context("Decrypted payload byte count overflowed u64")?;
+        plaintext.extend_from_slice(&chunk_plaintext);
+    }
 
-        plaintext.extend(chunk_plaintext);
+    if total_ciphertext_size != config.payload.total_compressed_size {
+        bail!(
+            "Encrypted payload contains {} ciphertext bytes; config declares {}",
+            total_ciphertext_size,
+            config.payload.total_compressed_size
+        );
+    }
+    if total_plaintext_size != config.payload.total_plaintext_size {
+        bail!(
+            "Decrypted payload contains {} plaintext bytes; config declares {}",
+            total_plaintext_size,
+            config.payload.total_plaintext_size
+        );
     }
 
     progress(1.0);
@@ -834,7 +2194,7 @@ fn encrypt_all_chunks(
     chunk_size: usize,
     payload_dir: &Path,
     progress: impl Fn(f32),
-) -> Result<usize> {
+) -> Result<(usize, u64)> {
     std::fs::create_dir_all(payload_dir)?;
 
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
@@ -844,6 +2204,7 @@ fn encrypt_all_chunks(
     let total_chunks = plaintext.len().div_ceil(chunk_size);
     ensure_archive_chunk_count_fits_nonce_space(total_chunks as u64, chunk_size)?;
     let mut chunk_index = 0u32;
+    let mut total_ciphertext_size = 0u64;
 
     for (i, chunk) in plaintext.chunks(chunk_size).enumerate() {
         progress(i as f32 / total_chunks as f32);
@@ -866,7 +2227,7 @@ fn encrypt_all_chunks(
         // Encrypt
         let ciphertext = cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 Payload {
                     msg: &compressed,
                     aad: &aad,
@@ -879,6 +2240,9 @@ fn encrypt_all_chunks(
         let chunk_path = payload_dir.join(&chunk_filename);
         let mut chunk_file = File::create(&chunk_path)?;
         chunk_file.write_all(&ciphertext)?;
+        total_ciphertext_size = total_ciphertext_size
+            .checked_add(ciphertext.len() as u64)
+            .context("Encrypted payload byte count overflowed u64")?;
 
         chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
             anyhow::anyhow!(
@@ -890,7 +2254,7 @@ fn encrypt_all_chunks(
     }
 
     progress(1.0);
-    Ok(chunk_index as usize)
+    Ok((chunk_index as usize, total_ciphertext_size))
 }
 
 /// Derive chunk nonce from base nonce and chunk index
@@ -1159,6 +2523,7 @@ fn unique_atomic_sidecar_path(
     ))
 }
 
+#[cfg(test)]
 fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
     if !ensure_replaceable_site_dir(final_dir)? {
         std::fs::rename(temp_dir, final_dir).with_context(|| {
@@ -1211,6 +2576,7 @@ fn replace_dir_from_temp(temp_dir: &Path, final_dir: &Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn ensure_replaceable_site_dir(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1277,114 +2643,6 @@ fn sync_tree_inner(path: &Path) -> Result<()> {
             .sync_all()
             .with_context(|| format!("Failed syncing directory {}", path.display()))?;
     }
-    Ok(())
-}
-
-fn copy_site_except_runtime_state(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create staged site directory {}", dst.display()))?;
-    let canonical_base = src.canonicalize().with_context(|| {
-        format!(
-            "Failed to resolve archive root {} before staging key rotation",
-            src.display()
-        )
-    })?;
-    copy_site_except_runtime_state_recursive(src, dst, src, &canonical_base)
-}
-
-fn safe_staged_site_destination(dst_root: &Path, rel_path: &Path) -> Result<PathBuf> {
-    let mut path_parts = vec![dst_root.to_path_buf()];
-    for component in rel_path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(name) => path_parts.push(PathBuf::from(name)),
-            _ => bail!(
-                "Refusing to stage archive entry with unsafe relative path: {}",
-                rel_path.display()
-            ),
-        }
-    }
-    Ok(path_parts.into_iter().collect())
-}
-
-fn copy_site_except_runtime_state_recursive(
-    src: &Path,
-    dst: &Path,
-    base: &Path,
-    canonical_base: &Path,
-) -> Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let rel_path = path.strip_prefix(base)?;
-        let skip_root_entry = rel_path.components().count() == 1
-            && matches!(
-                rel_path.to_str(),
-                Some("payload" | "blobs" | "config.json" | "integrity.json")
-            );
-        if skip_root_entry {
-            continue;
-        }
-
-        let metadata = std::fs::symlink_metadata(&path)?;
-        let file_type = metadata.file_type();
-        let dest_path = safe_staged_site_destination(dst, rel_path)?;
-        if file_type.is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
-            copy_site_except_runtime_state_recursive(&path, dst, base, canonical_base)?;
-        } else if file_type.is_symlink() {
-            let canonical_target = path.canonicalize().with_context(|| {
-                format!(
-                    "Failed to resolve symlinked site entry {} while staging key rotation",
-                    rel_path.display()
-                )
-            })?;
-            if !canonical_target.starts_with(canonical_base) {
-                bail!(
-                    "Refusing to rotate symlinked site entry outside archive root: {}",
-                    rel_path.display()
-                );
-            }
-
-            let target_meta = std::fs::metadata(&path).with_context(|| {
-                format!(
-                    "Failed to read symlink target metadata for {} while staging key rotation",
-                    rel_path.display()
-                )
-            })?;
-            if !target_meta.is_file() {
-                bail!(
-                    "Refusing to rotate symlinked site entry that does not point to a regular file: {}",
-                    rel_path.display()
-                );
-            }
-
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            // Materialize safe symlink targets into the staged site so the staged
-            // integrity pass stays self-contained before the final atomic swap.
-            std::fs::copy(&canonical_target, &dest_path).with_context(|| {
-                format!(
-                    "Failed copying symlink target {} into staged site path {}",
-                    canonical_target.display(),
-                    dest_path.display()
-                )
-            })?;
-        } else if file_type.is_file() {
-            if let Some(parent) = dest_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&path, &dest_path).with_context(|| {
-                format!(
-                    "Failed copying staged site file {} to {}",
-                    path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
-    }
-
     Ok(())
 }
 
@@ -1468,7 +2726,6 @@ mod tests {
     };
     use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, MAX_CHUNK_SIZE, PayloadMeta};
-    use crate::pages::errors::DecryptError;
     use crate::pages::verify::verify_bundle;
     use std::cell::Cell;
     use tempfile::TempDir;
@@ -1613,6 +2870,161 @@ mod tests {
     }
 
     #[test]
+    fn key_mutation_lock_rejects_a_concurrent_writer_without_changing_config() -> Result<()> {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let target = derive_key_mutation_target(&archive_dir)?;
+        let _guard = open_key_mutation_lock(target)?;
+        let config_before = std::fs::read(archive_dir.join("site/config.json"))?;
+
+        let error = key_add_password(&archive_dir, "test-password", "concurrent-password")
+            .expect_err("a second key writer must not enter the transaction");
+
+        anyhow::ensure!(format!("{error:#}").contains("already active"));
+        anyhow::ensure!(
+            std::fs::read(archive_dir.join("site/config.json"))? == config_before,
+            "lock contention changed the live key configuration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_add_private_artifact_symlink_failure_preserves_complete_live_generation() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let config_path = archive_dir.join("site/config.json");
+        let integrity_path = archive_dir.join("site/integrity.json");
+        let master_key_path = archive_dir.join("private/master-key.json");
+        let protected_path = temp_dir.path().join("protected-master-key.json");
+        std::fs::rename(&master_key_path, &protected_path)?;
+        symlink(&protected_path, &master_key_path)?;
+        let config_before = std::fs::read(&config_path)?;
+        let integrity_before = std::fs::read(&integrity_path)?;
+        let protected_before = std::fs::read(&protected_path)?;
+
+        let error = key_add_password(&archive_dir, "test-password", "new-password")
+            .expect_err("a private-artifact symlink must reject the staged transaction");
+
+        // The refusal moved from the per-artifact staging step to the
+        // whole-tree publication gate (8960afb9); the pinned semantics are
+        // unchanged — a symlinked private artifact rejects the transaction
+        // and every prior byte survives, asserted below.
+        anyhow::ensure!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
+        );
+        anyhow::ensure!(std::fs::read(&config_path)? == config_before);
+        anyhow::ensure!(std::fs::read(&integrity_path)? == integrity_before);
+        anyhow::ensure!(std::fs::read(&protected_path)? == protected_before);
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&master_key_path)?
+                .file_type()
+                .is_symlink()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn key_mutation_recovery_rejects_spoofed_sibling_name_without_removal() -> Result<()> {
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
+        let victim = temp_dir.path().join("unrelated-sibling");
+        std::fs::create_dir(&victim)?;
+        std::fs::write(victim.join("keep.txt"), b"must survive")?;
+        let prior = inspect_key_publication_tree(&archive_dir)?;
+        let victim_evidence = inspect_key_publication_tree(&victim)?;
+        let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
+        let journal = KeyMutationJournal {
+            format: KEY_MUTATION_JOURNAL_FORMAT.to_string(),
+            staged_file_name: "unrelated-sibling".to_string(),
+            backup_file_name: backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("backup filename")?
+                .to_string(),
+            prior_digest: prior.digest,
+            candidate_digest: victim_evidence.digest,
+        };
+        write_json_pretty(&guard.target.journal_path, &journal)?;
+        // On Unix, recovery refuses non-owner-only journals before reading
+        // them; this hand-crafted spoof must pass that gate to reach the
+        // staged-prefix refusal it pins. Windows has no mode-bit gate.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &guard.target.journal_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )?;
+
+        let error = recover_interrupted_key_mutation(&guard)
+            .expect_err("a journal must not claim an arbitrary sibling directory");
+
+        anyhow::ensure!(
+            format!("{error:#}").contains("owned staged prefix"),
+            "unexpected rejection: {error:#}"
+        );
+        anyhow::ensure!(std::fs::read(victim.join("keep.txt"))? == b"must survive");
+        Ok(())
+    }
+
+    #[test]
+    fn key_mutation_recovery_restores_exact_prior_after_park_crash() -> Result<()> {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
+        let (staged, prior) =
+            stage_key_mutation_tree(&guard.target, KeyMutationStageMode::PreserveSite)?;
+        std::fs::write(staged.join("transaction-candidate.txt"), b"candidate")?;
+        sync_tree(&staged)?;
+        let candidate = inspect_key_publication_tree(&staged)?;
+        let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
+        write_key_mutation_journal(&guard, &staged, &backup, &prior, &candidate)?;
+        std::fs::rename(&archive_dir, &backup)?;
+        sync_parent_directory(&archive_dir)?;
+
+        let recovered = recover_interrupted_key_mutation(&guard)?;
+
+        anyhow::ensure!(recovered == RecoveredKeyMutation::RolledBack);
+        anyhow::ensure!(inspect_key_publication_tree(&archive_dir)? == prior);
+        anyhow::ensure!(std::fs::symlink_metadata(&staged).is_err());
+        anyhow::ensure!(std::fs::symlink_metadata(&guard.target.journal_path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn key_publication_evidence_rejects_destination_drift() -> Result<()> {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let target = derive_key_mutation_target(&archive_dir)?;
+        let (staged, _prior) =
+            stage_key_mutation_tree(&target, KeyMutationStageMode::PreserveSite)?;
+        let evidence = inspect_key_publication_tree(&staged)?;
+        std::fs::write(staged.join("site/config.json"), b"{}")?;
+
+        let error = verify_published_key_tree(&staged, &evidence)
+            .expect_err("destination drift must invalidate exact publication evidence");
+
+        anyhow::ensure!(format!("{error:#}").contains("failed exact verification"));
+        remove_owned_key_mutation_tree(&staged, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn key_publication_tree_depth_is_bounded_without_recursive_walk() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut deepest = temp_dir.path().join("root");
+        std::fs::create_dir(&deepest)?;
+        for _ in 0..=KEY_MUTATION_TREE_DEPTH_LIMIT {
+            deepest = deepest.join("d");
+            std::fs::create_dir(&deepest)?;
+        }
+
+        let error = inspect_key_publication_tree(&temp_dir.path().join("root"))
+            .expect_err("over-deep trees must fail before exhausting the call stack");
+
+        anyhow::ensure!(format!("{error:#}").contains("depth bound"));
+        Ok(())
+    }
+
+    #[test]
     fn test_decrypt_all_chunks_rejects_mismatched_chunk_count_before_progress() {
         let temp_dir = TempDir::new().unwrap();
         let archive_dir = temp_dir.path();
@@ -1630,6 +3042,7 @@ mod tests {
                 files: vec!["payload/chunk-00000.bin".to_string()],
             },
             key_slots: Vec::new(),
+            next_slot_id: None,
         };
         let progress_calls = Cell::new(0);
 
@@ -1655,6 +3068,27 @@ mod tests {
         assert_eq!(result.slots.len(), 1);
         assert_eq!(result.slots[0].slot_type, "password");
         assert_eq!(result.slots[0].kdf, "argon2id");
+    }
+
+    #[test]
+    fn key_add_password_rejects_empty_and_whitespace_only_new_passwords() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+
+        for new_password in ["", "   ", "\t\n"] {
+            let err = key_add_password(&archive_dir, "test-password", new_password)
+                .expect_err("weak empty-equivalent password must not create a key slot");
+            assert!(
+                err.to_string().contains("empty or whitespace-only"),
+                "unexpected password validation error: {err:#}"
+            );
+        }
+
+        let config = load_config(&archive_dir).unwrap();
+        assert_eq!(
+            config.key_slots.len(),
+            1,
+            "rejected passwords must leave the archive config unchanged"
+        );
     }
 
     #[test]
@@ -1820,6 +3254,10 @@ mod tests {
 
         // Old password should fail
         let config = load_config(&archive_dir).unwrap();
+        assert!(
+            config.payload.total_compressed_size > 0,
+            "rotated non-empty archives must record their ciphertext total"
+        );
         assert!(unwrap_dek_with_password(&config, "test-password").is_err());
 
         // New password should work and decrypt correctly
@@ -1830,6 +3268,45 @@ mod tests {
 
         let decrypted = std::fs::read(&decrypted_path).unwrap();
         assert_eq!(decrypted, b"Test data for key management");
+    }
+
+    #[test]
+    fn test_key_rotate_reports_tampered_payload_and_preserves_live_archive() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let chunk_path = site_dir.join("payload/chunk-00000.bin");
+        let mut chunk = std::fs::read(&chunk_path).unwrap();
+        let final_byte = chunk
+            .last_mut()
+            .expect("encrypted test payload must contain an authentication tag");
+        *final_byte ^= 0x5a;
+        std::fs::write(&chunk_path, chunk).unwrap();
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("chunk 0") && detail.contains("authentication failed")
+            ),
+            "unexpected corrupt-payload taxonomy: {err:#}"
+        );
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(
+            unwrap_dek_with_password(&config, "test-password").is_ok(),
+            "failed rotation must preserve the original password slot"
+        );
+        assert!(
+            matches!(
+                unwrap_dek_with_password(&config, "new-password")
+                    .unwrap_err()
+                    .downcast_ref::<DecryptError>(),
+                Some(DecryptError::AuthenticationFailed)
+            ),
+            "failed rotation must not publish the replacement password slot"
+        );
     }
 
     #[test]
@@ -1888,12 +3365,48 @@ mod tests {
         let mut config = load_config(&archive_dir).unwrap();
         config.key_slots[0].id = u8::MAX;
 
-        let err = next_key_slot_id(&config.key_slots).unwrap_err();
+        let err = next_key_slot_id(&config).unwrap_err();
 
         assert_eq!(
             err.to_string(),
             "Cannot add more key slots: maximum slot ID (255) reached"
         );
+    }
+
+    /// 2l1b0.61: RECOVERY.md promises revoked slot ids are never reused, but
+    /// the next id was `max(live ids) + 1`, so revoking the highest slot and
+    /// adding another handed its id out again.
+    #[test]
+    fn revoked_highest_slot_id_is_never_reused() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let first = key_add_password(&archive_dir, "test-password", "password-a").unwrap();
+        let second = key_add_password(&archive_dir, "test-password", "password-b").unwrap();
+        assert_eq!(second, first + 1);
+
+        key_revoke(&archive_dir, "test-password", second).unwrap();
+        let after_revoke = load_config(&archive_dir).unwrap();
+        assert!(after_revoke.key_slots.iter().all(|slot| slot.id != second));
+        assert_eq!(after_revoke.next_slot_id, Some(u16::from(second) + 1));
+
+        let third = key_add_password(&archive_dir, "test-password", "password-c").unwrap();
+        assert_ne!(third, second, "a revoked slot id was handed out again");
+        assert_eq!(third, second + 1);
+        let config = load_config(&archive_dir).unwrap();
+        assert!(unwrap_dek_with_password(&config, "password-b").is_err());
+        assert!(unwrap_dek_with_password(&config, "password-c").is_ok());
+        // The persisted high-water mark is a known config field to verify.
+        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    /// A config no key mutation has touched has no high-water mark; the next
+    /// id is derived from the live slots, and the mark is written from then on.
+    #[test]
+    fn next_slot_id_is_derived_for_configs_without_a_high_water_mark() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let config = load_config(&archive_dir).unwrap();
+        assert_eq!(config.next_slot_id, None);
+        let live_max = config.key_slots.iter().map(|slot| slot.id).max().unwrap();
+        assert_eq!(next_key_slot_id(&config).unwrap(), live_max + 1);
     }
 
     #[test]
@@ -1920,17 +3433,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_add_password_materializes_in_tree_symlinked_required_asset() -> Result<()> {
+    fn test_key_add_password_refuses_in_tree_symlinked_required_asset() -> Result<()> {
+        // 8960afb9 retired the old materialize-the-symlink convenience: the
+        // key-publication gate now refuses ANY symlink in the tree, matching
+        // the export/verify posture. A correct-password mutation over a
+        // symlinked required asset must refuse and leave the symlink alone.
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir)?;
         replace_viewer_with_in_tree_symlink(&site_dir);
 
-        key_add_password(&archive_dir, "test-password", "new-password")?;
+        let error = key_add_password(&archive_dir, "test-password", "new-password")
+            .expect_err("a symlinked required asset must refuse the key mutation");
 
-        anyhow::ensure!(verify_bundle(&archive_dir, false)?.status == "valid");
+        anyhow::ensure!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
+        );
         let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
-        anyhow::ensure!(viewer_metadata.file_type().is_file());
-        anyhow::ensure!(!viewer_metadata.file_type().is_symlink());
+        anyhow::ensure!(viewer_metadata.file_type().is_symlink());
         Ok(())
     }
 
@@ -1947,8 +3467,10 @@ mod tests {
             Err(err) => err,
         };
 
+        let rendered = err.to_string();
         anyhow::ensure!(
-            err.to_string().contains("Invalid password"),
+            rendered.contains("Invalid password")
+                || rendered.contains("The password you entered is incorrect"),
             "unexpected error: {err:#}"
         );
         let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
@@ -1958,22 +3480,22 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_rotate_materializes_in_tree_symlinked_required_asset() {
+    fn test_key_rotate_refuses_in_tree_symlinked_required_asset() {
+        // Same posture as key add (8960afb9): rotation refuses a symlinked
+        // required asset instead of materializing it, and the tree survives.
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
         replace_viewer_with_in_tree_symlink(&site_dir);
-        let expected_viewer = std::fs::read(site_dir.join("viewer-real.js")).unwrap();
 
-        key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+        let error = key_rotate(&archive_dir, "test-password", "new-password", true, |_| {})
+            .expect_err("a symlinked required asset must refuse the key rotation");
 
-        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
-        assert!(viewer_metadata.file_type().is_file());
-        assert!(!viewer_metadata.file_type().is_symlink());
-        assert_eq!(
-            std::fs::read(site_dir.join("viewer.js")).unwrap(),
-            expected_viewer
+        assert!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
         );
-        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_symlink());
     }
 
     #[test]
@@ -2364,7 +3886,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&kek).expect("Invalid key length");
         let mut wrapped = cipher
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &Nonce::from(nonce_bytes),
                 Payload {
                     msg: &dek,
                     aad: &aad,

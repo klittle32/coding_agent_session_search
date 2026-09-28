@@ -25,6 +25,7 @@ const AGENT_PANE_WCAG_SUBJECTS: &[&str] = &[
     "opencode",
     "pi_agent",
     "prime_agent",
+    "omp",
     "clawdbot",
     "vibe",
     "mistral",

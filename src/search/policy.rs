@@ -183,8 +183,10 @@ pub const DEFAULT_SEMANTIC_BUDGET_MB: u64 = 500;
 /// skipped.  This protects the canonical DB, lexical index, and OS.
 pub const MIN_FREE_DISK_MB: u64 = 200;
 
-/// Model files are the biggest single cost.  Cap per-model.
-pub const MAX_MODEL_SIZE_MB: u64 = 300;
+/// Model files are the biggest single cost. Cap each model at the full default
+/// semantic budget so the verified multilingual MiniLM bundle (about 458 MiB)
+/// remains installable while larger accidental acquisitions still fail closed.
+pub const MAX_MODEL_SIZE_MB: u64 = 500;
 
 // ─── Background scheduler budgets ──────────────────────────────────────────
 
@@ -214,7 +216,7 @@ pub const SEMANTIC_SCHEMA_VERSION: u32 = 1;
 
 /// Changing the chunking strategy (e.g., max tokens per chunk, overlap)
 /// invalidates all existing vectors even if the model is unchanged.
-pub const CHUNKING_STRATEGY_VERSION: u32 = 1;
+pub const CHUNKING_STRATEGY_VERSION: u32 = 2;
 
 // ─── The policy struct ─────────────────────────────────────────────────────
 
@@ -1011,6 +1013,7 @@ mod tests {
         assert_eq!(p.max_refinement_docs, 100);
         assert_eq!(p.semantic_budget_mb, 500);
         assert_eq!(p.min_free_disk_mb, 200);
+        assert_eq!(p.max_model_size_mb, 500);
         assert_eq!(p.max_backfill_threads, 1);
         assert_eq!(p.semantic_schema_version, SEMANTIC_SCHEMA_VERSION);
         assert_eq!(p.chunking_strategy_version, CHUNKING_STRATEGY_VERSION);
@@ -1192,7 +1195,8 @@ mod tests {
     #[test]
     fn budget_decisions() {
         let p = SemanticPolicy::compiled_defaults();
-        // defaults: budget=500, min_free=200, max_model=300
+        // defaults: budget=500, min_free=200, max_model=500 (raised from 300
+        // for the larger multilingual quality-tier models)
 
         let cases: &[(u64, u64, u64, BudgetDecision)] = &[
             // (write_mb, current_usage_mb, free_disk_mb, expected)
@@ -1219,14 +1223,14 @@ mod tests {
                     min_required_mb: 200,
                 },
             ),
-            // Model too large: 350 MB > max_model 300 → deny
+            // Model too large: 550 MB > max_model 500 → deny
             (
-                350,
+                550,
                 0,
                 1000,
                 BudgetDecision::ModelTooLarge {
-                    model_mb: 350,
-                    max_mb: 300,
+                    model_mb: 550,
+                    max_mb: 500,
                 },
             ),
             // Edge: exact budget limit (90+410=500) → allowed

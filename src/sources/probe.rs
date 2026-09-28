@@ -40,8 +40,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::DiscoveredHost, configure_child_process_group, host_key_verification_error,
-    is_host_key_verification_failure, strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    config::DiscoveredHost, configure_child_process_group, file_backed_child_stdin,
+    host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
+    wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -114,6 +115,8 @@ pub enum CassStatus {
     },
     /// cass is installed but no index exists or is empty.
     InstalledNotIndexed { version: String },
+    /// cass is installed, but the bounded index inspection did not complete.
+    InstalledUnknown { version: String },
     /// cass is not found on PATH.
     NotFound,
     /// Couldn't determine cass status.
@@ -125,16 +128,18 @@ impl CassStatus {
     pub fn is_installed(&self) -> bool {
         matches!(
             self,
-            CassStatus::Indexed { .. } | CassStatus::InstalledNotIndexed { .. }
+            CassStatus::Indexed { .. }
+                | CassStatus::InstalledNotIndexed { .. }
+                | CassStatus::InstalledUnknown { .. }
         )
     }
 
     /// Get the installed version if available.
     pub fn version(&self) -> Option<&str> {
         match self {
-            CassStatus::Indexed { version, .. } | CassStatus::InstalledNotIndexed { version } => {
-                Some(version)
-            }
+            CassStatus::Indexed { version, .. }
+            | CassStatus::InstalledNotIndexed { version }
+            | CassStatus::InstalledUnknown { version } => Some(version),
             _ => None,
         }
     }
@@ -203,11 +208,31 @@ fn shell_single_quote_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
+/// Local discovery does not imply that a mixed application container is safe
+/// to copy to another machine. Also recognize old probe reports whose generic
+/// path classifier called the Grok Bot directory an unknown provider.
+pub(crate) fn remote_probe_source_allowed(agent: &str, path: &str) -> bool {
+    if matches!(agent, "grok_bot" | "grok-bot") {
+        return false;
+    }
+    let path = path.replace('\\', "/");
+    // FAD also probes Muse's authentication file to detect a local install.
+    // Neither that file nor its containing configuration tree is session data.
+    // Apply the path boundary even to old reports classified as "unknown".
+    if path.contains("/.config/muse/") || path.ends_with("/.config/muse") {
+        return false;
+    }
+    !path.contains("/Library/Application Support/Grok Bot/")
+        && !path.ends_with("/Library/Application Support/Grok Bot")
+}
+
 fn collect_probe_dirs(probe_paths: Vec<(&'static str, Vec<String>)>) -> Vec<String> {
     let mut dir_list = Vec::new();
-    for (_slug, paths) in probe_paths {
+    for (slug, paths) in probe_paths {
         for path in paths {
-            dir_list.push(path);
+            if remote_probe_source_allowed(slug, &path) {
+                dir_list.push(path);
+            }
         }
     }
     dir_list.sort();
@@ -240,6 +265,21 @@ fn build_probe_script_for_dirs(dir_list: &[String]) -> String {
     format!(
         r#"#!/bin/bash
 echo "===PROBE_START==="
+
+# Optional archive measurements share a two-second budget. Without a timeout
+# utility (common on macOS), omit them instead of starting unbounded work.
+PROBE_TIMEOUT_BIN=""
+if command -v timeout &>/dev/null; then
+    PROBE_TIMEOUT_BIN=timeout
+elif command -v gtimeout &>/dev/null; then
+    PROBE_TIMEOUT_BIN=gtimeout
+fi
+PROBE_OPTIONAL_DEADLINE=$((SECONDS + 2))
+probe_optional() {{
+    local remaining=$((PROBE_OPTIONAL_DEADLINE - SECONDS))
+    [ -n "$PROBE_TIMEOUT_BIN" ] && [ "$remaining" -gt 0 ] || return 124
+    "$PROBE_TIMEOUT_BIN" --kill-after=1s "${{remaining}}s" "$@"
+}}
 
 # System info
 echo "OS=$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -284,19 +324,25 @@ if [ -n "$CASS_BIN" ]; then
         echo "CASS_VERSION=$CASS_VER"
 
         # Get health status (JSON output) - only if version was detected
-        if "$CASS_BIN" health --json &>/dev/null; then
-            echo "CASS_HEALTH=OK"
+        if probe_optional "$CASS_BIN" health --json &>/dev/null; then
             # Try to get session count from stats
-            STATS=$("$CASS_BIN" stats --json 2>/dev/null)
+            STATS=$(probe_optional "$CASS_BIN" stats --json 2>/dev/null)
             if [ $? -eq 0 ] && [ -n "$STATS" ]; then
                 # Extract total conversations from JSON (allow whitespace/newlines)
                 SESSIONS=$(echo "$STATS" | tr -d '\n' | sed -n 's/.*"conversations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-                echo "CASS_SESSIONS=${{SESSIONS:-0}}"
+                if [ -n "$SESSIONS" ]; then
+                    echo "CASS_HEALTH=OK"
+                    echo "CASS_SESSIONS=$SESSIONS"
+                else
+                    echo "CASS_HEALTH=UNKNOWN"
+                fi
             else
-                echo "CASS_SESSIONS=0"
+                echo "CASS_HEALTH=UNKNOWN"
             fi
         else
-            echo "CASS_HEALTH=NOT_INDEXED"
+            # A failed health check can mean stale/corrupt assets or a timeout;
+            # it does not establish that the archive is empty.
+            echo "CASS_HEALTH=UNKNOWN"
         fi
     fi
 else
@@ -350,21 +396,18 @@ for dir in "${{PROBE_DIRS[@]}}"; do
         *) expanded_dir="$dir" ;;
     esac
     if [ -e "$expanded_dir" ]; then
-        SIZE=$(du -sm "$expanded_dir" 2>/dev/null | cut -f1)
+        SIZE=""
+        if DU_OUTPUT=$(probe_optional du -sm "$expanded_dir" 2>/dev/null); then
+            SIZE=$(printf '%s\n' "$DU_OUTPUT" | cut -f1)
+        fi
         # Count JSONL files for session estimate
         if [ -d "$expanded_dir" ]; then
-            # Keep probe bounded for very large trees: depth-limit and timeout when available.
-            if command -v timeout &> /dev/null; then
-                COUNT=$(timeout 5s find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
-            elif command -v gtimeout &> /dev/null; then
-                COUNT=$(gtimeout 5s find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
-            else
-                COUNT=$(find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ')
-            fi
+            # A timed-out walk must not be presented as a complete count.
+            COUNT=$(set -o pipefail; probe_optional find "$expanded_dir" -maxdepth 8 \( -name "*.jsonl" -o -name "*.json" \) 2>/dev/null | wc -l | tr -d ' ') || COUNT=""
         else
             COUNT=1  # Single file
         fi
-        echo "AGENT_DATA=$dir|${{SIZE:-0}}|${{COUNT:-0}}"
+        echo "AGENT_DATA=$dir|$SIZE|$COUNT"
     fi
 done
 
@@ -393,18 +436,29 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     // Build SSH command with strict host key verification.
     // Security-first: do not auto-trust unknown hosts during probing.
     // Use the host alias directly (SSH config handles Port, User, IdentityFile, ProxyJump, etc.)
+    let probe_script = build_probe_script();
+    let child_stdin = match file_backed_child_stdin(probe_script.as_bytes()) {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            return HostProbeResult::unreachable(
+                &host.name,
+                format!("Failed to prepare SSH probe input: {e}"),
+            );
+        }
+    };
     let mut cmd = Command::new("ssh");
     cmd.args(strict_ssh_cli_tokens(timeout_secs))
         .arg("--")
         .arg(&host.name)
         .arg("bash -s")
-        .stdin(Stdio::piped())
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_child_process_group(&mut cmd);
 
-    // Spawn the process and write probe script to stdin
-    let mut child = match cmd.spawn() {
+    // Spawn the process; the probe script reaches bash through the
+    // file-backed stdin above (no pipe write from cass — ztlan/gh#358).
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return HostProbeResult::unreachable(
@@ -412,15 +466,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
                 format!("Failed to execute ssh: {}", e),
             );
         }
-    };
-
-    // Write probe script to stdin
-    let probe_script = build_probe_script();
-    let write_error = if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(probe_script.as_bytes()).err()
-    } else {
-        None
     };
 
     // Wait for completion
@@ -458,13 +503,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 
         return HostProbeResult::unreachable(&host.name, error_msg);
     }
-    if let Some(e) = write_error {
-        return HostProbeResult::unreachable(
-            &host.name,
-            format!("Failed to write probe script: {}", e),
-        );
-    }
-
     // Parse successful output
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_probe_output(&host.name, &stdout, connection_time_ms)
@@ -473,7 +511,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 /// Parse the probe script output into a HostProbeResult.
 fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) -> HostProbeResult {
     let mut values: HashMap<String, String> = HashMap::new();
-    let mut agent_data: Vec<(String, u64, u64)> = Vec::new(); // (path, size_mb, count)
+    let mut agent_data: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
 
     // Parse only key=value pairs emitted by the probe script itself. SSH login
     // banners, forced-command wrappers, or shell noise can appear before or
@@ -509,8 +547,8 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
                 // Yields: count, size, path
                 let parts: Vec<&str> = data.rsplitn(3, '|').collect();
                 if parts.len() == 3 {
-                    let count = parts[0].parse().unwrap_or(0);
-                    let size = parts[1].parse().unwrap_or(0);
+                    let count = parts[0].parse().ok();
+                    let size = parts[1].parse().ok();
                     let path = parts[2].to_string();
                     agent_data.push((path, size, count));
                 }
@@ -540,8 +578,12 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
                     session_count: sessions,
                     last_indexed: None,
                 }
-            } else {
+            } else if health == Some("NOT_INDEXED") {
                 CassStatus::InstalledNotIndexed {
+                    version: version.clone(),
+                }
+            } else {
+                CassStatus::InstalledUnknown {
                     version: version.clone(),
                 }
             }
@@ -606,8 +648,8 @@ fn parse_probe_output(host_name: &str, output: &str, connection_time_ms: u64) ->
             DetectedAgent {
                 agent_type,
                 path,
-                estimated_sessions: Some(count),
-                estimated_size_mb: Some(size_mb),
+                estimated_sessions: count,
+                estimated_size_mb: size_mb,
             }
         })
         .collect();
@@ -638,20 +680,25 @@ fn infer_agent_type(path: &str) -> String {
         "codex".to_string()
     } else if path.contains(".cursor") || path.contains("Cursor") {
         "cursor".to_string()
-    } else if path.contains("antigravity-cli") || path.contains("antigravity") {
-        // Antigravity (agy) lives under ~/.gemini/antigravity-cli/, which also
-        // contains ".gemini" — so it MUST be matched before the gemini branch
-        // below, or agy roots would be mislabeled as legacy Gemini CLI.
+    } else if path.contains("antigravity") {
+        // Antigravity lives under ~/.gemini/antigravity/ (IDE) and
+        // ~/.gemini/antigravity-cli/ (agy CLI), which also contain ".gemini"
+        // — so it MUST be matched before the gemini branch below, or those
+        // roots would be mislabeled as legacy Gemini CLI.
         "antigravity".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
-    } else if path.contains(".prime/agent")
-        || path.contains("/.prime/")
-        || path.ends_with("/.prime")
-    {
-        "prime_agent".to_string()
     } else if path.contains("/.pi/") || path.ends_with("/.pi") {
         "pi_agent".to_string()
+    } else if path.contains("/.prime/agent/") || path.ends_with("/.prime/agent") {
+        "prime_agent".to_string()
+    } else if path.contains("/.omp/")
+        || path.ends_with("/.omp")
+        || path.contains("/omp/sessions")
+        || path.contains("/omp/profiles/")
+        || path.ends_with("/omp")
+    {
+        "omp".to_string()
     } else if path.contains(".aider") {
         "aider".to_string()
     } else if path.contains("opencode") {
@@ -675,6 +722,8 @@ fn infer_agent_type(path: &str) -> String {
         "vibe".to_string()
     } else if path.contains(".windsurf") {
         "windsurf".to_string()
+    } else if path.contains("/.letta/transcripts/") || path.ends_with("/.letta/transcripts") {
+        "letta_code".to_string()
     } else {
         "unknown".to_string()
     }
@@ -928,6 +977,12 @@ mod tests {
             infer_agent_type("~/.gemini/antigravity-cli/brain/abc/.system_generated/logs"),
             "antigravity"
         );
+        // The Antigravity IDE store (#454) shares the same parent.
+        assert_eq!(infer_agent_type("~/.gemini/antigravity"), "antigravity");
+        assert_eq!(
+            infer_agent_type("~/.gemini/antigravity/brain/abc/.system_generated/logs"),
+            "antigravity"
+        );
         assert_eq!(
             infer_agent_type("~/.config/Code/User/globalStorage/saoudrizwan.claude-dev"),
             "cline"
@@ -1074,6 +1129,35 @@ MEM_AVAIL_KB=4194304
     }
 
     #[test]
+    fn probe_optional_unknown_preserves_installation_and_detected_paths() {
+        let output = "===PROBE_START===\nCASS_VERSION=0.7.1\nCASS_HEALTH=UNKNOWN\nAGENT_DATA=~/.claude/projects||\nAGENT_DATA=~/.codex/sessions|0|0\n===PROBE_END===\n";
+        let result = parse_probe_output("workstation", output, 2000);
+        assert!(result.reachable);
+        assert!(result.has_cass());
+        assert_eq!(result.cass_status.version(), Some("0.7.1"));
+        assert!(matches!(
+            result.cass_status,
+            CassStatus::InstalledUnknown { .. }
+        ));
+        assert!(result.has_agent_data());
+        assert_eq!(result.detected_agents[0].estimated_sessions, None);
+        assert_eq!(result.detected_agents[0].estimated_size_mb, None);
+        assert_eq!(result.detected_agents[1].estimated_sessions, Some(0));
+        assert_eq!(result.detected_agents[1].estimated_size_mb, Some(0));
+        assert!(!super::super::index::RemoteIndexer::needs_indexing(&result));
+        let display =
+            super::super::interactive::probe_to_display_info(&result, &Default::default());
+        assert!(matches!(
+            display.state,
+            super::super::interactive::HostState::ReadyToSync
+        ));
+        assert!(matches!(
+            display.cass_status,
+            super::super::interactive::CassStatusDisplay::InstalledUnknown { .. }
+        ));
+    }
+
+    #[test]
     fn test_parse_probe_output_malformed() {
         let output = "random garbage";
         let result = parse_probe_output("bad-host", output, 0);
@@ -1208,6 +1292,35 @@ CASS_VERSION=0.4.2
             !script.contains("eval echo"),
             "probe paths must not be expanded through eval"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn probe_optional_commands_share_deadline_and_skip_without_timeout() {
+        let script = build_probe_script_for_dirs(&[]);
+        let helper = script
+            .split("# System info")
+            .next()
+            .expect("probe preamble");
+        let exercise = format!(
+            "{helper}\n\
+             [ -n \"$PROBE_TIMEOUT_BIN\" ] || exit 1\n\
+             probe_optional printf 'FAST_OK\\n'\n\
+             probe_optional sleep 10\n\
+             echo SLOW_EXIT=$?\n\
+             probe_optional printf 'MUST_NOT_RUN\\n'\n\
+             echo EXHAUSTED_EXIT=$?\n\
+             PROBE_OPTIONAL_DEADLINE=$((SECONDS + 2))\n\
+             PROBE_TIMEOUT_BIN=\n\
+             probe_optional printf 'MUST_NOT_RUN\\n'\n\
+             echo UNAVAILABLE_EXIT=$?\n"
+        );
+        let output = run_probe_script_with_home(&exercise, None);
+        assert!(output.contains("FAST_OK"));
+        assert!(output.contains("SLOW_EXIT=124"));
+        assert!(output.contains("EXHAUSTED_EXIT=124"));
+        assert!(output.contains("UNAVAILABLE_EXIT=124"));
+        assert!(!output.contains("MUST_NOT_RUN"));
     }
 
     #[test]
@@ -1400,13 +1513,54 @@ CASS_VERSION=0.4.2
         assert!(script.contains("copilot-chat"), "missing copilot path");
         assert!(script.contains("~/.windsurf"), "missing windsurf path");
         assert!(script.contains("~/.factory"), "missing factory path");
+        assert!(script.contains("~/.local/share/muse/sessions"));
+        assert!(!script.contains("~/.config/muse"));
         assert!(script.contains("~/.clawdbot"), "missing clawdbot path");
         assert!(script.contains("~/.vibe"), "missing vibe path");
         assert!(script.contains("sourcegraph.amp"), "missing amp path");
+        assert!(script.contains("~/.omp/agent"), "missing omp default path");
+        assert!(
+            script.contains("~/.omp/profiles"),
+            "missing omp profile path"
+        );
+        assert!(
+            script.contains("~/.local/share/omp"),
+            "missing omp XDG path"
+        );
         // Verify script structure
         assert!(script.contains("===PROBE_START==="));
         assert!(script.contains("===PROBE_END==="));
         assert!(script.contains("for dir in \"${PROBE_DIRS[@]}\""));
+    }
+
+    #[test]
+    fn gh447_remote_probe_excludes_grok_bot_mixed_container_and_keeps_grok_cli() {
+        let path = "~/Library/Application Support/Grok Bot/sand-client-persistence";
+        let paths = collect_probe_dirs(vec![
+            ("grok_bot", vec![path.into(), "/custom/replica-root".into()]),
+            ("unknown", vec![path.into()]),
+            ("grok", vec!["~/.grok/sessions".into()]),
+            ("codex", vec!["~/.codex/sessions".into()]),
+        ]);
+        assert_eq!(paths, vec!["~/.codex/sessions", "~/.grok/sessions"]);
+        let script = build_probe_script();
+        assert!(!script.contains("Grok Bot"));
+        assert!(script.contains("~/.grok/sessions"));
+        assert!(script.contains("~/.codex/sessions"));
+        // An older/custom probe can still report this directory under the
+        // generic unknown provider. Parse that real wire shape before passing
+        // it to automatic source configuration.
+        let parsed = parse_probe_output(
+            "laptop",
+            "===PROBE_START===\nAGENT_DATA=/Users/test/Library/Application Support/Grok Bot/sand-client-persistence|1|200\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===",
+            1,
+        );
+        assert_eq!(parsed.detected_agents.len(), 2);
+        let generator = super::super::config::SourceConfigGenerator::new();
+        assert_eq!(
+            generator.generate_source("laptop", &parsed).paths,
+            vec!["/Users/test/.codex/sessions"]
+        );
     }
 
     #[test]
@@ -1427,6 +1581,24 @@ CASS_VERSION=0.4.2
         assert_ne!(
             infer_agent_type("~/.prime/agent/sessions"),
             infer_agent_type("~/.pi/agent/sessions")
+        );
+        assert_eq!(infer_agent_type("/home/user/.prime/agent"), "prime_agent");
+        assert_eq!(infer_agent_type("/home/user/.prime/agent-other"), "unknown");
+        assert_eq!(infer_agent_type("~/.letta/transcripts"), "letta_code");
+        assert_eq!(
+            infer_agent_type("/home/user/.letta/transcripts-other"),
+            "unknown"
+        );
+        assert_eq!(infer_agent_type("~/.omp/agent/sessions"), "omp");
+        assert_eq!(
+            infer_agent_type("~/.omp/profiles/work/agent/sessions"),
+            "omp"
+        );
+        assert_eq!(infer_agent_type("~/.local/share/omp/sessions"), "omp");
+        assert_eq!(infer_agent_type("~/.local/share/omp"), "omp");
+        assert_eq!(
+            infer_agent_type("/srv/xdg/omp/profiles/work/sessions"),
+            "omp"
         );
     }
 

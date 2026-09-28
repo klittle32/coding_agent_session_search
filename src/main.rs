@@ -1,3 +1,10 @@
+// `unsafe` is denied crate-wide outside tests; the only sanctioned sites carry
+// `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
+#![cfg_attr(not(test), deny(unsafe_code))]
+
+mod logical_archive;
+mod search_service;
+
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
         .ok()
@@ -171,6 +178,7 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
+#[allow(unsafe_code)]
 fn apply_default_tantivy_writer_thread_cap() {
     let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
@@ -182,6 +190,7 @@ fn apply_default_tantivy_writer_thread_cap() {
         // any Tantivy writers.
         let default_cap =
             coding_agent_search::search::tantivy::default_tantivy_max_writer_threads();
+        // SAFETY: single-threaded startup before any runtime thread exists.
         unsafe {
             std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
         }
@@ -204,6 +213,7 @@ fn apply_default_tantivy_writer_thread_cap() {
 ///
 /// Operators who need full per-cursor provenance can override by exporting
 /// `FSQLITE_READ_WITNESS_CAP=0` (or any value) before launching cass.
+#[allow(unsafe_code)]
 fn apply_default_fsqlite_read_witness_cap() {
     // The env var is parsed once by frankensqlite at first cursor construction
     // and cached in a process-wide OnceLock, so a later `set_var` after a
@@ -249,6 +259,39 @@ fn main() -> anyhow::Result<()> {
     apply_default_fsqlite_read_witness_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_command_name(&raw_args) == Some("archive") {
+        // Explicit interchange stays outside ordinary search/maintenance setup.
+        let result = logical_archive::run(raw_args);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            tracing::warn!("logical archive bridge teardown exceeded its deadline");
+        }
+        return match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let (code, kind, retryable) = logical_archive::classify_failure(&error);
+                let payload = serde_json::json!({
+                    "error": {
+                        "code": code,
+                        "kind": kind,
+                        "message": error.to_string(),
+                        "retryable": retryable
+                    }
+                });
+                eprintln!("{payload}");
+                std::process::exit(code);
+            }
+        };
+    }
+    if raw_command_name(&raw_args) == Some("serve") {
+        let result = search_service::run(raw_args);
+        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
+            tracing::warn!("search service bridge teardown exceeded its deadline");
+        }
+        return match result {
+            Ok(()) => Ok(()),
+            Err(err) => handle_fatal_error(err),
+        };
+    }
     let parsed = match coding_agent_search::parse_cli(raw_args) {
         Ok(parsed) => parsed,
         Err(err) => handle_fatal_error(err),
@@ -279,7 +322,18 @@ fn main() -> anyhow::Result<()> {
         asupersync::runtime::RuntimeBuilder::multi_thread().build()?
     };
 
-    match runtime.block_on(coding_agent_search::run_with_parsed(parsed)) {
+    let result = runtime.block_on(coding_agent_search::run_with_parsed(parsed));
+    // Tear down scheduler threads while normal thread operations are still
+    // available. On Windows, deferring a cached bridge runtime's final drop to
+    // the CRT thread-local destructor phase makes JoinHandle::join fail with
+    // `threads should not terminate unexpectedly` after a successful command.
+    let bridges_shutdown = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+    let runtime_shutdown = runtime.shutdown_timeout(std::time::Duration::from_secs(30));
+    if !bridges_shutdown || !runtime_shutdown {
+        tracing::warn!("asupersync runtime teardown exceeded 30 seconds");
+    }
+
+    match result {
         Ok(()) => Ok(()),
         Err(err) => handle_fatal_error(err),
     }

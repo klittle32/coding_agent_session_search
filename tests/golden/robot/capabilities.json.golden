@@ -50,21 +50,26 @@
     "cursor",
     "chatgpt",
     "pi_agent",
+    "omp",
     "factory",
     "openclaw",
     "antigravity",
     "prime_agent",
     "kimi",
+    "kiro",
     "muse",
     "openhands",
     "copilot",
     "copilot_cli",
     "qwen",
     "grok",
-    "letta_code",
+    "devin",
+    "grok_bot",
+    "codebuff",
     "goose",
     "crush",
-    "hermes"
+    "hermes",
+    "shelley"
   ],
   "global_flags": [
     {
@@ -268,6 +273,23 @@
           ]
         },
         {
+          "name": "reconcile-conversation",
+          "description": "Targeted, idempotent lexical reconcile for ONE canonical conversation id (gh#382 partial-prefix recovery): upserts the conversation's full capped message set under stable document identities and publishes a successor generation. Retry-safe; no corpus-wide replay; the canonical archive is opened read-only",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "gc",
+          "description": "Reclaim merge-retired lexical segment files and exit (gh#453). Opens the lexical writer, which runs the engine's grace-period garbage sweep: a segment file is unlinked only once no published MANIFEST generation has referenced it for the engine's grace period (300 s), so readers on the previous generation are safe. Scans no sources and re-indexes nothing; every incremental `cass index` performs the same sweep at open. Reports files and bytes reclaimed (`--json` for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "watch",
           "description": "Watch for changes and reindex automatically",
           "arg_type": "flag",
@@ -295,7 +317,7 @@
         },
         {
           "name": "semantic",
-          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress",
+          "description": "Build semantic vector index after text indexing. Progress reports canonical replay, embedding, vector publish, optional HNSW, manifest publish, and finalization as distinct phases. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only while still reporting semantic phase progress. Set CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote the stall detector to a hard abort (exit 70) in every phase it reports on, including the otherwise report-only semantic/scribe lanes (issue #437)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -316,11 +338,10 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, fastembed)",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
-          "required": false,
-          "default": "fastembed"
+          "required": false
         },
         {
           "name": "data-dir",
@@ -377,6 +398,17 @@
           ]
         },
         {
+          "name": "background",
+          "description": "Run as a low-priority background job: lowers this process's CPU priority (nice, default 15; CASS_BACKGROUND_NICE) and I/O priority (ionice idle class on Linux; CASS_BACKGROUND_IONICE_CLASS) before indexing. This is what stale-on-read catch-up, `cass schedule`, and the daemon's periodic refresh use. Has no effect on what gets indexed",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -419,6 +451,27 @@
       "description": "Generate man page to stdout",
       "arguments": [],
       "has_json_output": false
+    },
+    {
+      "name": "bookmarks",
+      "description": "Save, list, search, remove, export, and import bookmarks (bookmarks.db)",
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "robot-docs",
@@ -514,7 +567,7 @@
         },
         {
           "name": "fields",
-          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
+          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id` or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -655,7 +708,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
+          "description": "Also mark query-term occurrences the engine left unmarked; snippets always mark matched terms with **bold** (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -691,7 +744,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -792,6 +845,17 @@
           ]
         },
         {
+          "name": "no-maintenance",
+          "description": "Execute search as a strict read-only operation. Never refresh a checkpoint, launch or join lexical maintenance, or spawn detached catch-up work. Conflicts with --refresh and --daemon because daemon auto-spawn creates runtime state",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -855,7 +919,7 @@
         },
         {
           "name": "fields",
-          "description": "Select answer-pack top-level fields. Presets: minimal, summary, all",
+          "description": "Select answer-pack fields. Presets: minimal, standard, full, summary, all",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -1024,6 +1088,17 @@
           "value_type": "integer",
           "required": false,
           "default": "2592000"
+        },
+        {
+          "name": "include-skill-content",
+          "description": "Include skill payload excerpts. Credentials remain redacted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "require-evidence",
@@ -1402,6 +1477,13 @@
           "default": "1800"
         },
         {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_TRIAGE_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -1607,7 +1689,7 @@
     },
     {
       "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
+      "description": "Inspect file lines, or follow a search hit with --message-index",
       "arguments": [
         {
           "name": "path",
@@ -1633,7 +1715,14 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show (1-indexed)",
+          "description": "Physical file line (1-based), NOT search's line_number; use --message-index for hits",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -1656,6 +1745,13 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_VIEW_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "robot-format",
@@ -1716,10 +1812,41 @@
         },
         {
           "name": "binary-only",
-          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. For binary promotion gates and packaging smoke tests that must validate a candidate binary on a host whose archive happens to be stale (#398)",
+          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. Use `cass selftest` instead when the probe must avoid opening the configured archive entirely (#398)",
           "arg_type": "flag",
           "required": false,
           "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "selftest",
+      "description": "Verify this executable without reading or writing the configured archive. Intended for package installation and binary-promotion gates",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output a stable machine-readable result (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
           "enum_values": [
             "true",
             "false"
@@ -2017,6 +2144,17 @@
           ]
         },
         {
+          "name": "repair-leaked-pages",
+          "description": "Free leaked pages (integrity_check's \"page N is never used\": pages no table, index or freelist owns) in place. Refuses any other integrity damage. Supports `--dry-run`; mutation requires `--yes` and backs up the live bundle first (`cass doctor backups restore`)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "cleanup-interrupted-artifacts",
           "description": "Quarantine interrupted `raw_mirror_capture` staging artifacts that block doctor mutation, instead of forcing a manual `rm` inside the data dir. Requires `--yes`; artifacts are renamed into a quarantine dir, never deleted",
           "arg_type": "flag",
@@ -2176,7 +2314,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Prime Agent, Gemini, Antigravity)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, Pi Agent, Oh My Pi, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",
@@ -2435,8 +2573,9 @@
         },
         {
           "name": "include-tools",
-          "description": "Include tool calls in export (default: true)",
-          "arg_type": "flag",
+          "description": "Include tool calls in the export; `--include-tools=false` omits them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2446,8 +2585,9 @@
         },
         {
           "name": "show-timestamps",
-          "description": "Show message timestamps",
-          "arg_type": "flag",
+          "description": "Show message timestamps; `--show-timestamps=false` hides them (default: true)",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
           "default": "true",
           "enum_values": [
@@ -2479,9 +2619,13 @@
           "name": "theme",
           "description": "Default theme (dark or light)",
           "arg_type": "option",
-          "value_type": "string",
+          "value_type": "enum",
           "required": false,
-          "default": "dark"
+          "default": "dark",
+          "enum_values": [
+            "dark",
+            "light"
+          ]
         },
         {
           "name": "dry-run",
@@ -2542,7 +2686,7 @@
     },
     {
       "name": "expand",
-      "description": "Show messages around a specific line in a session file",
+      "description": "Expand a search hit with --message-index, or inspect raw JSONL with --line",
       "arguments": [
         {
           "name": "path",
@@ -2561,10 +2705,24 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show context around",
+          "description": "Physical file line, NOT search's line_number; use --message-index for hits",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "conversation-id",
+          "description": "Exact conversation_id from search (disambiguates shared source paths)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "context",
@@ -2752,6 +2910,18 @@
             "basename",
             "full",
             "hash"
+          ]
+        },
+        {
+          "name": "share-profile",
+          "description": "Share profile applied to every exported text: public (home paths, usernames, project names, hostnames, emails and other personal data), team (home paths and personal data), personal (nothing). Credentials are never rewritten; the secret scan rejects them. Default: public for a plaintext export, team when encrypted",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "public",
+            "team",
+            "personal"
           ]
         },
         {
@@ -2953,12 +3123,27 @@
     {
       "name": "quarantine",
       "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "forget",
-      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets. Source files are kept: a source that changes afterwards is indexed again",
       "arguments": [
         {
           "name": "source-glob",
@@ -3015,50 +3200,170 @@
     {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "sources",
       "description": "Manage remote sources (P5.x)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "models",
       "description": "Manage semantic search models",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "fleet",
       "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "lessons",
       "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "swarm",
       "description": "Read-only swarm operations status, work packets, and coordination lint",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "import",
       "description": "Import data from external sources",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "analytics",
       "description": "Token usage, tool, and model analytics",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "release-verify",
@@ -3177,6 +3482,27 @@
         }
       ],
       "has_json_output": false
+    },
+    {
+      "name": "schedule",
+      "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "exit_codes": [
@@ -3206,9 +3532,9 @@
     },
     {
       "code": "4",
-      "meaning": "network error",
-      "retryable": "yes",
-      "agent_action": "Check connectivity or remote source configuration, then retry."
+      "meaning": "I/O failure or unsafe operation refused",
+      "retryable": "maybe",
+      "agent_action": "Branch on err.kind: fix the path, permissions, or free space for io/output-not-writable; follow err.hint for refused-unsafe. Not a network code: remote sources fail with 12, model downloads with 20-23."
     },
     {
       "code": "5",
@@ -3218,9 +3544,9 @@
     },
     {
       "code": "6",
-      "meaning": "incompatible version",
+      "meaning": "required input missing",
       "retryable": "no",
-      "agent_action": "Upgrade cass or the calling client before retrying."
+      "agent_action": "Supply the missing input named by err.kind (a password via --password-stdin, or a resume command), then rerun."
     },
     {
       "code": "7",
@@ -3230,9 +3556,9 @@
     },
     {
       "code": "8",
-      "meaning": "partial result",
+      "meaning": "partial result (sources sync only)",
       "retryable": "yes",
-      "agent_action": "Increase timeout or page through remaining results."
+      "agent_action": "Some sources had path failures: inspect the per-source errors and re-sync the failed sources. Search/pack timeouts exit 0 with budget.timed_out instead."
     },
     {
       "code": "9",
@@ -3299,6 +3625,18 @@
       "meaning": "I/O during model verify/install",
       "retryable": "maybe",
       "agent_action": "Fix filesystem permissions or disk space, then retry."
+    },
+    {
+      "code": "70",
+      "meaning": "index stalled and aborted",
+      "retryable": "yes",
+      "agent_action": "Read the kind index-stalled envelope on stderr and cass status --json, then rerun cass index; the lock is reaped on the next start."
+    },
+    {
+      "code": "130",
+      "meaning": "interrupted (SIGINT)",
+      "retryable": "yes",
+      "agent_action": "Rerun the command; cass sources setup --resume continues an interrupted setup."
     }
   ],
   "env_vars": [
@@ -3335,6 +3673,51 @@
     {
       "name": "CASS_SEARCH_MODE",
       "description": "Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml."
+    },
+    {
+      "name": "CASS_STATUS_BUDGET_MS",
+      "default": "8000",
+      "description": "Robot status execution budget in milliseconds. After expiry, optional or expensive sections are reported in budget.skipped_sections."
+    },
+    {
+      "name": "CASS_DOCTOR_BUDGET_MS",
+      "default": "8000",
+      "description": "Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out."
+    },
+    {
+      "name": "CASS_FTS_DRYRUN_CAP",
+      "default": "4096",
+      "description": "Row-ID comparison cap for the read-only 'doctor --rebuild-canonical-fts --dry-run' divergence scan (#345). At the cap the dry-run stops and reports a '>= N divergent' floor instead of an exact count; exact parity is deferred to the --yes apply path. Positive integer; invalid values fall back to the default."
+    },
+    {
+      "name": "CASS_VIEW_BUDGET_MS",
+      "default": "10000",
+      "description": "Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe."
+    },
+    {
+      "name": "CASS_SEARCH_BUDGET_MS",
+      "default": "120000",
+      "description": "Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
+    },
+    {
+      "name": "CASS_TRIAGE_BUDGET_MS",
+      "default": "8000",
+      "description": "Robot triage read-only probe budget in milliseconds. On expiry, incomplete readiness sections are reported in budget.skipped_sections."
+    },
+    {
+      "name": "CASS_PACK_BUDGET_MS",
+      "default": "10000",
+      "description": "Fallback structured pack execution budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
+    },
+    {
+      "name": "CASS_FLEET_PER_HOST_BUDGET_MS",
+      "default": "8000",
+      "description": "Maximum read-only probe budget per host, in milliseconds, for sources doctor and fleet upgrade rehearsal."
+    },
+    {
+      "name": "CASS_FLEET_BUDGET_MS",
+      "default": "60000",
+      "description": "Overall read-only probe budget, in milliseconds, for sources doctor and fleet upgrade rehearsal."
     },
     {
       "name": "TOON_DEFAULT_FORMAT",
@@ -3387,6 +3770,61 @@
       "description": "Suppress NDJSON progress events from cass index --json when set to 1."
     },
     {
+      "name": "CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES",
+      "default": "536870912",
+      "description": "Reset a deferred bulk-ingest WAL after it reaches this many bytes; 0 disables the in-run bound."
+    },
+    {
+      "name": "CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE",
+      "default": "TRUNCATE",
+      "description": "Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE."
+    },
+    {
+      "name": "CASS_DEFER_ANALYTICS_UPDATES",
+      "default": "0",
+      "description": "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH",
+      "default": "1",
+      "description": "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH_COOLDOWN_SECS",
+      "default": "300",
+      "description": "Minimum seconds between two auto-spawned catch-up index runs per data dir."
+    },
+    {
+      "name": "CASS_BACKGROUND_NICE",
+      "default": "15",
+      "description": "nice value `cass index --background` applies to itself (0..=19)."
+    },
+    {
+      "name": "CASS_BACKGROUND_IONICE_CLASS",
+      "default": "3",
+      "description": "ionice class `cass index --background` applies to itself on Linux (3 = idle)."
+    },
+    {
+      "name": "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
+      "default": "0",
+      "description": "Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open."
+    },
+    {
+      "name": "CASS_DAEMON_INDEX_INTERVAL_SECS",
+      "default": "0",
+      "description": "While the semantic daemon is resident, spawn a detached incremental `cass index --background` every N seconds (0 = off; 900 recommended). Skipped under severe load and while another index run holds the lock."
+    },
+    {
+      "name": "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
+      "default": "200",
+      "description": "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute."
+    },
+    {
+      "name": "CASS_SCHEDULE_MAX_LOAD_DEFERRAL_SECS",
+      "default": "10800",
+      "description": "Longest severe machine load may keep skipping scheduled incremental runs, measured from the last incremental run that completed; past it the run goes ahead at scheduler priority. 0 = skip for load without limit."
+    },
+    {
       "name": "CASS_INDEX_STALL_DETECT_SECS",
       "default": "120",
       "description": "Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection."
@@ -3394,7 +3832,12 @@
     {
       "name": "CASS_INDEX_STALL_ABORT_SECS",
       "default": "300",
-      "description": "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only."
+      "description": "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only unless CASS_INDEX_STALL_ABORT_ALL_PHASES=1."
+    },
+    {
+      "name": "CASS_INDEX_STALL_ABORT_ALL_PHASES",
+      "default": "0",
+      "description": "Opt-in (#437): promote the stall watchdog's report-only warnings to a hard abort (exit 70) in ANY phase — including scribe/accumulate and semantic report-only lanes — once CASS_INDEX_STALL_ABORT_SECS elapses without progress. The finalize/persist grace thresholds still apply; phases whose detection is suppressed (opaque HNSW, quiescent watch idle) never warn and therefore never abort."
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",
@@ -3450,8 +3893,37 @@
       "description": "Override Aider session discovery root."
     },
     {
+      "name": "CASS_OMP_DATA_ROOT",
+      "description": "Declare an OMP-only archive/store root; CASS assigns OMP identity and resume plans preserve its exact sessions root."
+    },
+    {
+      "name": "PI_SESSIONS_DIR",
+      "description": "Override the exact Pi Agent sessions directory."
+    },
+    {
       "name": "PI_CODING_AGENT_DIR",
-      "description": "Override Pi Agent session discovery root."
+      "description": "Override the shared Pi-family agent directory; ambiguous paths remain Pi Agent-owned. Use CASS_OMP_DATA_ROOT for OMP-only ownership."
+    },
+    {
+      "name": "PI_CODING_AGENT_SESSION_DIR",
+      "description": "Override the OMP session directory exactly; resume plans preserve this root with --session-dir."
+    },
+    {
+      "name": "PI_CONFIG_DIR",
+      "default": ".omp",
+      "description": "Override the OMP config directory name beneath the user home."
+    },
+    {
+      "name": "OMP_PROFILE",
+      "description": "Select an isolated OMP profile; takes precedence over PI_PROFILE."
+    },
+    {
+      "name": "PI_PROFILE",
+      "description": "Legacy fallback for selecting an isolated OMP profile."
+    },
+    {
+      "name": "XDG_DATA_HOME",
+      "description": "Select the XDG data root, including OMP v18 session and profile stores."
     },
     {
       "name": "CODEX_HOME",
@@ -3515,10 +3987,10 @@
     {
       "name": "bounded-search",
       "intent": "Search sessions without flooding the caller's token budget.",
-      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id --max-content-length 800 --robot-meta",
       "follow_up_commands": [
-        "cass view <source_path> -n <line_number> --json",
-        "cass expand <source_path> --line <line_number> -C 3 --json",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 3 --json",
         "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10"
       ],
       "parse_contract": "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
@@ -3529,8 +4001,8 @@
       "intent": "Build a deterministic cited handoff bundle for another agent.",
       "first_command": "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
       "follow_up_commands": [
-        "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
-        "cass view <source_path> -n <line_number> --json"
+        "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id --robot-meta",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json"
       ],
       "parse_contract": "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
       "note": "Use pack when the downstream consumer needs citations rather than raw search hits."
@@ -3538,14 +4010,14 @@
     {
       "name": "session-drilldown",
       "intent": "Move from a hit to surrounding conversation context.",
-      "first_command": "cass view <source_path> -n <line_number> --json",
+      "first_command": "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
       "follow_up_commands": [
-        "cass expand <source_path> --line <line_number> -C 5 --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 5 --json",
         "cass context <source_path> --json",
         "cass resume <source_path> --shell"
       ],
-      "parse_contract": "Parse path, line_number, message, surrounding messages, and resume command output.",
-      "note": "Use source_path and line_number from search hits; do not infer file formats by hand."
+      "parse_contract": "Parse coordinate_space, message_index, conversation_id, source_id, content, and is_target in the returned messages.",
+      "note": "Pass source_path, source_id, conversation_id, and line_number from the same hit; line_number belongs to --message-index, not raw --line."
     },
     {
       "name": "semantic-models",
@@ -3758,13 +4230,13 @@
       "wrong": "cass view session.jsonl --line-number 42 --json",
       "canonical": "cass view session.jsonl --line 42 --json",
       "accepted": true,
-      "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
+      "behavior": "Legacy --line-number/--line_number flags still inspect raw lines; use --message-index for search hits."
     },
     {
       "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
-      "canonical": "cass view session.jsonl --source local --line 42 --json",
+      "canonical": "cass view session.jsonl --source local --message-index 42 --json",
       "accepted": true,
-      "behavior": "Search-result field bundles can be pasted directly into follow-up drill-down commands."
+      "behavior": "Pasted line_number fields select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations."
     },
     {
       "wrong": "cass search auth --format json",

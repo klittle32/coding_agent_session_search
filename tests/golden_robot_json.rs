@@ -1,14 +1,14 @@
 //! Golden-file regression tests for cass robot-mode JSON outputs.
 //!
 //! Bead `u9osp`: cass ships a robot/LLM discovery surface via
-//! `cass capabilities --json`, `cass robot-docs --json`, `cass health --json`,
-//! and `cass models status --json`. These payloads are the contract every
+//! `cass capabilities --json`, `cass robot-docs --json`, `cass selftest --json`,
+//! `cass health --json`, and `cass models status --json`. These payloads are the contract every
 //! downstream agent consumes — a single renamed field or moved key silently
 //! breaks every consumer without failing any existing test.
 //!
 //! This file freezes the **shape** of those payloads against scrubbed golden
 //! files under `tests/golden/robot/`. Scrubbing rules live in
-//! [`scrub_robot_json`] below; see `tests/golden/robot/PROVENANCE.md` for
+//! [`scrub_robot_json`] below; see `tests/golden/PROVENANCE.md` for
 //! regeneration procedure.
 //!
 //! ## Regenerating a golden
@@ -59,11 +59,45 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         .env("GEMINI_HOME", gemini_home)
         .env("OPENCODE_STORAGE_ROOT", opencode_root)
         .env("CASS_AIDER_DATA_ROOT", aider_root)
+        // WS-A.6: the Pi family connectors honor these overrides ahead of
+        // the synthetic HOME. On 2026-09-01 a fleet worker's real
+        // `~/.pi/agent/sessions` leaked into `search_robot` and
+        // `stats_full_payload` through exactly this gap. Pin every override
+        // to a path inside the test HOME so the goldens observe only the
+        // fixture, whatever the host's environment says.
+        .env("PI_SESSIONS_DIR", test_home.join(".pi-sessions-missing"))
+        .env("PI_CODING_AGENT_DIR", test_home.join(".pi-agent-missing"))
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            test_home.join(".pi-coding-agent-sessions-missing"),
+        )
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_PROFILE")
+        // WS-A.6: stale-on-read auto-refresh is suppressed only for data dirs
+        // under the OS temp dir, and rch workers place `tempfile` dirs beneath
+        // the checkout, so a golden `search`/`stats` could spawn a detached
+        // `cass index --background` into the fixture copy. (The 2026-09-01
+        // leak itself came from `tests/cli_robot.rs` refreshing the committed
+        // fixture in place before these tests copied it; both writers are now
+        // off.) Goldens observe a fixture, never a live refresh.
+        .env("CASS_AUTO_REFRESH", "0")
+        // Never probe or connect to a daemon owned by the host running the
+        // golden suite. The default socket is user-global, while each golden
+        // must observe only its synthetic HOME.
+        .env("CASS_DAEMON_SOCKET", test_home.join("cass-daemon.sock"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");
     cmd
+}
+
+/// Keep doctor fixtures independent of a repository that happens to contain
+/// the platform temp directory. RCH workers may place `tempfile` directories
+/// beneath the checkout; without this inner repository boundary, doctor sees
+/// the checkout's `.gitignore` as policy for the synthetic archive.
+fn isolate_doctor_fixture_from_parent_repo(test_home: &Path) -> io::Result<()> {
+    fs::create_dir(test_home.join(".git"))
 }
 
 fn seed_analytics_incidents_fixture(test_home: &Path) -> PathBuf {
@@ -427,6 +461,41 @@ fn looks_like_json_schema_object(value: &Value) -> bool {
 fn normalize_live_robot_values(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            let is_topology_budget = map.contains_key("topology")
+                && map.contains_key("reserved_core_policy")
+                && map.contains_key("advisory_budgets")
+                && map.contains_key("fallback_active")
+                && map.contains_key("decision_reason")
+                && map.contains_key("proof_notes");
+            if is_topology_budget {
+                if let Some(topology) = map.get_mut("topology").and_then(Value::as_object_mut) {
+                    topology.insert("source".to_string(), json!("fallback"));
+                    topology.insert("memory_total_bytes".to_string(), Value::Null);
+                    topology.insert("memory_available_bytes".to_string(), Value::Null);
+                }
+                if let Some(policy) = map
+                    .get_mut("reserved_core_policy")
+                    .and_then(Value::as_object_mut)
+                {
+                    policy.insert("policy".to_string(), json!("current conservative default"));
+                    policy.insert(
+                        "reason".to_string(),
+                        json!("topology could not be derived, so cass preserves existing worker and RAM defaults"),
+                    );
+                }
+                map.insert("fallback_active".to_string(), json!(true));
+                map.insert(
+                    "decision_reason".to_string(),
+                    json!("using conservative defaults: linux sysfs topology is unavailable on this platform"),
+                );
+                map.insert(
+                    "proof_notes".to_string(),
+                    json!([
+                        "fallback is intentionally isomorphic to current defaults for live rebuild budgets",
+                        "no /sys-derived CPU locality assumptions are made in fallback mode"
+                    ]),
+                );
+            }
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
@@ -445,6 +514,18 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
+                    "os" | "arch" if child.is_string() => {
+                        *child = if key == "os" {
+                            json!("[OS]")
+                        } else {
+                            json!("[ARCH]")
+                        };
+                        continue;
+                    }
+                    "last_snapshot" | "last_reason" => {
+                        *child = json!("[LIVE_SAMPLE]");
+                        continue;
+                    }
                     "current_capacity_pct" => {
                         *child = json!(100);
                         continue;
@@ -553,6 +634,14 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
                     },
                     "semantic_batchers": {
                         "type": "integer"
+                    },
+                    "last_snapshot": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "load_per_core": {
+                                "type": "number"
+                            }
+                        }
                     }
                 }
             }
@@ -576,6 +665,12 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
                     "semantic_batchers": 99,
                     "steady_batch_fetch_conversations": 768,
                     "startup_batch_fetch_conversations": 16
+                },
+                "watchdog": {
+                    "last_snapshot": {
+                        "load_per_core": 7.5
+                    },
+                    "last_reason": null
                 }
             }
         }
@@ -592,6 +687,11 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
     assert_eq!(
         scrubbed["response_schemas"]["health"]["properties"]["semantic_batchers"]["type"],
         "integer"
+    );
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["last_snapshot"]["properties"]["load_per_core"]
+            ["type"],
+        "number"
     );
     assert_eq!(
         scrubbed["schema_fragment"]["properties"]["logical_cpus"]["type"],
@@ -617,6 +717,78 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
         scrubbed["state"]["resource_policy"]["advisory_budgets"]["startup_batch_fetch_conversations"],
         32
     );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["watchdog"]["last_snapshot"],
+        "[LIVE_SAMPLE]"
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["watchdog"]["last_reason"],
+        "[LIVE_SAMPLE]"
+    );
+}
+
+#[test]
+fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let input = serde_json::to_string_pretty(&json!({
+        "topology_budget": {
+            "topology": {
+                "source": "linux_sysfs",
+                "topology_class": "dual_socket",
+                "logical_cpus": 96,
+                "physical_cores": 48,
+                "sockets": 2,
+                "numa_nodes": 2,
+                "llc_groups": 4,
+                "smt_threads_per_core": 2,
+                "memory_total_bytes": 123,
+                "memory_available_bytes": 45
+            },
+            "reserved_core_policy": {
+                "reserved_cores": 8,
+                "policy": "host-specific policy",
+                "reason": "host-specific reason"
+            },
+            "advisory_budgets": {},
+            "fallback_active": false,
+            "decision_reason": "planned from DualSocket",
+            "proof_notes": ["host-specific proof"]
+        },
+        "near_miss_without_proof_notes": {
+            "topology": {
+                "source": "linux_sysfs",
+                "memory_total_bytes": 999,
+                "memory_available_bytes": 888
+            },
+            "reserved_core_policy": {},
+            "advisory_budgets": {},
+            "fallback_active": false,
+            "decision_reason": "must remain live"
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
+    let topology_budget = &scrubbed["topology_budget"];
+
+    assert_eq!(topology_budget["topology"]["source"], "fallback");
+    assert!(topology_budget["topology"]["memory_total_bytes"].is_null());
+    assert!(topology_budget["topology"]["memory_available_bytes"].is_null());
+    assert_eq!(topology_budget["fallback_active"], true);
+    assert!(topology_budget["reserved_core_policy"].is_object());
+    assert!(topology_budget["advisory_budgets"].is_object());
+    assert!(topology_budget["proof_notes"].is_array());
+
+    let near_miss = &scrubbed["near_miss_without_proof_notes"];
+    assert_eq!(near_miss["topology"]["source"], "linux_sysfs");
+    assert_eq!(near_miss["topology"]["memory_total_bytes"], "[LIVE_BYTES]");
+    assert_eq!(
+        near_miss["topology"]["memory_available_bytes"],
+        "[LIVE_BYTES]"
+    );
+    assert_eq!(near_miss["fallback_active"], false);
+    assert_eq!(near_miss["decision_reason"], "must remain live");
 }
 
 #[test]
@@ -775,6 +947,12 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     //    shape-relevant and stay in the golden.
     let home_str = test_home.display().to_string();
     if !home_str.is_empty() {
+        // macOS may report the same temporary directory through its canonical
+        // `/private` alias even when `tempfile` returned the `/var/...` spelling.
+        // Replace the longer alias first so both spellings collapse to one
+        // portable fixture root instead of leaving `/private[TEST_HOME]`.
+        let private_home_str = format!("/private{home_str}");
+        out = out.replace(&private_home_str, "[TEST_HOME]");
         out = out.replace(&home_str, "[TEST_HOME]");
     }
 
@@ -815,11 +993,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""slowest_operation": "[LIVE_OPERATION]""#)
         .to_string();
 
-    // 5b. The semantic daemon socket path derives from $TMPDIR and $USER
-    // ("$TMPDIR/semantic-daemon-$USER.sock"), so its value is pure host
-    // environment — a golden regenerated on a different machine (or through
-    // rch) would otherwise freeze that host's temp dir into the contract.
-    // Keep the field, scrub the value.
+    // 5b. The semantic daemon socket path is host-local. `cass_cmd` pins it to
+    // the fixture, and scrubbing its value keeps the contract stable for any
+    // direct callers that do not use that helper.
     let socket_path_re = regex::Regex::new(r#""socket_path"\s*:\s*"[^"]*""#).unwrap();
     out = socket_path_re
         .replace_all(&out, r#""socket_path": "[DAEMON_SOCKET]""#)
@@ -857,37 +1033,12 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .to_string();
     }
 
-    // 8. `last_snapshot` + `last_reason` in health --json vary between
-    // `null` (sampler has not yet fired) and a populated object/string
-    // (sampler has fired at least once) depending on timing. The content
-    // of the populated form already has its inner floats scrubbed by
-    // rule 6; the remaining difference is whether the sampler fired. Fold
-    // both forms to a single sentinel so the golden does not race the
-    // sampler timer. We match `null`, a string value, or a `{...}` object
-    // by consuming everything up to the next unescaped `"..."` key at the
-    // same indentation — kept narrow so the scrub only fires on the
-    // health watchdog block.
-    //
-    // The object form is multi-line pretty-printed JSON; `(?s)` enables
-    // `.` to match newlines. Non-greedy match `.*?` stops at the first
-    // closing `}` on its own line at the correct indent. We rely on the
-    // outer scrub-then-compare discipline: any false-positive collapse
-    // would still fail the golden because the sentinel would differ
-    // between runs — the goal is deterministic scrubbing, not semantic
-    // parsing.
-    let last_snapshot_obj_re = regex::Regex::new(r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#).unwrap();
-    out = last_snapshot_obj_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-    let last_snapshot_null_re = regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
-    out = last_snapshot_null_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-
-    let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
-    out = last_reason_re
-        .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
-        .to_string();
+    // 8. `last_snapshot` + `last_reason` in health --json vary depending on
+    // whether the responsiveness sampler has fired. They are normalized
+    // structurally in `normalize_live_robot_values` below. Keeping this out
+    // of the regex pass is essential: introspection embeds a nested JSON
+    // Schema named `last_snapshot`, and a brace-matching regex can truncate
+    // that schema into invalid JSON.
 
     // Resource policy status reports include host-live CPU and memory budgets.
     // The shape is contractual; the sampled worker/byte counts are not.
@@ -917,6 +1068,11 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "available_bytes",
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
+        // WS-B.4a: the archive footprint depends on the engine's page layout
+        // and on whether a WAL sidecar happens to exist; keep the keys, scrub
+        // the values.
+        "db_bytes",
+        "wal_bytes",
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re
@@ -1004,6 +1160,9 @@ fn assert_golden(name: &str, actual: &str) {
         .join("tests")
         .join("golden")
         .join(name);
+
+    serde_json::from_str::<Value>(actual)
+        .unwrap_or_else(|err| panic!("generated golden {name} is not valid JSON: {err}"));
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         std::fs::create_dir_all(golden_path.parent().unwrap()).expect("create golden parent dir");
@@ -1345,6 +1504,30 @@ fn health_shape_matches_golden() {
 }
 
 #[test]
+fn selftest_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["selftest", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    assert_golden("robot/selftest.json.golden", &scrubbed);
+}
+
+#[test]
+fn selftest_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let selftest = capture_robot_json_value(
+        test_home.path(),
+        &["selftest", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&selftest)).expect("pretty-print JSON");
+    assert_golden("robot/selftest_shape.json.golden", &canonical);
+}
+
+#[test]
 fn onboarding_json_matches_golden() {
     // `cass onboarding --json` on an isolated empty HOME: no providers detected,
     // no semantic model, no archive DB → recommended_action=discover_sources,
@@ -1523,8 +1706,9 @@ fn diag_quarantine_json_matches_golden() {
 }
 
 #[test]
-fn doctor_quarantine_json_matches_golden() {
+fn doctor_quarantine_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let data_dir = seed_diag_quarantine_fixture(test_home.path());
     let output = cass_cmd(test_home.path())
         .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
@@ -1549,6 +1733,7 @@ fn doctor_quarantine_json_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/doctor_quarantine.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
@@ -2262,24 +2447,59 @@ fn export_html_shape_matches_golden() {
 // of the pin; the shape-side lives in doctor_shape.json.golden
 // (bead q931h).
 #[test]
-fn doctor_json_matches_golden() {
+fn doctor_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let scrubbed = capture_robot_json(
         test_home.path(),
         &["doctor", "--json"],
         ExpectStatus::ExitOk,
     );
     assert_golden("robot/doctor.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
-fn status_shape_matches_golden() {
+fn status_shape_matches_golden() -> Result<(), &'static str> {
     let test_home = tempfile::tempdir().expect("create temp home");
     let mut status = capture_robot_json_value(
         test_home.path(),
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
+    // The load-average controller is Linux-only by default, so these fields
+    // are numbers on Linux and null elsewhere. Validate that runtime contract,
+    // then pin one representative number so the shape golden is portable.
+    for (pointer, representative) in [
+        (
+            "/rebuild/pipeline/controller_loadavg_high_watermark_1m",
+            121.0,
+        ),
+        (
+            "/rebuild/pipeline/controller_loadavg_low_watermark_1m",
+            120.0,
+        ),
+    ] {
+        let Some(value) = status.pointer_mut(pointer) else {
+            return Err("status shape fixture missing a load-average controller field");
+        };
+        if !(value.is_null() || value.is_number()) {
+            return Err("status shape fixture load-average field was not null|number");
+        }
+        *value = json!(representative);
+    }
+    for pointer in [
+        "/topology_budget/topology/memory_total_bytes",
+        "/topology_budget/topology/memory_available_bytes",
+    ] {
+        let Some(value) = status.pointer_mut(pointer) else {
+            return Err("status shape fixture missing a topology memory field");
+        };
+        if !(value.is_null() || value.is_u64()) {
+            return Err("status shape fixture topology memory field was not null|u64");
+        }
+        *value = json!(536_870_912_u64);
+    }
     // Keep the warnings array item schema pinned even when this fixture has no
     // warning instances.
     if let Some(warnings) = status
@@ -2292,11 +2512,13 @@ fn status_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
     assert_golden("robot/status_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]
-fn doctor_shape_matches_golden() {
+fn doctor_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let doctor = capture_robot_json_value(
         test_home.path(),
         &["doctor", "--json"],
@@ -2305,6 +2527,7 @@ fn doctor_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&doctor)).expect("pretty-print JSON");
     assert_golden("robot/doctor_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]

@@ -18,6 +18,9 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use asupersync::runtime::{Runtime, RuntimeBuilder};
@@ -36,8 +39,118 @@ use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocu
 /// authority, so its presence is what makes a directory readable.
 pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 
+/// Operator override for Quill's deterministic per-query work budget
+/// (`QuillConfig::query_fuel_budget`, default 10,000,000 units). The budget is
+/// what turns a pathological query into a fast typed refusal instead of an
+/// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
+/// knob; the durable fix for fuel exhaustion is a compacted index (#441).
+pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+
+/// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
+/// its context chain. The engine reports it as `... query fuel exhausted after
+/// N/M units ...`; callers use this to tell "the lexical engine refused the
+/// work" apart from an index fault.
+#[must_use]
+pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("query fuel exhausted"))
+}
+
+/// Whether `error` is Quill's posting-cursor invariant refusal
+/// (`ArgusError::CursorInvariant`), anywhere in its context chain. Unlike a
+/// busy or cancelled query, this failure belongs to the published
+/// generation: the same query over the same segments fails the same way every
+/// time (GH #499: a date-filtered Boolean over a sealed segment that holds
+/// tombstones), so callers must not report it as retryable.
+#[must_use]
+pub fn is_engine_invariant_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("posting cursor invariant failed")
+    })
+}
+
+/// Engine configuration every CASS reader and writer opens with.
+///
+/// Two deliberate departures from `QuillConfig::default()`:
+///
+/// * `max_visibility_lag_ms` is effectively infinite. Quill's default (1 s)
+///   is a cross-process visibility contract: once unpublished changes are a
+///   second old, the *next ingest call* seals every shard and publishes a new
+///   MANIFEST on its own. CASS never relies on that — every reader opens the
+///   snapshot CASS itself publishes through an explicit `commit()`, and the
+///   rebuild checkpoint (`.lexical-rebuild-state.json`) is written around that
+///   same commit. Letting the engine publish underneath the checkpoint is
+///   exactly what #440 reported: an interrupted `--force-rebuild` left a
+///   staging MANIFEST several conversations ahead of the durable cursor, so
+///   the resumed run re-inserted already-live identities and Quill refused
+///   the duplicate. It is also why #441's archives grew hundreds of tiny
+///   segments: a seal per shard per second, each in its own sparse docid
+///   lease, which the hole-ratio-gated tier merge can never fold. With
+///   explicit publication only, a segment is sealed on the accumulation
+///   budget or at commit, and the MANIFEST moves only when CASS says so.
+/// * `tier_fanout` is effectively infinite, which switches off the engine's
+///   own tier merge. That merge runs inside every commit and folds any
+///   `tier_fanout` adjacent same-tier segments, and its top tier has no upper
+///   bound: eight "large" segments are each wider than the medium boundary
+///   (524,288 docids), so their fold spans more than 4,194,304 documents —
+///   the per-term posting limit every Quill reader and concat merge enforces
+///   ([`MAX_FOLD_OUTPUT_DOCS`]). On a multi-million-message archive a common
+///   token is in more documents than that, so the rebuild's final commit
+///   failed with "posting validation limit 4194304 exceeded" (GH #498). The
+///   same unbounded fold also bypassed the #456 merge-memory cap. CASS's own
+///   planners ([`plan_capped_merge_runs`], [`plan_capped_balanced_merge_runs`])
+///   already own merging after incremental runs and at the end of a rebuild,
+///   under both the byte cap and the document bound.
+/// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
+///
+/// Everything else keeps the engine default so the on-disk format and the
+/// admission semantics stay exactly what the pinned engine documents.
+#[must_use]
+pub fn cass_quill_config() -> QuillConfig {
+    let mut config = QuillConfig {
+        max_visibility_lag_ms: u64::MAX,
+        tier_fanout: usize::MAX,
+        ..QuillConfig::default()
+    };
+    if let Some(budget) = query_fuel_budget_override(
+        dotenvy::var(CASS_QUILL_QUERY_FUEL_BUDGET_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        config.query_fuel_budget = budget;
+    }
+    config
+}
+
+/// Parse the fuel-budget override. Zero, garbage, and absent all mean "keep
+/// the engine default" — a zero budget would refuse every query, which is
+/// never what an operator setting this variable wants.
+fn query_fuel_budget_override(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|value| value.trim().replace('_', "").parse::<u64>().ok())
+        .filter(|budget| *budget > 0)
+}
+
 thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static READER_OPEN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reader_open_count() -> u64 {
+    READER_OPEN_COUNT.with(std::cell::Cell::get)
+}
+
+pub(crate) fn shutdown_driver() -> bool {
+    DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
 }
 
 /// Drive one Quill future to completion on the calling thread.
@@ -115,6 +228,33 @@ where
 pub fn refresh_reader(reader: &QuillSearchIndex) -> Result<bool> {
     drive(|cx| async move { reader.refresh(&cx).await })
         .map_err(|error| anyhow!("refreshing the Quill CASS reader: {error}"))
+}
+
+/// Refresh a reader in place, or report that its directory was republished.
+///
+/// A lexical rebuild publishes by exchanging the whole index directory
+/// (`publish_staged_lexical_index`: `cass index --full`, forget, dedup, agent
+/// purge, the background repair). The path then holds a new index whose
+/// MANIFEST generations restart, and read-only catch-up refuses it as a
+/// generation regression, a reused generation, or a watermark rollback. A
+/// long-lived reader would fail every later search. `Ok(None)` is an in-place
+/// refresh; `Ok(Some(reason))` means the path must be opened again.
+///
+/// # Errors
+///
+/// Returns an error when the current publication cannot be read for any
+/// other reason.
+pub fn refresh_reader_or_detect_republish(reader: &QuillSearchIndex) -> Result<Option<String>> {
+    use frankensearch::quill::{QuillIndexError, SnapshotError};
+    match drive(|cx| async move { reader.refresh(&cx).await }) {
+        Ok(_) => Ok(None),
+        Err(QuillIndexError::Snapshot(
+            error @ (SnapshotError::KeeperGenerationRegression { .. }
+            | SnapshotError::KeeperGenerationCollision { .. }
+            | SnapshotError::KeeperTransition { .. }),
+        )) => Ok(Some(error.to_string())),
+        Err(error) => Err(anyhow!("refreshing the Quill CASS reader: {error}")),
+    }
 }
 
 /// One ranked hit from a Quill lexical search.
@@ -304,19 +444,217 @@ pub fn content_snippet_generator(
 ///
 /// Returns an error when the published snapshot cannot be opened.
 pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
+    #[cfg(test)]
+    READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
     drive(|cx| {
         let path = path.to_path_buf();
         async move {
-            QuillSearchIndex::open_with_schema(
-                &cx,
-                path,
-                CASS_SEMANTIC_SCHEMA,
-                QuillConfig::default(),
-            )
-            .await
+            QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, cass_quill_config())
+                .await
         }
     })
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
+}
+
+/// File name pattern of one published Quill segment inside an index directory.
+const QUILL_SEGMENT_FILE_PREFIX: &str = "seg-";
+const QUILL_SEGMENT_FILE_SUFFIX: &str = ".fslx";
+
+/// Live segment count of a published Quill index, from the engine's own
+/// reader — the number a query actually pays for. Costs an engine open, so
+/// it belongs on surfaces that may spend (`doctor`, tests), not on
+/// `status`/`health`, which report [`segment_file_count`] instead. Folded
+/// inputs stay on disk for a while after a merge, so the two can differ.
+#[must_use]
+pub fn live_segment_count(path: &Path) -> Option<usize> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    open_cass_reader(path)
+        .ok()
+        .and_then(|reader| reader.segment_count().ok())
+}
+
+/// Segment-file count above which `doctor` reports segment pressure (#441).
+/// Eight times the bounded-merge threshold: the post-run maintenance pass
+/// folds runs above the threshold, so a generation this far past it either
+/// predates the maintenance pass (a v0.7.1 archive) or is not being folded,
+/// and one `cass index --full` consolidates it.
+pub const CASS_SEGMENT_PRESSURE_FILES: usize = 8 * CASS_MERGE_SEGMENT_THRESHOLD;
+
+/// Number of segment files in a Quill index directory, from directory
+/// metadata alone — no engine open, no manifest parse.
+///
+/// This is the observation-surface cousin of [`QuillCassIndex::segment_count`]
+/// (#441, WS-B.1a): `status`/`health` must never open the engine, but an
+/// operator still needs to see an archive that has fragmented into hundreds
+/// of segments. Files on disk can briefly exceed the manifest's live segment
+/// count (a merge publishes before the folded inputs are removed), so this is
+/// a truthful upper bound labeled as such, not the live count. Returns `None`
+/// when the directory is not a Quill index.
+#[must_use]
+pub fn segment_file_count(path: &Path) -> Option<usize> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    let entries = std::fs::read_dir(path).ok()?;
+    Some(
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                        && name.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+                })
+            })
+            .count(),
+    )
+}
+
+/// Live-document accounting for a published Quill generation, read from the
+/// engine's MANIFEST alone (GH #457).
+///
+/// Every segment record in a Quill MANIFEST carries its live-at-seal
+/// `doc_count` and the generation's tombstone set for that segment, so the
+/// number of documents a query can actually return is
+/// `Σ (doc_count − tombstones)`. No segment file is opened, mapped or hashed,
+/// which keeps this cheap enough for `status`, `health` and
+/// `search --robot-meta`, none of which may spend an engine open.
+///
+/// This is the count a hollow generation cannot hide behind: the cass
+/// generation manifest and the rebuild checkpoint both record what a rebuild
+/// *published*, while this reads what the engine currently *serves*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuillManifestLiveDocs {
+    /// Documents that survive the generation's tombstones.
+    pub live_docs: u64,
+    /// Documents sealed into the referenced segments before any tombstoning.
+    pub sealed_docs: u64,
+    /// Tombstoned documents across every referenced segment.
+    pub tombstones: u64,
+    /// Segments the MANIFEST references (the count a query pays for).
+    pub segments: usize,
+    /// Monotone publication generation of the MANIFEST that was read.
+    pub generation: u64,
+    /// `true` when `MANIFEST` was missing or corrupt and the contents came
+    /// from `MANIFEST.prev` (the engine's own read-only crash recovery).
+    pub recovered_from_previous: bool,
+}
+
+/// Read [`QuillManifestLiveDocs`] for the Quill index at `path`.
+///
+/// `None` when the directory holds no decodable MANIFEST slot (an absent or
+/// corrupt generation is reported by the readiness surfaces on their own).
+#[must_use]
+pub fn manifest_live_doc_count(path: &Path) -> Option<QuillManifestLiveDocs> {
+    let loaded = frankensearch::quill::load_manifest_pair(path).ok()?;
+    let manifest = &loaded.manifest;
+    let mut live_docs = 0_u64;
+    let mut sealed_docs = 0_u64;
+    let mut tombstones = 0_u64;
+    for segment in &manifest.segments {
+        let sealed = u64::from(segment.doc_count);
+        let live = u64::from(segment.live_doc_count());
+        sealed_docs = sealed_docs.saturating_add(sealed);
+        live_docs = live_docs.saturating_add(live);
+        tombstones = tombstones.saturating_add(sealed.saturating_sub(live));
+    }
+    Some(QuillManifestLiveDocs {
+        live_docs,
+        sealed_docs,
+        tombstones,
+        segments: manifest.segments.len(),
+        generation: manifest.generation,
+        recovered_from_previous: !matches!(
+            loaded.source,
+            frankensearch::quill::ManifestSource::Current
+        ),
+    })
+}
+
+/// On-disk footprint of one Quill index directory, split by what a full
+/// rebuild has to reproduce versus what the engine reclaims on its own (#453).
+///
+/// A concat merge publishes its output and drops the folded inputs from the
+/// MANIFEST, but the input files stay on disk until the engine's writer-open
+/// garbage sweep has seen them unreferenced by both durable slots for a full
+/// grace period (`frankensearch_quill::DEFAULT_GARBAGE_GRACE`). Those files
+/// are not part of the index a rebuild rewrites, so the headroom preflight
+/// must not double them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuillDirectoryFootprint {
+    /// Bytes of the segment files the current MANIFEST references, plus every
+    /// other regular file in the directory (MANIFEST slots, lock record,
+    /// repair sidecars, staged temporaries).
+    pub live_bytes: u64,
+    /// Bytes of `seg-*.fslx` files the current MANIFEST no longer references
+    /// (merge-folded inputs awaiting the engine sweep) and of their
+    /// `.retired` receipts.
+    pub retired_bytes: u64,
+    /// Number of unreferenced `seg-*.fslx` files behind `retired_bytes`.
+    pub retired_segment_files: usize,
+}
+
+/// Canonical file name of a Quill segment, as the engine writes it.
+fn canonical_segment_file_name(segment_id: u64) -> String {
+    format!("{QUILL_SEGMENT_FILE_PREFIX}{segment_id:016x}{QUILL_SEGMENT_FILE_SUFFIX}")
+}
+
+/// Suffix of the engine's per-segment retirement receipt (`seg-<id>.fslx.retired`).
+const QUILL_RETIREMENT_RECEIPT_SUFFIX: &str = ".retired";
+
+/// Split one Quill index directory's regular files into live and retired
+/// bytes by reading the published MANIFEST (no engine open, no segment I/O).
+///
+/// Returns `None` when `path` is not a Quill index or its MANIFEST cannot be
+/// read, so a caller sizing storage falls back to counting everything as
+/// live: an unreadable manifest is a reason to be conservative, never to
+/// call bytes reclaimable. Only direct children are inspected; a Quill index
+/// directory is flat.
+#[must_use]
+pub fn quill_directory_footprint(path: &Path) -> Option<QuillDirectoryFootprint> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    let loaded = frankensearch::quill::load_manifest_pair(path).ok()?;
+    let live_segments: std::collections::HashSet<String> = loaded
+        .manifest
+        .segments
+        .iter()
+        .map(|segment| canonical_segment_file_name(segment.segment_id))
+        .collect();
+    let mut footprint = QuillDirectoryFootprint::default();
+    for entry in std::fs::read_dir(path).ok()?.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
+            continue;
+        };
+        let is_segment = name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+            && name.ends_with(QUILL_SEGMENT_FILE_SUFFIX);
+        let is_receipt = name
+            .strip_suffix(QUILL_RETIREMENT_RECEIPT_SUFFIX)
+            .is_some_and(|base| {
+                base.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                    && base.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+            });
+        if is_segment && !live_segments.contains(name) {
+            footprint.retired_bytes = footprint.retired_bytes.saturating_add(metadata.len());
+            footprint.retired_segment_files += 1;
+        } else if is_receipt {
+            footprint.retired_bytes = footprint.retired_bytes.saturating_add(metadata.len());
+        } else {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
+        }
+    }
+    Some(footprint)
 }
 
 /// Field handles for the compiled CASS schema.
@@ -386,6 +724,262 @@ pub struct QuillCassIndex {
     directory: PathBuf,
     /// Epoch milliseconds of the last compaction, 0 when never compacted.
     last_merge_ts: i64,
+    /// GH #446: liveness sink for the stall watchdog. `None` outside an
+    /// indexing run (searches, tests, tools) — no thread, no ticks.
+    liveness: Option<EngineLivenessProbe>,
+}
+
+/// Shared shape of every liveness callback (the indexer passes
+/// `IndexingProgress::tick_activity`).
+pub type EngineHeartbeat = Arc<dyn Fn() + Send + Sync>;
+
+/// How often the sampler looks for engine progress while an opaque engine call
+/// is running. Well inside the watchdog's 120 s detect window.
+const ENGINE_LIVENESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum process CPU time consumed within one sample interval for the
+/// interval to count as work. A wedged process (workers parked on futexes,
+/// #413) burns microseconds per second; a sealing/merging engine burns most
+/// of a core.
+const ENGINE_LIVENESS_MIN_CPU_ADVANCE: Duration = Duration::from_millis(100);
+
+/// GH #446: liveness ticks from inside the Quill sink.
+///
+/// The stall watchdog's only signals are `phase`/`current`/`activity`, and
+/// nothing on the sink side of the phase-2 rebuild pipeline used to move any
+/// of them: a Quill commit on a multi-million-message archive is minutes of
+/// scribe seal + segment build + merge + durable publish, the producer is
+/// parked on pipeline budget the whole time, and the pipeline counters stay
+/// byte-identical — a healthy 66-minute rebuild logged 12 abort-eligible
+/// `stall_detected` windows and, with the default 300 s abort, exit 70.
+///
+/// The engine exposes no intra-commit callback, so the probe measures the
+/// commit's *observable* work instead of granting a phase-shaped grace:
+///
+/// 1. every accumulate call (a batch of documents admitted into the scribe)
+///    ticks synchronously — that is real, completed work;
+/// 2. while an opaque engine call (commit / merge / compact) runs, a sampler
+///    thread ticks once per interval in which EITHER the index directory's
+///    byte footprint grew (segment files being written) OR the process
+///    consumed at least [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`] of CPU (a
+///    CPU-bound seal or merge stretch between writes).
+///
+/// Liveness stays honest: a wedged engine call — parked threads, no writes,
+/// no CPU — advances neither signal, the counters freeze exactly as before,
+/// and the watchdog still aborts (#413 detection preserved). The sampler
+/// sleeps while no engine call is in flight and exits when the index is
+/// dropped.
+struct EngineLivenessProbe {
+    armed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    heartbeat: EngineHeartbeat,
+    sampler: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EngineLivenessProbe {
+    fn spawn(targets: Vec<PathBuf>, heartbeat: EngineHeartbeat) -> Self {
+        let armed = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let armed = Arc::clone(&armed);
+            let stop = Arc::clone(&stop);
+            let heartbeat = Arc::clone(&heartbeat);
+            std::thread::Builder::new()
+                .name("cass-quill-liveness".to_string())
+                .spawn(move || {
+                    let mut tracker = EngineLivenessTracker::default();
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(ENGINE_LIVENESS_SAMPLE_INTERVAL);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if !armed.load(Ordering::Relaxed) {
+                            // Forget the previous op's baseline so the first
+                            // sample of the next op is a fresh comparison.
+                            tracker = EngineLivenessTracker::default();
+                            continue;
+                        }
+                        let sample = EngineLivenessSample::capture(&targets);
+                        if tracker.observe(sample) {
+                            heartbeat();
+                        }
+                    }
+                })
+                .ok()
+        };
+        Self {
+            armed,
+            stop,
+            heartbeat,
+            sampler,
+        }
+    }
+
+    /// Run one opaque engine call with the sampler armed.
+    fn during<T>(&self, op: impl FnOnce() -> T) -> T {
+        self.armed.store(true, Ordering::Relaxed);
+        let result = op();
+        self.armed.store(false, Ordering::Relaxed);
+        result
+    }
+}
+
+impl Drop for EngineLivenessProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(sampler) = self.sampler.take() {
+            // The sampler wakes at most one interval later; joining bounds
+            // the thread's lifetime to the index's without blocking a drop
+            // on a stuck heartbeat callback.
+            if std::thread::current().id() != sampler.thread().id() {
+                drop(sampler.join());
+            }
+        }
+    }
+}
+
+/// One observation of the two engine-progress signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineLivenessSample {
+    /// Total bytes of regular files under the index directory (plus file
+    /// count, so a size-neutral rename/replace still registers).
+    pub directory_footprint: (u64, u64),
+    /// Process user+system CPU time; `None` where unavailable.
+    pub process_cpu_time: Option<Duration>,
+}
+
+impl EngineLivenessSample {
+    fn capture(targets: &[PathBuf]) -> Self {
+        Self {
+            directory_footprint: watch_target_footprint(targets),
+            process_cpu_time: process_cpu_time(),
+        }
+    }
+}
+
+/// Summed `(bytes, files)` over every watch target: a directory contributes
+/// its whole recursive footprint, a plain file contributes itself, and a
+/// missing path contributes nothing.
+fn watch_target_footprint(targets: &[PathBuf]) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for target in targets {
+        let Ok(metadata) = std::fs::metadata(target) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            let (dir_bytes, dir_files) = directory_footprint(target);
+            bytes = bytes.saturating_add(dir_bytes);
+            files = files.saturating_add(dir_files);
+        } else if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+            files = files.saturating_add(1);
+        }
+    }
+    (bytes, files)
+}
+
+/// GH #450: run one opaque, potentially very long blocking call — a
+/// frankensqlite open that may perform a multi-gigabyte migration repair — with
+/// the same honest liveness sampler the Quill sink uses (see
+/// [`EngineLivenessProbe`]).
+///
+/// `targets` are the files/directories whose byte footprint counts as evidence
+/// of work (for a storage open: the database and its sidecars). `heartbeat` is
+/// called at most once per sample interval, and only in an interval where the
+/// footprint grew or the process burned CPU — so a genuinely wedged call still
+/// posts no progress and the stall watchdog still fires.
+pub(crate) fn run_with_liveness_ticks<T>(
+    targets: Vec<PathBuf>,
+    heartbeat: EngineHeartbeat,
+    op: impl FnOnce() -> T,
+) -> T {
+    let probe = EngineLivenessProbe::spawn(targets, heartbeat);
+    probe.during(op)
+}
+
+/// Pure decision core of the sampler: compares consecutive samples and says
+/// whether the interval showed engine work. Unit-tested without threads.
+#[derive(Debug, Default)]
+pub(crate) struct EngineLivenessTracker {
+    previous: Option<EngineLivenessSample>,
+}
+
+impl EngineLivenessTracker {
+    /// Returns `true` when `sample` shows progress relative to the previous
+    /// one: the directory footprint changed, or CPU advanced by at least
+    /// [`ENGINE_LIVENESS_MIN_CPU_ADVANCE`]. The first sample of an op only
+    /// establishes the baseline.
+    pub(crate) fn observe(&mut self, sample: EngineLivenessSample) -> bool {
+        let Some(previous) = self.previous.replace(sample) else {
+            return false;
+        };
+        if sample.directory_footprint != previous.directory_footprint {
+            return true;
+        }
+        match (previous.process_cpu_time, sample.process_cpu_time) {
+            (Some(before), Some(now)) => {
+                now.saturating_sub(before) >= ENGINE_LIVENESS_MIN_CPU_ADVANCE
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `(bytes, files)` for every regular file under `directory`, recursively.
+/// Best-effort: unreadable entries are skipped, never fatal.
+fn directory_footprint(directory: &Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && let Ok(metadata) = entry.metadata()
+            {
+                bytes = bytes.saturating_add(metadata.len());
+                files = files.saturating_add(1);
+            }
+        }
+    }
+    (bytes, files)
+}
+
+/// Process user+system CPU time via `getrusage(RUSAGE_SELF)`.
+///
+/// Unavoidable FFI (AGENTS.md): there is no safe std API for process CPU
+/// time, and the daemon's `resource.rs` takes the same allow for its POSIX
+/// calls.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_cpu_time() -> Option<Duration> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage(RUSAGE_SELF, ptr)` writes a fully initialized
+    // `rusage` into the caller-owned buffer on success (return 0), retains
+    // no pointer, and touches nothing else.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: rc == 0 guarantees the kernel initialized the whole struct.
+    let usage = unsafe { usage.assume_init() };
+    let timeval_to_duration = |tv: libc::timeval| {
+        Duration::from_secs(u64::try_from(tv.tv_sec).unwrap_or(0))
+            + Duration::from_micros(u64::try_from(tv.tv_usec).unwrap_or(0))
+    };
+    Some(timeval_to_duration(usage.ru_utime) + timeval_to_duration(usage.ru_stime))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_time() -> Option<Duration> {
+    None
 }
 
 impl QuillCassIndex {
@@ -396,6 +990,12 @@ impl QuillCassIndex {
     /// Returns an error when the directory cannot be created or the index
     /// cannot be opened under the CASS schema.
     pub fn open_or_create(path: &Path) -> Result<Self> {
+        Self::open_or_create_with_config(path, &cass_quill_config())
+    }
+
+    /// [`Self::open_or_create`] under an explicit engine configuration; tests
+    /// use it to isolate one knob against the engine's own behaviour.
+    fn open_or_create_with_config(path: &Path, config: &QuillConfig) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let directory = path.to_path_buf();
         // Create ONLY when the directory holds no published manifest.
@@ -414,23 +1014,13 @@ impl QuillCassIndex {
         let index_exists = path.join(QUILL_INDEX_MARKER).exists();
         let index = drive(|cx| {
             let directory = directory.clone();
+            let config = config.clone();
             async move {
                 if index_exists {
-                    QuillIndex::open_with_schema(
-                        &cx,
-                        directory,
-                        CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
-                    )
-                    .await
+                    QuillIndex::open_with_schema(&cx, directory, CASS_SEMANTIC_SCHEMA, config).await
                 } else {
-                    QuillIndex::create_with_schema(
-                        &cx,
-                        directory,
-                        CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
-                    )
-                    .await
+                    QuillIndex::create_with_schema(&cx, directory, CASS_SEMANTIC_SCHEMA, config)
+                        .await
                 }
             }
         })
@@ -445,6 +1035,7 @@ impl QuillCassIndex {
             index,
             directory: path.to_path_buf(),
             last_merge_ts: 0,
+            liveness: None,
         };
         // A freshly created index has a writer but no published manifest, so
         // nothing on disk yet announces it as an index and no reader can open
@@ -456,6 +1047,29 @@ impl QuillCassIndex {
             index.commit()?;
         }
         Ok(index)
+    }
+
+    /// GH #446: install (or, with `None`, remove) the liveness callback the
+    /// sink invokes from real engine work — see [`EngineLivenessProbe`].
+    /// The indexer passes `IndexingProgress::tick_activity`.
+    pub fn set_heartbeat(&mut self, heartbeat: Option<EngineHeartbeat>) {
+        self.liveness = heartbeat
+            .map(|heartbeat| EngineLivenessProbe::spawn(vec![self.directory.clone()], heartbeat));
+    }
+
+    fn tick_heartbeat(&self) {
+        if let Some(liveness) = &self.liveness {
+            (liveness.heartbeat)();
+        }
+    }
+
+    /// Run one opaque engine call (commit / merge / compact / accumulate)
+    /// with the liveness sampler armed for its duration.
+    fn with_engine_liveness<T>(&self, op: impl FnOnce() -> T) -> T {
+        match &self.liveness {
+            Some(liveness) => liveness.during(op),
+            None => op(),
+        }
     }
 
     /// Index one batch of CASS documents.
@@ -471,12 +1085,81 @@ impl QuillCassIndex {
             .iter()
             .map(QuillCassDocument::to_schema_document)
             .collect();
-        drive(|cx| {
-            let projected = &projected;
-            let index = &self.index;
-            async move { index.index_schema_documents(&cx, projected).await }
+        // Accumulation can seal a segment on budget, so it is sampled like a
+        // commit; the completed batch then ticks synchronously.
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let projected = &projected;
+                let index = &self.index;
+                async move { index.index_schema_documents(&cx, projected).await }
+            })
         })
-        .map_err(|error| anyhow!("indexing CASS documents into Quill: {error}"))
+        .map_err(|error| {
+            // Preserve the engine cause for retry classification without changing
+            // the operator-facing diagnostic.
+            let diagnostic = format!("indexing CASS documents into Quill: {error}");
+            anyhow::Error::new(error).context(diagnostic)
+        })?;
+        self.tick_heartbeat();
+        Ok(())
+    }
+
+    /// Upsert one batch of CASS documents under their stable identities
+    /// (source id + source path + canonical conversation id + message idx).
+    ///
+    /// Unlike [`Self::add_cass_documents`], a document whose identity is
+    /// already live REPLACES it instead of appending a duplicate — the
+    /// primitive the qhiv2 / gh#382 targeted partial-prefix reconcile needs:
+    /// retrying the same source set converges to exactly one live document
+    /// per identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission, identity resolution, or accumulation
+    /// refuses the batch.
+    pub fn upsert_cass_documents(&mut self, documents: &[QuillCassDocument]) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let projected: Vec<SchemaDocument> = documents
+            .iter()
+            .map(QuillCassDocument::to_schema_document)
+            .collect();
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let projected = &projected;
+                let index = &self.index;
+                async move { index.upsert_schema_documents(&cx, projected).await }
+            })
+        })
+        .map_err(|error| {
+            let diagnostic = format!("upserting CASS documents into Quill: {error}");
+            anyhow::Error::new(error).context(diagnostic)
+        })?;
+        self.tick_heartbeat();
+        Ok(())
+    }
+
+    /// Remove a bounded batch of stable CASS identities. Quill requires a
+    /// committed writer for deletion, so publish any pending plain additions
+    /// first. The removal publishes its own successor; these two publications
+    /// are not one atomic whole-conversation replacement.
+    pub fn delete_cass_document_ids(&mut self, document_ids: &[String]) -> Result<()> {
+        if document_ids.is_empty() {
+            return Ok(());
+        }
+        self.commit()?;
+        let ids: Vec<&str> = document_ids.iter().map(String::as_str).collect();
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let index = &self.index;
+                let ids = &ids;
+                async move { index.delete_documents(&cx, ids).await }
+            })
+        })
+        .map_err(|error| anyhow!("removing revised CASS documents from Quill: {error}"))?;
+        self.tick_heartbeat();
+        Ok(())
     }
 
     /// Publish everything staged since the last commit.
@@ -485,12 +1168,16 @@ impl QuillCassIndex {
     ///
     /// Returns an error when publication fails.
     pub fn commit(&mut self) -> Result<()> {
-        drive(|cx| {
-            let index = &self.index;
-            async move { index.commit(&cx).await }
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let index = &self.index;
+                async move { index.commit(&cx).await }
+            })
         })
         .map(|_| ())
-        .map_err(|error| anyhow!("committing the Quill CASS index: {error}"))
+        .map_err(|error| anyhow!("committing the Quill CASS index: {error}"))?;
+        self.tick_heartbeat();
+        Ok(())
     }
 
     /// Delete every live document and publish the empty successor.
@@ -519,7 +1206,7 @@ impl QuillCassIndex {
                     &cx,
                     directory,
                     CASS_SEMANTIC_SCHEMA,
-                    QuillConfig::default(),
+                    cass_quill_config(),
                 )
                 .await
             }
@@ -601,6 +1288,40 @@ impl QuillCassIndex {
         self.add_cass_documents(&owned)
     }
 
+    /// Upsert one batch of borrowed CASS documents under their stable
+    /// identities (see [`Self::upsert_cass_documents`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission, identity resolution, or accumulation
+    /// refuses the batch.
+    pub fn upsert_cass_document_refs(
+        &mut self,
+        documents: &[frankensearch::quill::cass::CassDocumentRef<'_>],
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<QuillCassDocument> = documents
+            .iter()
+            .map(|document| QuillCassDocument {
+                agent: document.agent.to_owned(),
+                workspace: document.workspace.map(str::to_owned),
+                workspace_original: document.workspace_original.map(str::to_owned),
+                source_path: document.source_path.to_owned(),
+                msg_idx: document.msg_idx,
+                created_at: document.created_at,
+                title: document.title.map(str::to_owned),
+                content: document.content.to_owned(),
+                source_id: document.source_id.to_owned(),
+                origin_kind: document.origin_kind.to_owned(),
+                origin_host: document.origin_host.map(str::to_owned),
+                conversation_id: document.conversation_id,
+            })
+            .collect();
+        self.upsert_cass_documents(&owned)
+    }
+
     /// Live segment count in the published snapshot.
     ///
     /// Returns 0 when nothing is published yet, which is what the caller's
@@ -615,37 +1336,237 @@ impl QuillCassIndex {
 
     /// Compact when the segment count and cooldown say it is worth doing.
     ///
-    /// Returns whether a compaction actually ran.
+    /// Runs the bounded policy in [`plan_capped_balanced_merge_runs`]: a
+    /// balanced run of adjacent *small* segments is folded into one, so an
+    /// append-only archive keeps large segments plus geometric tail tiers
+    /// instead of accumulating a segment per session (#441) or rewriting the
+    /// same large tail after each tiny append (#479). Comparable adjacent
+    /// pairs may also fold; every nonempty output grows its largest input by
+    /// at least half its live-document count.
+    /// Tombstone-density compaction runs afterwards so replaced/deleted rows
+    /// are reclaimed on the same cadence.
+    ///
+    /// Returns whether any merge or compaction actually ran.
     ///
     /// # Errors
     ///
-    /// Returns an error when compaction itself fails.
+    /// Returns an error when a merge or compaction itself fails.
     pub fn optimize_if_idle(&mut self, now_ms: i64) -> Result<bool> {
         let segments = self.segment_count();
         if !self.merge_status(segments, now_ms).should_merge() {
             return Ok(false);
         }
-        self.force_merge()?;
+        let merged = self.merge_small_segment_runs()?;
+        let compacted = self.compact_tombstones()?;
+        if merged || compacted {
+            self.note_merged(now_ms);
+        }
+        Ok(merged || compacted)
+    }
+
+    /// At most one bounded merge, for use while a streaming ingest is running.
+    ///
+    /// Every concat merge is a publish, and every publish re-verifies each
+    /// live segment's bytes, so [`Self::optimize_if_idle`] — which folds every
+    /// planned run and then compacts — costs one full verification per run.
+    /// Run mid-ingest on a multi-gigabyte generation, that loop held the
+    /// consumer for more than ten minutes. This folds only the planned run
+    /// that removes the most segments (normally the tail the run's own
+    /// commits left), under the same threshold and cooldown, and leaves the
+    /// rest to the post-run fold.
+    ///
+    /// Returns whether a merge ran.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the merge itself fails.
+    pub fn fold_largest_small_run(&mut self, now_ms: i64) -> Result<bool> {
+        let segments = self.segment_count();
+        if !self.merge_status(segments, now_ms).should_merge() {
+            return Ok(false);
+        }
+        let profile = self.published_segment_profile()?;
+        let fold_profile = self.published_segment_fold_profile()?;
+        let Some(run) = plan_capped_balanced_merge_runs(
+            &profile,
+            &fold_profile,
+            lexical_merge_max_output_bytes(),
+        )
+        .into_iter()
+        .max_by_key(Vec::len) else {
+            return Ok(false);
+        };
+        self.concat_merge_run(&run)?;
         self.note_merged(now_ms);
         Ok(true)
     }
 
-    /// Compact now, regardless of policy.
+    /// Fold the published segments into as few as the merge-output byte cap
+    /// allows, regardless of the idle policy, then reclaim tombstones.
+    ///
+    /// This is the end-of-rebuild step: a from-scratch build seals one segment
+    /// per ingest shard per accumulation budget, and the query planner's
+    /// per-segment dictionary probes make segment count the dominant query
+    /// cost (#441), so a freshly published generation should start small.
+    ///
+    /// It used to fold everything into ONE segment. The engine assembles a
+    /// concat-merge output as a single in-memory buffer sized to the finished
+    /// file and re-verifies it in place before writing, so that fold held the
+    /// entire lexical generation in anonymous memory at once — the
+    /// publish-tail RSS spike of GH #456 (36 GB on a 1.1M-message archive),
+    /// and the 6.75 GB single segment of GH #453. The runs are now planned
+    /// under [`lexical_merge_max_output_bytes`], which bounds the peak merge
+    /// allocation by the cap and the generation by roughly
+    /// `index_bytes / cap` segments — a handful, not the hundreds #441 was
+    /// about. Each run also holds at most [`MAX_FOLD_OUTPUT_DOCS`] documents,
+    /// so a multi-million-message archive folds into several segments rather
+    /// than one whose common-token posting lists no reader could open (#498).
     ///
     /// # Errors
     ///
-    /// Returns an error when compaction fails.
+    /// Returns an error when the merge or compaction fails. Requires a fully
+    /// committed index (call [`Self::commit`] first).
     pub fn force_merge(&mut self) -> Result<()> {
-        drive(|cx| {
-            let index = &self.index;
-            async move {
-                index
-                    .compact(&cx, frankensearch::quill::CompactionPolicy::default())
-                    .await
+        self.force_merge_with_output_cap(lexical_merge_max_output_bytes())
+    }
+
+    /// [`Self::force_merge`] with an explicit merge-output byte cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the merge or compaction fails.
+    pub fn force_merge_with_output_cap(&mut self, max_output_bytes: u64) -> Result<()> {
+        let runs =
+            plan_capped_merge_runs(&self.published_segment_fold_profile()?, max_output_bytes);
+        for run in runs {
+            self.concat_merge_run(&run)?;
+        }
+        self.compact_tombstones()?;
+        Ok(())
+    }
+
+    /// The fold profile of every published segment, in manifest (docid)
+    /// order: what the merge-output cap plans against.
+    fn published_segment_fold_profile(&self) -> Result<Vec<SegmentFoldProfile>> {
+        let snapshot = self
+            .index
+            .snapshot()
+            .map_err(|error| anyhow!("reading the Quill CASS manifest: {error}"))?;
+        Ok(snapshot
+            .segments()
+            .iter()
+            .map(|segment| {
+                let manifest = segment.manifest();
+                SegmentFoldProfile {
+                    segment_id: manifest.segment_id,
+                    file_len: manifest.file_len,
+                    docid_lo: manifest.docid_lo,
+                    docid_hi: manifest.docid_hi,
+                    doc_count: u64::from(manifest.doc_count),
+                }
+            })
+            .collect())
+    }
+
+    /// `(segment_id, live_doc_count)` for every published segment, in manifest
+    /// (docid) order — the order [`QuillIndex::concat_merge`] requires a source
+    /// run to be consecutive in.
+    fn published_segment_profile(&self) -> Result<Vec<(u64, u64)>> {
+        let snapshot = self
+            .index
+            .snapshot()
+            .map_err(|error| anyhow!("reading the Quill CASS manifest: {error}"))?;
+        Ok(snapshot
+            .segments()
+            .iter()
+            .map(|segment| {
+                (
+                    segment.manifest().segment_id,
+                    u64::from(segment.manifest().live_doc_count()),
+                )
+            })
+            .collect())
+    }
+
+    /// Apply [`plan_capped_balanced_merge_runs`] until it has nothing left to fold.
+    /// Returns whether at least one merge ran.
+    ///
+    /// GH #456: the document-tiered run is split under the merge-output byte
+    /// cap before it is folded, for the same reason as [`Self::force_merge`]:
+    /// a fragmented generation whose segments are all "small" by document
+    /// share is one run covering the whole index, and folding it at once
+    /// materialises the whole index in memory during an ordinary
+    /// `cass index`. A pass that can fold nothing under the cap ends the loop.
+    fn merge_small_segment_runs(&mut self) -> Result<bool> {
+        let max_output_bytes = lexical_merge_max_output_bytes();
+        let mut merged_any = false;
+        // Each productive iteration strictly reduces the segment count, so
+        // this loop is bounded by the initial count; the cap is a
+        // belt-and-braces guard.
+        for _ in 0..MAX_BOUNDED_MERGE_PASSES {
+            let profile = self.published_segment_profile()?;
+            let fold_profile = self.published_segment_fold_profile()?;
+            let sub_runs =
+                plan_capped_balanced_merge_runs(&profile, &fold_profile, max_output_bytes);
+            if sub_runs.is_empty() {
+                break;
             }
+            for sub_run in sub_runs {
+                self.concat_merge_run(&sub_run)?;
+            }
+            merged_any = true;
+        }
+        Ok(merged_any)
+    }
+
+    /// Q1-preserving concat merge of one consecutive manifest run into a
+    /// fresh segment. The output id is random and collision-checked against
+    /// the live manifest, matching the engine's own id discipline.
+    fn concat_merge_run(&mut self, source_segment_ids: &[u64]) -> Result<()> {
+        let output_segment_id = fresh_segment_id(&self.published_segment_profile()?);
+        let created_unix_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let index = &self.index;
+                async move {
+                    index
+                        .concat_merge(&cx, source_segment_ids, output_segment_id, created_unix_s)
+                        .await
+                }
+            })
         })
         .map(|_| ())
-        .map_err(|error| anyhow!("compacting the Quill CASS index: {error}"))
+        .map_err(|error| {
+            anyhow!(
+                "concat-merging {} Quill CASS segments: {error}",
+                source_segment_ids.len()
+            )
+        })?;
+        // One merged run is one unit of completed work.
+        self.tick_heartbeat();
+        Ok(())
+    }
+
+    /// Density-driven tombstone compaction; a no-op on an append-only index.
+    fn compact_tombstones(&mut self) -> Result<bool> {
+        let changed = self
+            .with_engine_liveness(|| {
+                drive(|cx| {
+                    let index = &self.index;
+                    async move {
+                        index
+                            .compact(&cx, frankensearch::quill::CompactionPolicy::default())
+                            .await
+                    }
+                })
+            })
+            .map(|report| report.changed())
+            .map_err(|error| anyhow!("compacting the Quill CASS index: {error}"))?;
+        self.tick_heartbeat();
+        Ok(changed)
     }
 
     /// Bulk-load merge policy hook.
@@ -658,9 +1579,951 @@ impl QuillCassIndex {
     pub const fn configure_bulk_load_merge_policy(&self) {}
 }
 
+/// Upper bound on bounded-merge passes per `optimize_if_idle` call. Each pass
+/// removes at least one segment, so this can only bind on a manifest with
+/// thousands of segments — and then it merely defers the remainder to the next
+/// maintenance window instead of holding the writer for the whole backlog.
+const MAX_BOUNDED_MERGE_PASSES: usize = 256;
+
+/// Indexes at or below this many live documents have no protected big segments,
+/// but still require balanced merge inputs. One Q1 lease is the boundary.
+const BOUNDED_MERGE_SMALL_INDEX_DOCS: u64 = 1 << 16;
+
+/// A segment holding at least `total / BOUNDED_MERGE_BIG_DIVISOR` live docs is
+/// "big" and never rewritten by the bounded policy; only runs of small
+/// segments are folded. There are at most eight protected big segments;
+/// smaller segments accumulate in geometric size tiers between them.
+const BOUNDED_MERGE_BIG_DIVISOR: u64 = 8;
+
+/// Pick the next run of adjacent segments to concat-merge, or `None` when the
+/// manifest is already converged.
+///
+/// `profile` is `(segment_id, live_doc_count)` in manifest order. The policy
+/// is size-tiered by *document count*, deliberately not by docid width: the
+/// engine's own tier merge classifies by docid-range width and refuses runs
+/// whose hull is more than half holes, and a CASS archive built session by
+/// session is nothing but holes (every writer session leases fresh 65,536-wide
+/// docid blocks per shard and burns the unused tail). A Q1 concat merge
+/// preserves ids and tolerates those gaps, so counting live rows is the
+/// measure that actually predicts merge cost and query cost here.
+///
+/// Returns the longest balanced run of adjacent small segments. The largest
+/// input must not exceed the other inputs combined: an existing tail cannot
+/// be rewritten on every tiny append (GH #479). Ties go to the earliest run.
+#[cfg(test)]
+fn plan_bounded_segment_merge(profile: &[(u64, u64)]) -> Option<Vec<u64>> {
+    let mut best: Option<(usize, usize)> = None;
+    for (start, end) in small_segment_ranges(profile) {
+        if let Some((offset, len)) = balanced_segment_subrun(&profile[start..end])
+            && best.is_none_or(|(_, best_len)| len > best_len)
+        {
+            best = Some((start + offset, len));
+        }
+    }
+    best.map(|(start, len)| {
+        profile[start..start + len]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    })
+}
+
+fn small_segment_ranges(profile: &[(u64, u64)]) -> Vec<(usize, usize)> {
+    let total: u64 = profile
+        .iter()
+        .map(|(_, live)| *live)
+        .fold(0, u64::saturating_add);
+    if total <= BOUNDED_MERGE_SMALL_INDEX_DOCS {
+        return vec![(0, profile.len())];
+    }
+    let big_threshold = (total / BOUNDED_MERGE_BIG_DIVISOR).max(1);
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (index, (_, live)) in profile.iter().enumerate() {
+        let small = *live < big_threshold;
+        match (small, run_start) {
+            (true, None) => run_start = Some(index),
+            (false, Some(start)) => {
+                runs.push((start, index));
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, profile.len()));
+    }
+    runs
+}
+
+/// Find a contiguous run whose largest input is no larger than its peers
+/// combined. An unbalanced run has one dominant input; no subrun containing
+/// that input can qualify, so search independently on either side of it.
+/// Every split removes more than half the run's live-document mass, bounding
+/// depth by 128 for the u128 aggregate. Each level visits disjoint slices;
+/// zero-mass slices are skipped. The explicit stack avoids recursion.
+fn balanced_segment_subrun(profile: &[(u64, u64)]) -> Option<(usize, usize)> {
+    let mut pending = vec![(0, profile.len())];
+    let mut best: Option<(usize, usize)> = None;
+    while let Some((start, end)) = pending.pop() {
+        let len = end - start;
+        if len < 2 || best.is_some_and(|(_, best_len)| len < best_len) {
+            continue;
+        }
+        let mut total = 0_u128;
+        let mut largest = 0_u128;
+        let mut largest_index = start;
+        for (offset, (_, live)) in profile[start..end].iter().enumerate() {
+            let weight = u128::from(*live);
+            total += weight;
+            if weight > largest {
+                largest = weight;
+                largest_index = start + offset;
+            }
+        }
+        if largest == 0 {
+            continue;
+        }
+        if largest <= total - largest {
+            if best.is_none_or(|(best_start, best_len)| {
+                len > best_len || (len == best_len && start < best_start)
+            }) {
+                best = Some((start, len));
+            }
+        } else {
+            pending.push((largest_index + 1, end));
+            pending.push((start, largest_index));
+        }
+    }
+    best
+}
+
+/// A byte-cap split must retain geometric balance too: a balanced overall
+/// run can otherwise become an expensive large-plus-tiny prefix after capping.
+fn plan_capped_balanced_merge_runs(
+    profile: &[(u64, u64)],
+    fold_profile: &[SegmentFoldProfile],
+    max_output_bytes: u64,
+) -> Vec<Vec<u64>> {
+    let live_counts: std::collections::HashMap<_, _> = profile.iter().copied().collect();
+    let folds: std::collections::HashMap<_, _> = fold_profile
+        .iter()
+        .map(|segment| (segment.segment_id, *segment))
+        .collect();
+    let mut planned = Vec::new();
+    let mut used = std::collections::HashSet::new();
+    for (start, end) in small_segment_ranges(profile) {
+        let run = &profile[start..end];
+        let Some(run_folds) = run
+            .iter()
+            .map(|(id, _)| folds.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        for capped in plan_capped_merge_runs(&run_folds, max_output_bytes) {
+            let sub_profile: Vec<_> = capped
+                .iter()
+                .filter_map(|id| live_counts.get(id).map(|live| (*id, *live)))
+                .collect();
+            if let Some((offset, len)) = balanced_segment_subrun(&sub_profile) {
+                let ids: Vec<_> = sub_profile[offset..offset + len]
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect();
+                used.extend(ids.iter().copied());
+                planned.push(ids);
+            }
+        }
+        // Recover comparable siblings across artificial greedy-cap boundaries.
+        // Do not revisit any input already selected above or by an earlier pair.
+        for (pair, pair_folds) in run.windows(2).zip(run_folds.windows(2)) {
+            let (left_id, left) = pair[0];
+            let (right_id, right) = pair[1];
+            if left == 0 || right == 0 || used.contains(&left_id) || used.contains(&right_id) {
+                continue;
+            }
+            if u128::from(left.max(right)) <= 2 * u128::from(left.min(right))
+                && fold_fits(pair_folds, max_output_bytes)
+            {
+                used.insert(left_id);
+                used.insert(right_id);
+                planned.push(vec![left_id, right_id]);
+            }
+        }
+    }
+    planned
+}
+
+/// GH #456: default upper bound on the estimated output of one concat merge
+/// (1 GiB; see [`estimated_fold_output_bytes`]).
+///
+/// The engine builds a merge output as one in-memory buffer sized to the
+/// finished segment file, then re-verifies it in place before writing, so the
+/// peak anonymous allocation of a fold is about the output size plus the
+/// inputs' term dictionaries. Without a cap the end-of-rebuild fold (and an
+/// incremental fold over a fully fragmented generation) is sized to the whole
+/// lexical index. With it, a generation converges to roughly
+/// `index_bytes / cap` segments — a handful even at 10 GB — and the fold's
+/// memory no longer grows with archive size.
+pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT: u64 = 1 << 30;
+
+/// Environment override for [`CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT`]
+/// (bytes; underscores allowed; `0`/unparsable keep the default).
+pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV: &str = "CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES";
+
+/// The effective merge-output byte cap (GH #456).
+#[must_use]
+pub fn lexical_merge_max_output_bytes() -> u64 {
+    lexical_merge_max_output_bytes_from(
+        dotenvy::var(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn lexical_merge_max_output_bytes_from(raw: Option<&str>) -> u64 {
+    raw.map(|value| value.trim().replace('_', ""))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT)
+}
+
+/// What the merge-output cap plans against for one published segment
+/// (GH #456): its file bytes and its Q1 docid range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentFoldProfile {
+    pub segment_id: u64,
+    pub file_len: u64,
+    pub docid_lo: u64,
+    pub docid_hi: u64,
+    /// Physical documents the segment holds, tombstoned ones included until
+    /// compaction: everything its posting lists can cover (GH #498).
+    pub doc_count: u64,
+}
+
+/// GH #498: the most physical documents one concat-merge output may hold.
+///
+/// Every Quill reader parses a term's posting list under the engine's
+/// `DEFAULT_MAX_POSTINGS_PER_TERM` (2^22) and the concat merge refuses to
+/// assemble a list it could not reopen, so an output where a common token is
+/// in more documents than that fails with "posting validation limit 4194304
+/// exceeded". A term's postings cover at most every document the sources
+/// hold, so a fold within this bound cannot hit the limit whatever the text.
+pub(crate) const MAX_FOLD_OUTPUT_DOCS: u64 =
+    frankensearch::quill::quiver::DEFAULT_MAX_POSTINGS_PER_TERM as u64;
+
+/// Physical documents a concat merge of `run` would hold (GH #498).
+fn fold_doc_count(run: &[SegmentFoldProfile]) -> u64 {
+    run.iter()
+        .map(|segment| segment.doc_count)
+        .fold(0_u64, u64::saturating_add)
+}
+
+/// Whether a concat merge of `run` stays under both the output byte cap
+/// (GH #456) and the posting limit (GH #498).
+fn fold_fits(run: &[SegmentFoldProfile], max_output_bytes: u64) -> bool {
+    estimated_fold_output_bytes(run) <= max_output_bytes
+        && fold_doc_count(run) <= MAX_FOLD_OUTPUT_DOCS
+}
+
+/// Conservative per-docid cost of the docid *hull* a concat-merge output
+/// spans (GH #456). A Q1-preserving merge keeps global docids, so its output
+/// carries per-docid structures for every id between the first input's
+/// `docid_lo` and the last input's `docid_hi` — holes included. Two 3 KB
+/// session segments one lease apart merge into a 4,624,714-byte file over a
+/// 65,538-docid hull (measured on quill 0.2.3: ~70.5 bytes per hull docid);
+/// an archive built session by session is nothing but such holes, which is
+/// how #453's incremental fold of 1,605 session segments produced one
+/// 6.75 GB file. 128 leaves headroom over the measurement so the estimate
+/// stays an upper bound (`force_merge_under_a_byte_cap_…` asserts it).
+pub(crate) const FOLD_HULL_BYTES_PER_DOCID: u64 = 128;
+
+/// Upper-bound estimate of the file a concat merge of `run` would assemble
+/// (and therefore hold in memory): the inputs' bytes plus the hull cost.
+fn estimated_fold_output_bytes(run: &[SegmentFoldProfile]) -> u64 {
+    let bytes = run
+        .iter()
+        .map(|segment| segment.file_len)
+        .fold(0_u64, u64::saturating_add);
+    let lo = run
+        .iter()
+        .map(|segment| segment.docid_lo)
+        .min()
+        .unwrap_or(0);
+    let hi = run
+        .iter()
+        .map(|segment| segment.docid_hi)
+        .max()
+        .unwrap_or(0);
+    bytes.saturating_add(
+        hi.saturating_sub(lo)
+            .saturating_mul(FOLD_HULL_BYTES_PER_DOCID),
+    )
+}
+
+/// Split a manifest-ordered fold profile into consecutive runs whose
+/// estimated merge output ([`estimated_fold_output_bytes`]) stays at or below
+/// `max_output_bytes` and whose documents stay within
+/// [`MAX_FOLD_OUTPUT_DOCS`], keeping only runs of two or more segments (a
+/// single segment has nothing to fold into). A segment that exceeds either
+/// bound on its own closes the run before it and is left as it is. Greedy and
+/// deterministic in manifest order, so the runs stay consecutive — the shape
+/// a Q1-preserving concat merge requires — and merging one run never breaks
+/// the adjacency of another.
+pub(crate) fn plan_capped_merge_runs(
+    profile: &[SegmentFoldProfile],
+    max_output_bytes: u64,
+) -> Vec<Vec<u64>> {
+    let mut runs: Vec<Vec<u64>> = Vec::new();
+    let mut current: Vec<SegmentFoldProfile> = Vec::new();
+    let mut current_bytes = 0_u64;
+    let mut current_docs = 0_u64;
+    let mut current_lo = 0_u64;
+    let mut current_hi = 0_u64;
+    let close = |current: &mut Vec<SegmentFoldProfile>, runs: &mut Vec<Vec<u64>>| {
+        if current.len() >= 2 {
+            runs.push(current.iter().map(|segment| segment.segment_id).collect());
+        }
+        current.clear();
+    };
+    for &segment in profile {
+        if !current.is_empty() {
+            let next_bytes = current_bytes.saturating_add(segment.file_len);
+            let next_docs = current_docs.saturating_add(segment.doc_count);
+            let next_lo = current_lo.min(segment.docid_lo);
+            let next_hi = current_hi.max(segment.docid_hi);
+            let next_estimate = next_bytes.saturating_add(
+                next_hi
+                    .saturating_sub(next_lo)
+                    .saturating_mul(FOLD_HULL_BYTES_PER_DOCID),
+            );
+            if next_estimate > max_output_bytes || next_docs > MAX_FOLD_OUTPUT_DOCS {
+                close(&mut current, &mut runs);
+            } else {
+                current.push(segment);
+                current_bytes = next_bytes;
+                current_docs = next_docs;
+                current_lo = next_lo;
+                current_hi = next_hi;
+                continue;
+            }
+        }
+        if !fold_fits(std::slice::from_ref(&segment), max_output_bytes) {
+            // Oversized on its own: never a merge input under these bounds.
+            continue;
+        }
+        current.push(segment);
+        current_bytes = segment.file_len;
+        current_docs = segment.doc_count;
+        current_lo = segment.docid_lo;
+        current_hi = segment.docid_hi;
+    }
+    close(&mut current, &mut runs);
+    runs
+}
+
+/// A random, nonzero segment id absent from `profile`.
+fn fresh_segment_id(profile: &[(u64, u64)]) -> u64 {
+    loop {
+        let candidate: u64 = rand::random();
+        if candidate != 0 && profile.iter().all(|(id, _)| *id != candidate) {
+            return candidate;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Segments referenced by the published MANIFEST, read through the same
+    /// reader the merge policy consults.
+    fn published_segment_count(index: &QuillCassIndex) -> usize {
+        index.segment_count()
+    }
+
+    #[test]
+    fn fuel_budget_override_parses_positive_integers_only() {
+        assert_eq!(query_fuel_budget_override(None), None);
+        assert_eq!(query_fuel_budget_override(Some("")), None);
+        assert_eq!(query_fuel_budget_override(Some("0")), None);
+        assert_eq!(query_fuel_budget_override(Some("lots")), None);
+        assert_eq!(
+            query_fuel_budget_override(Some(" 25000000 ")),
+            Some(25_000_000)
+        );
+        assert_eq!(
+            query_fuel_budget_override(Some("25_000_000")),
+            Some(25_000_000)
+        );
+    }
+
+    #[test]
+    fn cass_config_publishes_only_on_explicit_commit() {
+        let config = cass_quill_config();
+        assert_eq!(
+            config.max_visibility_lag_ms,
+            u64::MAX,
+            "#440/#441: the engine must never publish a MANIFEST underneath the rebuild checkpoint"
+        );
+        assert!(
+            config.validate().is_ok(),
+            "the CASS config must pass engine validation"
+        );
+        let default = QuillConfig::default();
+        assert_eq!(
+            config.tier_fanout,
+            usize::MAX,
+            "#498: the engine's unbounded tier merge must never run under CASS"
+        );
+        assert_eq!(
+            config.scribe_shard_budget_bytes,
+            default.scribe_shard_budget_bytes
+        );
+        assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
+    }
+
+    /// Segments and documents published after `commits` single-document
+    /// commits under `config`, pinned to one deterministic ingest shard so
+    /// every sealed segment is adjacent in one docid lease — the shape the
+    /// engine's tier merge folds.
+    fn segments_after_single_document_commits(commits: usize, tier_fanout: usize) -> (usize, u64) {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            ..cass_quill_config()
+        };
+        let mut index =
+            QuillCassIndex::open_or_create_with_config(directory.path(), &config).expect("open");
+        for commit in 0..commits {
+            let msg_idx = u64::try_from(commit).expect("small count");
+            index
+                .add_cass_documents(&[sample("tier", msg_idx, "tier fold message")])
+                .expect("index document");
+            index.commit().expect("commit");
+        }
+        (
+            published_segment_count(&index),
+            index.doc_count().expect("doc count"),
+        )
+    }
+
+    /// GH #498: CASS commits never run the engine's own tier merge, while the
+    /// engine default folds the same commits. That merge has no upper bound
+    /// on its top tier; CASS's capped planners are the only merge authority.
+    #[test]
+    fn cass_commits_never_run_the_engine_tier_merge() {
+        let fanout = frankensearch::quill::config::DEFAULT_TIER_FANOUT;
+        let commits = fanout + 1;
+        let (engine_segments, engine_docs) =
+            segments_after_single_document_commits(commits, fanout);
+        assert!(
+            engine_segments < commits,
+            "control: the engine default must tier-merge {commits} adjacent segments, left {engine_segments}"
+        );
+        let (cass_segments, cass_docs) =
+            segments_after_single_document_commits(commits, cass_quill_config().tier_fanout);
+        assert_eq!(
+            cass_segments, commits,
+            "a CASS commit must publish its segment without an engine fold"
+        );
+        let expected_docs = u64::try_from(commits).expect("small count");
+        assert_eq!(engine_docs, expected_docs);
+        assert_eq!(cass_docs, expected_docs);
+    }
+
+    /// GH #498 end to end on the real engine, along the reporter's path
+    /// (`phase=checkpoint_after_fold`): a rebuild's own fold leaves eight
+    /// "large" segments — each wider than the engine's 524,288-docid medium
+    /// tier — holding 4,240,000 documents that share a token, and the next
+    /// commit runs the engine tier merge over them. Under the engine's
+    /// default fanout that commit fails exactly as reported; under the CASS
+    /// config it publishes, and the CASS fold stays within the posting limit
+    /// and keeps the token searchable.
+    ///
+    /// Ignored by default (4.24M documents); run with
+    /// `cargo test --lib gh498_multi_million -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "ingests 4.24M documents; run explicitly for #498 evidence"]
+    fn gh498_multi_million_document_generation_commits_and_folds() {
+        const LARGE_SEGMENT_DOCS: u64 = 530_000;
+        const LARGE_SEGMENTS: u64 = 8;
+        let config_with_fanout = |tier_fanout: usize| QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            // Seal at commit, not on the 64 MiB accumulation budget.
+            scribe_shard_budget_bytes: 4 << 30,
+            ..cass_quill_config()
+        };
+        let common = |source: &str, msg_idx: u64| sample(source, msg_idx, "common posting token");
+        let directory = tempfile::tempdir().expect("bridge index directory");
+
+        // Ingest without engine merges, then fold consecutive segments as a
+        // rebuild's capped fold does, into eight large segments.
+        let mut index = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(usize::MAX),
+        )
+        .expect("open");
+        for commit in 0..LARGE_SEGMENTS {
+            let batch: Vec<_> = (0..LARGE_SEGMENT_DOCS)
+                .map(|offset| common(&format!("gh498-{commit}"), offset))
+                .collect();
+            index.add_cass_documents(&batch).expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let mut run = Vec::new();
+        let mut run_docs = 0_u64;
+        for segment in index
+            .published_segment_fold_profile()
+            .expect("fold profile")
+        {
+            run.push(segment.segment_id);
+            run_docs += segment.doc_count;
+            if run_docs >= LARGE_SEGMENT_DOCS {
+                if run.len() > 1 {
+                    index
+                        .concat_merge_run(&run)
+                        .expect("fold into one large segment");
+                }
+                run.clear();
+                run_docs = 0;
+            }
+        }
+        let large = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        eprintln!("gh498 large generation: {large:?}");
+        assert_eq!(
+            large.len(),
+            usize::try_from(LARGE_SEGMENTS).expect("small count")
+        );
+        assert!(
+            large
+                .iter()
+                .all(|segment| segment.docid_hi - segment.docid_lo
+                    > frankensearch::quill::config::DEFAULT_TIER_MEDIUM_MAX_DOCID_WIDTH),
+            "every folded segment must be in the engine's large tier: {large:?}"
+        );
+        assert!(fold_doc_count(&large) > MAX_FOLD_OUTPUT_DOCS);
+        drop(index);
+
+        // Control: the next commit under the engine default tier-merges them.
+        let mut control = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(frankensearch::quill::config::DEFAULT_TIER_FANOUT),
+        )
+        .expect("reopen under the engine default");
+        control
+            .add_cass_documents(&[common("gh498-control", 0)])
+            .expect("index one more document");
+        let error = format!(
+            "{:#}",
+            control
+                .commit()
+                .expect_err("control: the engine tier merge must refuse the oversized fold")
+        );
+        eprintln!("gh498 control error: {error}");
+        assert!(
+            error.contains("posting validation limit 4194304 exceeded"),
+            "control must reproduce #498: {error}"
+        );
+        drop(control);
+
+        // Fix: the same commit under the CASS config publishes, and the CASS
+        // fold splits the generation within the posting limit.
+        let mut index = QuillCassIndex::open_or_create_with_config(
+            directory.path(),
+            &config_with_fanout(cass_quill_config().tier_fanout),
+        )
+        .expect("reopen under the CASS config");
+        index
+            .add_cass_documents(&[common("gh498-fixed", 0)])
+            .expect("index one more document");
+        index
+            .commit()
+            .expect("a CASS commit never runs the engine tier merge");
+        let total = index.doc_count().expect("doc count");
+        assert!(total > MAX_FOLD_OUTPUT_DOCS);
+        let before = index.segment_count();
+        index
+            .force_merge_with_output_cap(u64::MAX)
+            .expect("the fold is planned within the posting limit");
+        let folded = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        eprintln!("gh498 folded generation: {folded:?}");
+        assert!(
+            folded.len() >= 2 && folded.len() < before,
+            "the fold must merge, but not into one segment: {folded:?}"
+        );
+        assert!(
+            folded
+                .iter()
+                .all(|segment| segment.doc_count <= MAX_FOLD_OUTPUT_DOCS),
+            "{folded:?}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), total);
+        let reader = index.reader().expect("reader over the folded generation");
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let parsed = parser.parse(
+            "common",
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page = search_paginated(&reader, &parsed.query, 10, 0, false)
+            .expect("the common token's posting lists reopen");
+        assert_eq!(page.hits.len(), 10);
+    }
+
+    #[test]
+    fn bounded_merge_plan_folds_small_runs_and_leaves_big_segments_alone() {
+        // Tiny index: everything merges.
+        assert_eq!(
+            plan_bounded_segment_merge(&[(1, 10), (2, 20), (3, 30)]),
+            Some(vec![1, 2, 3])
+        );
+        // Nothing to do with fewer than two segments.
+        assert_eq!(plan_bounded_segment_merge(&[(1, 10)]), None);
+        assert_eq!(plan_bounded_segment_merge(&[]), None);
+
+        // Large index (total 800k, big threshold 100k): one big head, then a
+        // run of small tail segments -> the tail run is the plan and the big
+        // segment is untouched.
+        let profile = [(7, 700_000), (8, 40_000), (9, 30_000), (10, 30_000)];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![8, 9, 10]));
+
+        // Two runs: the longest wins; ties go to the earliest.
+        let profile = [
+            (1, 500_000),
+            (2, 10),
+            (3, 10),
+            (4, 500_000),
+            (5, 10),
+            (6, 10),
+            (7, 10),
+        ];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![5, 6, 7]));
+        let profile = [
+            (1, 500_000),
+            (2, 10),
+            (3, 10),
+            (4, 500_000),
+            (5, 10),
+            (6, 10),
+        ];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![2, 3]));
+
+        // Converged: only big segments, or isolated smalls between bigs.
+        let profile = [(1, 300_000), (2, 300_000), (3, 300_000)];
+        assert_eq!(plan_bounded_segment_merge(&profile), None);
+        let profile = [(1, 300_000), (2, 5), (3, 300_000), (4, 5)];
+        assert_eq!(plan_bounded_segment_merge(&profile), None);
+    }
+
+    #[test]
+    fn bounded_merge_plan_defers_disproportionate_tail_rewrites() {
+        let profile = [
+            (1, 160_000),
+            (2, 160_000),
+            (3, 160_000),
+            (4, 63_385),
+            (5, 1_615),
+        ];
+        assert_eq!(plan_bounded_segment_merge(&profile), None);
+        let with_new_sibling = [
+            (1, 160_000),
+            (2, 160_000),
+            (3, 160_000),
+            (4, 63_385),
+            (5, 1_615),
+            (6, 1_615),
+        ];
+        assert_eq!(
+            plan_bounded_segment_merge(&with_new_sibling),
+            Some(vec![5, 6])
+        );
+        assert_eq!(plan_bounded_segment_merge(&[(1, 60_000), (2, 1)]), None);
+        assert_eq!(
+            plan_bounded_segment_merge(&[(1, 60_000), (2, 1), (3, 1)]),
+            Some(vec![2, 3])
+        );
+        assert_eq!(
+            balanced_segment_subrun(&[(1, 1), (2, 1), (3, 100), (4, 1), (5, 1)]),
+            Some((0, 2))
+        );
+        assert_eq!(balanced_segment_subrun(&[(1, 0), (2, 0)]), None);
+        assert_eq!(
+            balanced_segment_subrun(&[(1, u64::MAX), (2, u64::MAX)]),
+            Some((0, 2))
+        );
+    }
+
+    #[test]
+    fn bounded_merge_plan_repeated_appends_have_logarithmic_rewrite_work() {
+        let mut profile = Vec::new();
+        let mut rewritten_docs = 0_u64;
+        let mut next_id = 1_u64;
+        for _ in 0..256 {
+            profile.push((next_id, 1));
+            next_id += 1;
+            loop {
+                let folds: Vec<_> = profile
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (id, docs))| SegmentFoldProfile {
+                        segment_id: *id,
+                        file_len: *docs,
+                        docid_lo: position as u64,
+                        docid_hi: position as u64 + 1,
+                        doc_count: 1,
+                    })
+                    .collect();
+                let runs = plan_capped_balanced_merge_runs(&profile, &folds, u64::MAX);
+                if runs.is_empty() {
+                    break;
+                }
+                for run in runs {
+                    let start = profile.iter().position(|(id, _)| *id == run[0]).unwrap();
+                    let end = start + run.len();
+                    let docs: u64 = profile[start..end].iter().map(|(_, docs)| docs).sum();
+                    rewritten_docs += docs;
+                    profile.splice(start..end, [(next_id, docs)]);
+                    next_id += 1;
+                }
+            }
+            assert!(profile.len() <= 16, "geometric tail stays bounded");
+        }
+        assert_eq!(profile.iter().map(|(_, docs)| docs).sum::<u64>(), 256);
+        assert!(
+            rewritten_docs <= 256 * 16,
+            "geometric growth bounds rewritten documents, got {rewritten_docs}"
+        );
+    }
+
+    #[test]
+    fn bounded_merge_plan_byte_cap_preserves_balance() {
+        let profile = [(1, 100), (2, 1), (3, 1), (4, 100)];
+        let fold_profile: Vec<_> = profile
+            .iter()
+            .map(|(id, _)| SegmentFoldProfile {
+                segment_id: *id,
+                file_len: 100,
+                docid_lo: *id - 1,
+                docid_hi: *id,
+                doc_count: 1,
+            })
+            .collect();
+        let cap = 3 * (100 + FOLD_HULL_BYTES_PER_DOCID);
+        assert_eq!(
+            plan_capped_merge_runs(&fold_profile, cap),
+            vec![vec![1, 2, 3]]
+        );
+        assert_eq!(
+            plan_capped_balanced_merge_runs(&profile, &fold_profile, cap),
+            vec![vec![2, 3]],
+            "cap must not force the large first segment to absorb two tiny inputs"
+        );
+        assert!(estimated_fold_output_bytes(&fold_profile[1..3]) <= cap);
+    }
+
+    #[test]
+    fn bounded_merge_plan_recovers_siblings_across_cap_boundaries() {
+        let profile = [
+            (1, 1_000_000),
+            (2, 100),
+            (3, 1),
+            (4, 1),
+            (5, 100),
+            (6, 1_000_000),
+            (7, 1),
+            (8, 1),
+        ];
+        let folds: Vec<_> = profile
+            .iter()
+            .map(|(id, _)| SegmentFoldProfile {
+                segment_id: *id,
+                file_len: 100,
+                docid_lo: *id - 1,
+                docid_hi: *id,
+                doc_count: 1,
+            })
+            .collect();
+        let cap = 2 * (100 + FOLD_HULL_BYTES_PER_DOCID);
+        assert_eq!(
+            plan_capped_balanced_merge_runs(&profile, &folds, cap),
+            vec![vec![3, 4], vec![7, 8]],
+            "recover middle siblings and do not starve a later protected-small run"
+        );
+        assert_eq!(
+            plan_capped_balanced_merge_runs(&[(1, 100), (2, 60)], &folds[..2], cap),
+            vec![vec![1, 2]],
+            "comparable unequal inputs still make geometric progress"
+        );
+        assert!(
+            plan_capped_balanced_merge_runs(&[(1, 0), (2, 0)], &folds[..2], u64::MAX).is_empty(),
+            "empty inputs must not repeatedly rewrite a large empty segment"
+        );
+        assert!(
+            plan_capped_balanced_merge_runs(&[(1, 0), (2, 1)], &folds[..2], u64::MAX).is_empty()
+        );
+    }
+
+    #[test]
+    fn fresh_segment_id_avoids_live_ids_and_zero() {
+        let profile = [(1, 1), (2, 1)];
+        for _ in 0..64 {
+            let id = fresh_segment_id(&profile);
+            assert!(id != 0 && id != 1 && id != 2);
+        }
+    }
+
+    // GH #446: the sampler's decision core — first sample is a baseline, then
+    // footprint growth OR a real CPU advance counts as engine work; a frozen
+    // engine (nothing written, no CPU) never ticks.
+    #[test]
+    fn engine_liveness_tracker_ticks_on_footprint_or_cpu_advance_only() {
+        let sample = |bytes: u64, files: u64, cpu_ms: u64| EngineLivenessSample {
+            directory_footprint: (bytes, files),
+            process_cpu_time: Some(Duration::from_millis(cpu_ms)),
+        };
+        let mut tracker = EngineLivenessTracker::default();
+        assert!(!tracker.observe(sample(100, 2, 1_000)), "baseline");
+        assert!(
+            !tracker.observe(sample(100, 2, 1_010)),
+            "wedged: 10ms CPU, no writes"
+        );
+        assert!(
+            tracker.observe(sample(4_096, 3, 1_012)),
+            "segment file written"
+        );
+        assert!(!tracker.observe(sample(4_096, 3, 1_020)), "quiet again");
+        assert!(
+            tracker.observe(sample(4_096, 3, 1_120)),
+            "CPU-bound merge stretch"
+        );
+        assert!(
+            tracker.observe(sample(2_048, 3, 1_121)),
+            "size-neutral rewrite shrank"
+        );
+        assert!(tracker.observe(sample(2_048, 2, 1_122)), "file count moved");
+
+        // Without CPU telemetry only the footprint can prove progress.
+        let mut tracker = EngineLivenessTracker::default();
+        let no_cpu = |bytes: u64| EngineLivenessSample {
+            directory_footprint: (bytes, 1),
+            process_cpu_time: None,
+        };
+        assert!(!tracker.observe(no_cpu(1)));
+        assert!(!tracker.observe(no_cpu(1)));
+        assert!(tracker.observe(no_cpu(2)));
+    }
+
+    /// GH #450: a long blocking call that keeps growing a watched file must
+    /// post liveness ticks so the #258 stall detector does not call it a stall.
+    #[test]
+    fn run_with_liveness_ticks_reports_progress_for_a_long_growing_op() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let watched = tmp.path().join("archive.db");
+        std::fs::write(&watched, b"seed").expect("seed");
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat: EngineHeartbeat = {
+            let ticks = Arc::clone(&ticks);
+            Arc::new(move || {
+                ticks.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+
+        let result = run_with_liveness_ticks(vec![watched.clone()], heartbeat, || {
+            // Three sample intervals: one to take the baseline, two that can
+            // observe growth.
+            for step in 0..3 {
+                std::fs::write(&watched, vec![b'x'; 1024 * (step + 1)]).expect("grow");
+                std::thread::sleep(ENGINE_LIVENESS_SAMPLE_INTERVAL + Duration::from_millis(250));
+            }
+            "done"
+        });
+
+        assert_eq!(result, "done");
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "a growing archive must post at least one liveness tick"
+        );
+    }
+
+    #[test]
+    fn engine_liveness_sample_reads_real_footprint_and_cpu() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("nested")).expect("nested dir");
+        std::fs::write(tmp.path().join("a.bin"), [0u8; 10]).expect("a");
+        std::fs::write(tmp.path().join("nested").join("b.bin"), [0u8; 5]).expect("b");
+        let sample = EngineLivenessSample::capture(&[tmp.path().to_path_buf()]);
+        assert_eq!(sample.directory_footprint, (15, 2));
+        // GH #450: a watch target may be a plain file (a database and its
+        // sidecars) or missing entirely.
+        assert_eq!(
+            watch_target_footprint(&[
+                tmp.path().join("a.bin"),
+                tmp.path().join("nested").join("b.bin"),
+                tmp.path().join("absent.bin"),
+            ]),
+            (15, 2),
+            "file targets sum their own sizes; a missing target contributes nothing"
+        );
+        assert_eq!(
+            directory_footprint(&tmp.path().join("does-not-exist")),
+            (0, 0),
+            "an unreadable directory is an empty footprint, never an error"
+        );
+        if cfg!(unix) {
+            assert!(
+                sample.process_cpu_time.is_some(),
+                "getrusage must work on unix"
+            );
+        }
+    }
+
+    /// Real sink work must reach the heartbeat: accumulate and commit each
+    /// tick synchronously, and clearing the heartbeat stops the ticks.
+    #[test]
+    fn quill_sink_work_ticks_the_installed_heartbeat() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut index = QuillCassIndex::open_or_create(tmp.path()).expect("open");
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            sink.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        index
+            .add_cass_documents(&[sample("s1", 0, "alpha beta"), sample("s1", 1, "gamma")])
+            .expect("accumulate");
+        let after_accumulate = ticks.load(Ordering::Relaxed);
+        assert!(
+            after_accumulate >= 1,
+            "accumulate must tick: {after_accumulate}"
+        );
+        index.commit().expect("commit");
+        let after_commit = ticks.load(Ordering::Relaxed);
+        assert!(after_commit > after_accumulate, "commit must tick");
+        index.force_merge().expect("merge");
+        let after_merge = ticks.load(Ordering::Relaxed);
+        assert!(after_merge > after_commit, "compaction must tick");
+
+        index.set_heartbeat(None);
+        index
+            .add_cass_documents(&[sample("s2", 0, "delta")])
+            .expect("accumulate without heartbeat");
+        index.commit().expect("commit without heartbeat");
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            after_merge,
+            "a cleared heartbeat must never be invoked again"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), 3);
+    }
 
     fn sample(source_id: &str, msg_idx: u64, content: &str) -> QuillCassDocument {
         QuillCassDocument {
@@ -712,5 +2575,767 @@ mod tests {
             index.doc_count()
         });
         assert_eq!(nested.expect("nested doc count"), 0);
+    }
+
+    #[test]
+    fn lexical_round_trip_restores_full_and_restricted_callers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("outer runtime");
+        runtime.block_on(async {
+            let parent = Cx::current().expect("outer runtime context");
+            for restricted in [false, true] {
+                let restriction =
+                    restricted.then(|| Cx::push_restriction(asupersync::cx::CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                let assert_caller = || {
+                    let current = Cx::current().expect("restored caller context");
+                    assert_eq!(current.task_id(), caller.task_id());
+                    assert_eq!(current.region_id(), caller.region_id());
+                    assert_eq!(current.capabilities(), caller.capabilities());
+                    if restricted {
+                        assert!(!current.capabilities().spawn);
+                        assert!(!current.capabilities().io);
+                    }
+                };
+                let directory = tempfile::tempdir().expect("bridge index directory").keep();
+                eprintln!(
+                    "retained lexical caller-restoration fixture: {}",
+                    directory.display()
+                );
+                let mut index = QuillCassIndex::open_or_create(&directory).expect("open index");
+                assert_caller();
+                let content = "migration preserves the caller and searchable content";
+                index
+                    .add_cass_documents(&[sample("bridge", 0, content)])
+                    .expect("stage document");
+                index.commit().expect("publish document");
+                assert_caller();
+
+                let nested = drive(|_cx| async {
+                    let mapping = Cx::current().expect("nested bridge context");
+                    let count = index.doc_count().expect("nested published count");
+                    let restored = Cx::current().expect("restored nested bridge context");
+                    assert_eq!(restored.task_id(), mapping.task_id());
+                    assert_eq!(restored.region_id(), mapping.region_id());
+                    assert_eq!(restored.capabilities(), mapping.capabilities());
+                    count
+                });
+                assert_eq!(nested, 1);
+                assert_caller();
+                let reader = index.reader().expect("published reader");
+                let parser =
+                    frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+                        .expect("CASS query parser");
+                let parsed = parser.parse(
+                    "migration",
+                    &frankensearch::quill::query::CassQueryFilters::default(),
+                );
+                let page = search_paginated(&reader, &parsed.query, 10, 0, true)
+                    .expect("query published document");
+                assert_eq!(page.hits.len(), 1);
+                assert_eq!(page.total_count, Some(1));
+                // Content is searchable but not stored in CASS_SEMANTIC_SCHEMA.
+                // Exercise stored-field hydration with the fixture's title.
+                assert_eq!(
+                    stored_text(
+                        &reader,
+                        QuillCassFields::compiled().title,
+                        page.hits[0].global_docid
+                    )
+                    .expect("hydrate title"),
+                    Some("bridge session".to_owned())
+                );
+                assert_caller();
+                drop(reader);
+                drop(index);
+                assert_caller();
+                drop(restriction);
+                let restored = Cx::current().expect("restored outer runtime context");
+                assert_eq!(restored.task_id(), parent.task_id());
+                assert_eq!(restored.region_id(), parent.region_id());
+                assert_eq!(restored.capabilities(), parent.capabilities());
+            }
+        });
+        assert!(shutdown_driver(), "Quill bridge runtime must drain");
+        assert!(runtime.shutdown_timeout(Duration::from_secs(30)));
+    }
+
+    /// #440: the engine must not publish a MANIFEST on its own visibility
+    /// cadence. With the engine default (1 s) a second ingest call after a
+    /// one-second pause seals and publishes everything staged so far, which
+    /// is precisely how a staging index ran ahead of the rebuild checkpoint.
+    #[test]
+    fn engine_publishes_only_on_explicit_commit() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first staged batch")])
+            .expect("stage first batch");
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        index
+            .add_cass_documents(&[sample("alpha", 1, "second staged batch")])
+            .expect("stage second batch");
+        assert_eq!(
+            index.doc_count().expect("published doc count"),
+            0,
+            "nothing may be published before CASS commits"
+        );
+        index.commit().expect("commit");
+        assert_eq!(index.doc_count().expect("published doc count"), 2);
+    }
+
+    /// #440: a resumed rebuild re-adds documents the published authority may
+    /// already hold. The upsert path must converge to one live document per
+    /// identity where a plain add is (correctly) refused as a duplicate.
+    #[test]
+    fn upsert_refs_converge_where_add_refuses_duplicates() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        let published = [
+            sample("alpha", 0, "published before the interruption"),
+            sample("alpha", 1, "also published before the interruption"),
+        ];
+        index
+            .add_cass_documents(&published)
+            .expect("index published documents");
+        index.commit().expect("publish");
+
+        let duplicate = index.add_cass_documents(&published[..1]);
+        assert!(
+            duplicate
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("duplicate live document id")),
+            "a plain re-add of a live identity must be refused: {duplicate:?}"
+        );
+        assert!(
+            duplicate.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<frankensearch::quill::QuillIndexError>()
+                    .is_some()
+            }),
+            "ingest errors must retain the typed engine cause: {duplicate:?}"
+        );
+
+        assert_eq!(index.doc_count().expect("unchanged published count"), 2);
+
+        let replay = [
+            published[0].clone(),
+            published[1].clone(),
+            sample("alpha", 2, "new after the interruption"),
+        ];
+        let refs: Vec<_> = replay.iter().map(QuillCassDocument::as_ref).collect();
+        index
+            .upsert_cass_document_refs(&refs)
+            .expect("upsert converges on the published identities");
+        index.commit().expect("publish replay");
+        assert_eq!(index.doc_count().expect("doc count"), 3);
+    }
+
+    /// GH #456: the merge planner keeps every run under the byte cap, skips
+    /// oversized segments, and never emits a single-segment run.
+    #[test]
+    fn capped_merge_runs_respect_the_output_byte_cap() {
+        // Dense: every segment's hull is exactly its own docids, so the
+        // estimate is bytes plus `FOLD_HULL_BYTES_PER_DOCID` per docid.
+        let dense = |id: u64, bytes: u64, lo: u64, docs: u64| SegmentFoldProfile {
+            segment_id: id,
+            file_len: bytes,
+            docid_lo: lo,
+            docid_hi: lo + docs,
+            doc_count: docs,
+        };
+        let profile = [
+            dense(1, 300, 0, 1),
+            dense(2, 300, 1, 1),
+            dense(3, 300, 2, 1),
+            dense(4, 300, 3, 1),
+            dense(5, 2_000, 4, 1),
+            dense(6, 100, 5, 1),
+            dense(7, 100, 6, 1),
+        ];
+        let h = FOLD_HULL_BYTES_PER_DOCID;
+        // 1..=3: 900 + 3h fits exactly; adding 4 -> 1200 + 4h does not.
+        // 5 alone: 2000 + h is oversized. 6+7: 200 + 2h fits.
+        assert_eq!(
+            plan_capped_merge_runs(&profile, 900 + 3 * h),
+            vec![vec![1, 2, 3], vec![6, 7]],
+            "four 300-byte segments do not fit; segment 5 is oversized; 4 stands alone"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&profile, u64::MAX),
+            vec![vec![1, 2, 3, 4, 5, 6, 7]],
+            "an unbounded cap folds everything into one run"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&profile, 200 + 2 * h),
+            vec![vec![6, 7]],
+            "only the two 100-byte segments fit together"
+        );
+        assert!(
+            plan_capped_merge_runs(&profile, 100 + h - 1).is_empty(),
+            "a cap below every segment folds nothing"
+        );
+        assert!(plan_capped_merge_runs(&[dense(9, 10, 0, 1)], 1_000).is_empty());
+        assert!(plan_capped_merge_runs(&[], 1_000).is_empty());
+
+        // Sparse: two tiny segments a whole lease apart cost the hull, not
+        // their bytes — the shape of a session-built archive (#453).
+        let lease = 65_536_u64;
+        let sparse = [
+            dense(1, 3_000, 0, 2),
+            dense(2, 3_000, lease, 2),
+            dense(3, 3_000, 2 * lease, 2),
+        ];
+        let hull_two = 6_000 + (lease + 2) * FOLD_HULL_BYTES_PER_DOCID;
+        assert!(
+            plan_capped_merge_runs(&sparse, hull_two - 1).is_empty(),
+            "under the two-lease hull cost nothing folds"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&sparse, hull_two),
+            vec![vec![1, 2]],
+            "exactly the two-lease hull folds the first pair and leaves the third"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&sparse, u64::MAX),
+            vec![vec![1, 2, 3]]
+        );
+    }
+
+    /// GH #498: no planned fold may hold more documents than a Quill posting
+    /// list can reopen, however generous the byte cap. The reporter's
+    /// generation was 7,113,816 documents; a single fold of it failed with
+    /// "posting validation limit 4194304 exceeded by declared doc_freq".
+    #[test]
+    fn capped_merge_runs_never_exceed_the_engine_posting_limit() {
+        assert_eq!(
+            MAX_FOLD_OUTPUT_DOCS, 4_194_304,
+            "the bound must be the limit the engine reports in #498"
+        );
+        let dense = |id: u64, lo: u64, docs: u64| SegmentFoldProfile {
+            segment_id: id,
+            file_len: docs,
+            docid_lo: lo,
+            docid_hi: lo + docs,
+            doc_count: docs,
+        };
+        let docs = 889_227_u64;
+        let generation: Vec<_> = (0..8_u64)
+            .map(|index| dense(index + 1, index * docs, docs))
+            .collect();
+        assert!(
+            fold_doc_count(&generation) > MAX_FOLD_OUTPUT_DOCS,
+            "the whole generation is one fold the engine would refuse"
+        );
+        let runs = plan_capped_merge_runs(&generation, u64::MAX);
+        assert_eq!(runs, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        for run in &runs {
+            let folded: Vec<_> = generation
+                .iter()
+                .filter(|segment| run.contains(&segment.segment_id))
+                .copied()
+                .collect();
+            assert!(fold_doc_count(&folded) <= MAX_FOLD_OUTPUT_DOCS, "{run:?}");
+        }
+
+        // The bound is inclusive: exactly the limit folds, one more does not.
+        let half = MAX_FOLD_OUTPUT_DOCS / 2;
+        assert_eq!(
+            plan_capped_merge_runs(&[dense(1, 0, half), dense(2, half, half)], u64::MAX),
+            vec![vec![1, 2]]
+        );
+        assert!(
+            plan_capped_merge_runs(&[dense(1, 0, half), dense(2, half, half + 1)], u64::MAX)
+                .is_empty()
+        );
+
+        // Tombstoned documents keep their postings until compaction, so the
+        // bound counts physical documents, not live ones: two segments whose
+        // live rows are small but whose physical rows sum past the limit stay
+        // apart, including through the comparable-sibling recovery pass.
+        let big = 40_000_000_u64;
+        let live = [(1, big), (2, 1_000), (3, 1_000), (4, big)];
+        let physical = |second: u64| {
+            [
+                dense(1, 0, big),
+                dense(2, big, second),
+                dense(3, big + second, second),
+                dense(4, big + 2 * second, big),
+            ]
+        };
+        assert!(
+            plan_capped_balanced_merge_runs(&live, &physical(half + 1), u64::MAX).is_empty(),
+            "a pair past the posting limit must not fold"
+        );
+        assert_eq!(
+            plan_capped_balanced_merge_runs(&live, &physical(half), u64::MAX),
+            vec![vec![2, 3]],
+            "the same pair within the limit folds"
+        );
+    }
+
+    #[test]
+    fn merge_output_cap_env_parsing_keeps_the_default_on_junk() {
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(None),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some("0")),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some("lots")),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some(" 268_435_456 ")),
+            268_435_456
+        );
+    }
+
+    /// GH #456: under a cap that fits only some of the session segments, the
+    /// end-of-rebuild fold still folds what fits, keeps every document
+    /// searchable, and never assembles more than the cap in one output.
+    #[test]
+    fn force_merge_under_a_byte_cap_folds_partially_and_keeps_every_document() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 6_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[
+                    sample(&format!("cap{session}"), 0, "capped fold alpha message"),
+                    sample(&format!("cap{session}"), 1, "capped fold beta message"),
+                ])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        assert!(before.len() >= usize::try_from(sessions).expect("small"));
+        // Room for exactly the first two session segments (their hull plus
+        // bytes), which is less than any three.
+        let cap = estimated_fold_output_bytes(&before[..2]);
+        assert!(estimated_fold_output_bytes(&before[..3]) > cap);
+        let planned = plan_capped_merge_runs(&before, cap);
+        assert!(
+            !planned.is_empty() && planned.iter().all(|run| run.len() == 2),
+            "the cap admits pairs only: {planned:?}"
+        );
+
+        index
+            .force_merge_with_output_cap(cap)
+            .expect("capped force merge");
+        let after = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        assert_eq!(
+            after.len(),
+            before.len() - planned.len(),
+            "every planned pair folded into one segment: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.len() > 1,
+            "the cap must stop the fold short of a single segment: {after:?}"
+        );
+        // The estimate is an upper bound on what the engine actually wrote,
+        // which is what makes the cap a memory bound: every merged output
+        // stays under the cap it was planned for.
+        let merged_ids: std::collections::BTreeSet<u64> = after
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|id| !before.iter().any(|segment| segment.segment_id == *id))
+            .collect();
+        assert_eq!(merged_ids.len(), planned.len());
+        assert!(
+            after
+                .iter()
+                .filter(|segment| merged_ids.contains(&segment.segment_id))
+                .all(|segment| segment.file_len <= cap),
+            "a merged output exceeded the cap {cap} it was planned under: {after:?}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        index
+            .force_merge_with_output_cap(u64::MAX)
+            .expect("uncapped force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+    }
+
+    /// GH #457: the MANIFEST-only live count must track what the engine
+    /// serves — every sealed document before any deletion, zero once
+    /// `delete_all` publishes the hollow successor — without a reader open.
+    #[test]
+    fn manifest_live_doc_count_tracks_served_documents_without_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            manifest_live_doc_count(directory.path()),
+            None,
+            "no MANIFEST has been published yet"
+        );
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        index
+            .add_cass_documents(&[
+                sample("hollow", 0, "alpha"),
+                sample("hollow", 1, "beta"),
+                sample("hollow", 2, "gamma"),
+            ])
+            .expect("index documents");
+        index.commit().expect("commit");
+
+        let live = manifest_live_doc_count(directory.path()).expect("published manifest");
+        assert_eq!(live.live_docs, 3);
+        assert_eq!(live.sealed_docs, 3);
+        assert_eq!(live.tombstones, 0);
+        assert!(live.segments >= 1, "a commit seals at least one segment");
+        assert!(!live.recovered_from_previous);
+        assert_eq!(live.live_docs, index.doc_count().expect("engine count"));
+
+        index.delete_all().expect("publish the hollow successor");
+        let hollow = manifest_live_doc_count(directory.path()).expect("hollow manifest");
+        assert_eq!(hollow.live_docs, 0);
+        assert_eq!(hollow.segments, 0);
+        assert!(
+            hollow.generation > live.generation,
+            "the hollow successor is a later generation"
+        );
+        assert_eq!(index.doc_count().expect("engine count"), 0);
+    }
+
+    /// The streaming-ingest fold merges one run per call and then honours the
+    /// cooldown, so a mid-run call costs at most one extra publish.
+    #[test]
+    fn fold_largest_small_run_merges_one_run_then_cools_down() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 5_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[sample(&format!("s{session}"), 0, "session alpha")])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = published_segment_count(&index);
+        assert!(before >= 5, "each session leaves a segment, got {before}");
+
+        assert!(
+            index
+                .fold_largest_small_run(1_700_000_000_000)
+                .expect("fold")
+        );
+        let after = published_segment_count(&index);
+        assert!(after < before, "{after} segments after folding {before}");
+        assert_eq!(index.doc_count().expect("doc count"), sessions);
+
+        // Enough later commits to clear the merge threshold, so only the
+        // cooldown can hold the next fold back.
+        for late in 0..CASS_MERGE_SEGMENT_THRESHOLD {
+            index
+                .add_cass_documents(&[sample(&format!("late{late}"), 0, "late session alpha")])
+                .expect("index late documents");
+            index.commit().expect("commit late");
+        }
+        let grown = published_segment_count(&index);
+        assert!(
+            grown >= CASS_MERGE_SEGMENT_THRESHOLD,
+            "got {grown} segments"
+        );
+        assert!(
+            !index
+                .fold_largest_small_run(1_700_000_000_001)
+                .expect("fold inside cooldown"),
+            "a call inside the cooldown must not merge"
+        );
+        assert_eq!(published_segment_count(&index), grown);
+    }
+
+    /// #441: one writer session per open leases fresh docid blocks, so every
+    /// session leaves at least one segment the engine's width-tiered merge
+    /// will never fold. The bounded policy must fold them and keep the corpus
+    /// searchable.
+    #[test]
+    fn bounded_merge_folds_session_segments_into_one() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 5_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[
+                    sample(&format!("s{session}"), 0, "session zero message alpha"),
+                    sample(&format!("s{session}"), 1, "session one message beta"),
+                ])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = published_segment_count(&index);
+        assert!(
+            before >= usize::try_from(sessions).expect("small count"),
+            "each session must have left at least one segment, got {before}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        // Cooldown never elapsed and nothing merged yet -> policy fires.
+        let merged = index.optimize_if_idle(1_700_000_000_000).expect("optimize");
+        assert!(merged, "five session segments exceed the merge threshold");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        // A reader opened on the merged generation still finds every session.
+        // The CASS-schema reader is preparsed-only, so go through the CASS
+        // parser exactly as the search layer does.
+        let reader = index.reader().expect("reader");
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let parsed = parser.parse(
+            "alpha",
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page = search_paginated(&reader, &parsed.query, 100, 0, false)
+            .expect("search merged generation");
+        assert_eq!(
+            page.hits.len(),
+            usize::try_from(sessions).expect("small count")
+        );
+
+        // Converged: another pass inside the cooldown is a no-op.
+        assert!(!index.optimize_if_idle(1_700_000_000_001).expect("optimize"));
+
+        // A further session appends a segment; force_merge folds it back.
+        index
+            .add_cass_documents(&[sample("late", 0, "late session alpha")])
+            .expect("index late session");
+        index.commit().expect("commit late session");
+        assert!(published_segment_count(&index) >= 2);
+        index.force_merge().expect("force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2 + 1);
+    }
+
+    /// Fuel exhaustion is recognised by the engine's own error text, anywhere
+    /// in the cause chain, and only that text (GH #441 degrade path).
+    #[test]
+    fn query_fuel_exhaustion_is_recognised_through_the_cause_chain() {
+        let inner = anyhow!("scalar Quill query fuel exhausted after 10000000/10000000 units");
+        let wrapped = inner.context("executing a Quill lexical query");
+        assert!(is_query_fuel_exhausted(&wrapped));
+        assert!(!is_query_fuel_exhausted(&anyhow!(
+            "opening the Quill CASS reader: manifest missing"
+        )));
+    }
+
+    /// GH #499: the invariant classifier is keyed to the engine's own Display
+    /// text, so an upstream rewording fails here instead of quietly turning a
+    /// deterministic failure back into a retryable one. Fuel exhaustion,
+    /// cancellation, and reader faults must stay outside the class.
+    #[test]
+    fn cursor_invariant_failure_is_recognised_from_the_engine_display() {
+        use frankensearch::quill::QuillIndexError;
+        use frankensearch::quill::argus::ArgusError;
+
+        let engine_error = |error: ArgusError| {
+            anyhow!(
+                "executing a Quill lexical query: {}",
+                QuillIndexError::from(error)
+            )
+        };
+        let invariant = engine_error(ArgusError::CursorInvariant(
+            "Boolean children belong to different segment domains",
+        ));
+        assert!(is_engine_invariant_failure(&invariant));
+        assert!(!is_query_fuel_exhausted(&invariant));
+
+        let fuel = engine_error(ArgusError::QueryFuelExhausted {
+            budget: 10,
+            consumed: 10,
+            segments_touched: 1,
+            dictionary_blocks: 0,
+            posting_blocks: 10,
+            position_docs: 0,
+        });
+        assert!(is_query_fuel_exhausted(&fuel));
+        assert!(!is_engine_invariant_failure(&fuel));
+        assert!(!is_engine_invariant_failure(&engine_error(
+            ArgusError::QueryCancelled { phase: "collect" }
+        )));
+        assert!(!is_engine_invariant_failure(&anyhow!(
+            "opening the Quill CASS reader: manifest missing"
+        )));
+    }
+
+    /// GH #441: an archive only ever appends, so tombstone-driven compaction
+    /// never fires and every commit seals a segment the engine's own tier
+    /// policy does not fold (measured here: 40 commits → 40 segments with the
+    /// production configuration alone). What bounds growth in production is
+    /// the post-run maintenance step `cass index` calls after every
+    /// incremental run (`optimize_if_idle`) — so that is the invariant this
+    /// pins: after forty append-only commits, one maintenance pass folds the
+    /// generation well below the merge threshold and keeps every document.
+    /// No-claim: this proves consolidation happens, not its cost.
+    #[test]
+    fn post_run_maintenance_bounds_segment_growth_on_append_only_commits() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        let commits = 40_u64;
+        for commit in 0..commits {
+            let batch: Vec<QuillCassDocument> = (0..8)
+                .map(|slot| {
+                    let source = format!("session-{commit}");
+                    sample(
+                        &source,
+                        slot,
+                        &format!("commit {commit} message {slot} about borrow checker lifetimes"),
+                    )
+                })
+                .collect();
+            index.add_cass_documents(&batch).expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let before = published_segment_count(&index);
+        assert!(
+            before >= CASS_MERGE_SEGMENT_THRESHOLD,
+            "precondition: append-only commits must leave unfolded segments (got {before})"
+        );
+
+        let merged = index.optimize_if_idle(1_700_000_000_000).expect("optimize");
+        assert!(
+            merged,
+            "the post-run maintenance pass must fold {before} segments"
+        );
+        let after = published_segment_count(&index);
+        assert!(
+            after < CASS_MERGE_SEGMENT_THRESHOLD,
+            "maintenance left {after} segments (threshold {CASS_MERGE_SEGMENT_THRESHOLD})"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), commits * 8);
+    }
+
+    /// WS-B.1a: the metadata-only segment-file count that `status`/`doctor`
+    /// report must track the live segment count as an upper bound, without
+    /// opening the engine. Positive observable: after a run of append-only
+    /// commits the file count is at least the reader's live count and grows
+    /// with it; after a merge it is still at least the (now small) live
+    /// count. Planted negative: a directory without a MANIFEST is `None`,
+    /// never a fake zero. No-claim: this does not pin when the engine removes
+    /// folded segment files, only that the bound holds.
+    #[test]
+    fn segment_file_count_bounds_the_live_segment_count_without_opening_the_engine() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            segment_file_count(directory.path()),
+            None,
+            "a directory without a MANIFEST is not a Quill index"
+        );
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for commit in 0..6_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("session-{commit}"),
+                    0,
+                    "segment file count fixture",
+                )])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let live = published_segment_count(&index);
+        let files = segment_file_count(directory.path()).expect("published index");
+        assert!(
+            files >= live && live >= 2,
+            "segment files ({files}) must bound the live segment count ({live})"
+        );
+
+        index.force_merge().expect("force merge");
+        let live_after = published_segment_count(&index);
+        let files_after = segment_file_count(directory.path()).expect("published index");
+        assert_eq!(live_after, 1);
+        assert!(
+            files_after >= live_after,
+            "segment files ({files_after}) must still bound the live count ({live_after})"
+        );
+    }
+
+    /// #453: the byte split behind doctor's full-rebuild headroom. After a
+    /// merge the folded inputs are still on disk but no longer referenced by
+    /// the MANIFEST; they must land in `retired_bytes`, never in
+    /// `live_bytes`, and the two must add up to the directory's regular
+    /// files.
+    #[test]
+    fn quill_directory_footprint_splits_manifest_referenced_bytes_from_retired_inputs() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            quill_directory_footprint(directory.path()),
+            None,
+            "a directory without a MANIFEST is not a Quill index"
+        );
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for commit in 0..4_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("session-{commit}"),
+                    0,
+                    "footprint fixture with a few distinct tokens",
+                )])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let before = quill_directory_footprint(directory.path()).expect("published index");
+        assert_eq!(before.retired_bytes, 0, "nothing is folded yet: {before:?}");
+        assert_eq!(before.retired_segment_files, 0);
+        assert!(before.live_bytes > 0);
+
+        index.force_merge().expect("force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        let after = quill_directory_footprint(directory.path()).expect("published index");
+        let files_after = segment_file_count(directory.path()).expect("published index");
+        assert_eq!(
+            after.retired_segment_files,
+            files_after - 1,
+            "every segment file but the merge output is retired: {after:?}"
+        );
+        assert!(after.retired_bytes > 0, "{after:?}");
+
+        // The split is exhaustive over the directory's regular files.
+        let regular_bytes: u64 = std::fs::read_dir(directory.path())
+            .expect("read index directory")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert_eq!(after.live_bytes + after.retired_bytes, regular_bytes);
+
+        // The live figure is exactly what the MANIFEST references plus the
+        // non-segment bookkeeping files.
+        let manifest = frankensearch::quill::load_manifest_pair(directory.path())
+            .expect("load manifest")
+            .manifest;
+        let referenced: u64 = manifest
+            .segments
+            .iter()
+            .map(|segment| segment.file_len)
+            .sum();
+        let bookkeeping: u64 = std::fs::read_dir(directory.path())
+            .expect("read index directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !(name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                    && (name.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+                        || name.ends_with(QUILL_RETIREMENT_RECEIPT_SUFFIX)))
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert_eq!(after.live_bytes, referenced + bookkeeping);
     }
 }

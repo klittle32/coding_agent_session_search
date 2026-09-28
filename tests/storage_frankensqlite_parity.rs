@@ -8,6 +8,7 @@
 //! transaction behavior, edge cases (Unicode, NULL, empty DB, large content),
 //! and cross-format file reads (rusqlite ↔ frankensqlite interop).
 
+use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
 };
@@ -108,6 +109,209 @@ fn open_both() -> (TempDir, SqliteStorage, FrankenStorage) {
     let sql = SqliteStorage::open(&sql_path).expect("open SqliteStorage");
     let frank = FrankenStorage::open(&frank_path).expect("open FrankenStorage");
     (dir, sql, frank)
+}
+
+#[test]
+fn gh402_populated_archive_reopens_readonly_after_page_reclamation_without_mutation() {
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("reserved-empty-readonly-reopen.db");
+    let storage = FrankenStorage::open(&db_path).expect("create CASS archive");
+    let agent_id = storage
+        .ensure_agent(&make_agent("codex", "Codex"))
+        .expect("create agent");
+    let repeated_body = "reserved empty readonly reopen sentinel ".repeat(384);
+    let conversations = (0..32)
+        .map(|index| {
+            make_conversation(
+                "codex",
+                &format!("gh402-{index:03}"),
+                &format!("GH 402 conversation {index}"),
+                vec![make_message(0, MessageRole::User, &repeated_body)],
+            )
+        })
+        .collect::<Vec<_>>();
+    let batch = conversations
+        .iter()
+        .map(|conversation| (agent_id, None, conversation))
+        .collect::<Vec<_>>();
+    let outcomes = storage
+        .insert_conversations_batched(&batch)
+        .expect("populate archive");
+    let retained_conversation_id = outcomes
+        .last()
+        .expect("at least one inserted conversation")
+        .conversation_id;
+
+    storage
+        .raw()
+        .execute_compat(
+            "DELETE FROM conversations WHERE id <> ?1",
+            &[ParamValue::from(retained_conversation_id)],
+        )
+        .expect("reclaim pages through an ordinary FrankenSQLite DELETE");
+    assert_eq!(
+        storage
+            .total_conversation_count()
+            .expect("count retained conversations"),
+        1
+    );
+    let freelist_count: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA freelist_count;", &[], |row| row.get_typed(0))
+        .expect("read reclaimed-page count");
+    assert!(
+        freelist_count > 0,
+        "GH #402 fixture did not create any reclaimed pages, so it cannot discriminate the ReservedEmpty reopen regression"
+    );
+    storage.close().expect("close populated archive cleanly");
+
+    // Copy only the checkpointed main database to a fresh path. The copied
+    // inode has no machine-local FrankenSQLite namespace sidecars, so the
+    // opens below exercise first contact instead of reusing the writer's
+    // already-established namespace state.
+    let first_contact_db_path = dir.path().join("reserved-empty-first-contact.db");
+    std::fs::copy(&db_path, &first_contact_db_path)
+        .expect("copy reclaimed-page archive without namespace sidecars");
+    let db_path = first_contact_db_path;
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let sidecar = db_path.with_file_name(format!(
+            "{}{}",
+            db_path.file_name().expect("db file name").to_string_lossy(),
+            suffix
+        ));
+        assert!(
+            !sidecar.exists(),
+            "first-contact fixture unexpectedly inherited namespace sidecar {}",
+            sidecar.display()
+        );
+    }
+
+    let bundle_snapshot = || {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = if suffix.is_empty() {
+                    db_path.clone()
+                } else {
+                    db_path.with_file_name(format!(
+                        "{}{}",
+                        db_path.file_name().expect("db file name").to_string_lossy(),
+                        suffix
+                    ))
+                };
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("snapshot {}: {error}", path.display()),
+                };
+                (suffix, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = bundle_snapshot();
+    assert!(
+        before
+            .first()
+            .and_then(|(_, bytes)| bytes.as_ref())
+            .is_some_and(|bytes| !bytes.is_empty()),
+        "fixture must contain a populated main database"
+    );
+
+    for attempt in 1..=3 {
+        let readonly = FrankenStorage::open_readonly(&db_path).unwrap_or_else(|error| {
+            panic!(
+                "GH #402 attempt {attempt}: a populated archive routed through the ReservedEmpty namespace path must reopen read-only: {error:#}"
+            )
+        });
+        assert_eq!(
+            readonly
+                .total_conversation_count()
+                .expect("read retained conversation count"),
+            1
+        );
+        let retained = readonly
+            .fetch_messages(retained_conversation_id)
+            .expect("read retained messages");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, repeated_body);
+        readonly
+            .close_without_checkpoint()
+            .expect("close read-only archive without checkpointing");
+    }
+
+    assert_eq!(
+        bundle_snapshot(),
+        before,
+        "read-only first-contact opens must not modify the canonical DB/WAL/SHM bundle"
+    );
+}
+
+#[test]
+fn readonly_live_wal_preserves_archive_bytes_and_modification_times() {
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("live-wal-readonly.db");
+    let writer = FrankenStorage::open(&db_path).expect("create CASS archive");
+    writer
+        .raw()
+        .execute("PRAGMA wal_autocheckpoint = 0")
+        .expect("retain live WAL frames");
+    let agent_id = writer
+        .ensure_agent(&make_agent("codex", "Codex"))
+        .expect("create agent");
+    let conversation = make_conversation(
+        "codex",
+        "readonly-live-wal",
+        "Live WAL sentinel",
+        vec![make_message(0, MessageRole::User, "committed WAL content")],
+    );
+    let outcomes = writer
+        .insert_conversations_batched(&[(agent_id, None, &conversation)])
+        .expect("commit live WAL conversation");
+    let conversation_id = outcomes
+        .first()
+        .expect("inserted conversation")
+        .conversation_id;
+    assert_eq!(writer.total_conversation_count().expect("writer count"), 1);
+
+    let snapshot = || {
+        [
+            "live-wal-readonly.db",
+            "live-wal-readonly.db-wal",
+            "live-wal-readonly.db-shm",
+        ]
+        .map(|name| {
+            let path = dir.path().join(name);
+            let bytes = std::fs::read(&path).expect("read existing live archive artifact");
+            let modified = std::fs::metadata(&path)
+                .expect("live archive metadata")
+                .modified()
+                .expect("live archive modification time");
+            (bytes, modified)
+        })
+    };
+    let before = snapshot();
+    assert!(before[1].0.len() > 32, "fixture must retain WAL frames");
+    assert!(!before[2].0.is_empty(), "fixture must have a WAL index");
+
+    let reader = FrankenStorage::open_readonly(&db_path).expect("open live archive read-only");
+    assert_eq!(reader.total_conversation_count().expect("reader count"), 1);
+    let messages = reader
+        .fetch_messages(conversation_id)
+        .expect("read WAL message");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "committed WAL content");
+    assert_eq!(
+        snapshot(),
+        before,
+        "read-only queries must preserve DB/WAL/SHM"
+    );
+    reader.close().expect("close read-only live archive");
+    assert_eq!(
+        snapshot(),
+        before,
+        "read-only close must preserve DB/WAL/SHM bytes and modification times"
+    );
+    writer.close().expect("close fixture writer");
 }
 
 // ============================================================================
